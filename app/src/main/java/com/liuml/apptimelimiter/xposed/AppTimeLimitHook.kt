@@ -10,7 +10,6 @@ import android.os.Process
 import android.os.SystemClock
 import android.widget.Toast
 import com.liuml.apptimelimiter.core.UsageMath
-import com.liuml.apptimelimiter.data.RuleMode
 import com.liuml.apptimelimiter.data.RuleRepository
 import com.liuml.apptimelimiter.ipc.RuleContract
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -78,7 +77,7 @@ private class RuntimeLimiter(
     private val mainHandler = Handler(Looper.getMainLooper())
     private var activeActivity = WeakReference<Activity>(null)
     private var foregroundStartedAt = NOT_RUNNING
-    private var committedThisProcessMs = 0L
+    private var perLaunchCommittedMs = 0L
     private var loadedRuleVersion = Long.MIN_VALUE
     private var exitScheduled = false
     private var hookReadyLogged = false
@@ -86,7 +85,7 @@ private class RuntimeLimiter(
     private var providerFailureLogged = false
     private var diagnosticsEnabled = true
     private var grantedExtensionMs = 0L
-    private var warningShownForLimitMs = Long.MIN_VALUE
+    private var warningShownForExtensionMs = Long.MIN_VALUE
     private var warningDialog: AlertDialog? = null
     private var warningCountdown: Runnable? = null
 
@@ -105,13 +104,13 @@ private class RuntimeLimiter(
             )
         }
 
-        val ruleSummary = "${rule.enabled}/${rule.limitMillis}/${rule.mode}/${rule.version}/${rule.exitWarningEnabled}/${rule.extensionMillis}/${rule.diagnosticsEnabled}/${rule.source}"
+        val ruleSummary = "${rule.enabled}/${rule.dailyEnabled}/${rule.dailyLimitMillis}/${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis}/${rule.version}/${rule.exitWarningEnabled}/${rule.extensionMillis}/${rule.diagnosticsEnabled}/${rule.source}"
         if (lastRuleSummary != ruleSummary) {
             lastRuleSummary = ruleSummary
             diagnostic(
                 activity,
                 event = "RULE_READ",
-                message = "enabled=${rule.enabled}, limit=${rule.limitMillis / 1000}s, mode=${rule.mode}, warning=${rule.exitWarningEnabled}, extension=${rule.extensionMillis / 1000}s, source=${rule.source}",
+                message = "enabled=${rule.enabled}, daily=${rule.dailyEnabled}/${rule.dailyLimitMillis / 1000}s, perLaunch=${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis / 1000}s, warning=${rule.exitWarningEnabled}, extension=${rule.extensionMillis / 1000}s, source=${rule.source}",
             )
         }
 
@@ -122,9 +121,9 @@ private class RuntimeLimiter(
 
         if (loadedRuleVersion != rule.version) {
             loadedRuleVersion = rule.version
-            committedThisProcessMs = 0L
+            perLaunchCommittedMs = 0L
             grantedExtensionMs = 0L
-            warningShownForLimitMs = Long.MIN_VALUE
+            warningShownForExtensionMs = Long.MIN_VALUE
             foregroundStartedAt = NOT_RUNNING
         }
 
@@ -136,7 +135,7 @@ private class RuntimeLimiter(
             diagnostic(
                 activity,
                 event = "TIMER_START",
-                message = "开始前台计时，剩余=${remainingMs / 1000.0}s",
+                message = "开始前台计时，最早阈值剩余=${remainingMs / 1000.0}s",
             )
         }
     }
@@ -145,7 +144,7 @@ private class RuntimeLimiter(
         if (activeActivity.get() !== activity || foregroundStartedAt == NOT_RUNNING) return
         val rule = readRule(activity, reloadFallback = true)
         val segmentMs = activeSegmentMillis()
-        val totalMs = commitActiveSegment(activity, rule)
+        commitActiveSegment(activity, rule)
         activeActivity.clear()
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
@@ -154,7 +153,7 @@ private class RuntimeLimiter(
             diagnostic(
                 activity,
                 event = "TIMER_PAUSE",
-                message = "本段=${segmentMs / 1000.0}s，累计=${totalMs / 1000.0}s",
+                message = "本段=${segmentMs / 1000.0}s，${usageSummary(activity, rule)}",
             )
         }
     }
@@ -162,15 +161,13 @@ private class RuntimeLimiter(
     private fun scheduleDeadline(activity: Activity, rule: HookRule): Long {
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
-        val state = usageState(activity, rule)
-        val activeMs = activeSegmentMillis()
-        val effectiveLimitMs = effectiveLimitMillis(rule)
-        val remainingMs = UsageMath.remainingMillis(effectiveLimitMs, state.usedMillis, activeMs)
-        if (remainingMs == 0L) {
-            forceExit(activity, rule, state)
+        val status = thresholdStatus(activity, rule)
+        val remainingMs = status.remainingMillis
+        if (status.reached) {
+            forceExit(activity, rule, status)
         } else {
             mainHandler.postDelayed(deadline, remainingMs)
-            if (rule.exitWarningEnabled && warningShownForLimitMs != effectiveLimitMs) {
+            if (rule.exitWarningEnabled && warningShownForExtensionMs != grantedExtensionMs) {
                 mainHandler.postDelayed(
                     warningDeadline,
                     UsageMath.warningDelayMillis(remainingMs, WARNING_LEAD_MS),
@@ -189,24 +186,25 @@ private class RuntimeLimiter(
             stopTiming()
             return
         }
-        val state = usageState(activity, rule)
-        val activeMs = activeSegmentMillis()
-        if (UsageMath.isLimitReached(effectiveLimitMillis(rule), state.usedMillis, activeMs)) {
-            forceExit(activity, rule, state)
+        val status = thresholdStatus(activity, rule)
+        if (status.reached) {
+            forceExit(activity, rule, status)
         } else {
             scheduleDeadline(activity, rule)
         }
     }
 
-    private fun forceExit(activity: Activity, rule: HookRule, state: UsageState) {
+    private fun forceExit(activity: Activity, rule: HookRule, status: ThresholdStatus) {
         if (exitScheduled) return
         exitScheduled = true
         dismissWarning(resetForCurrentLimit = false)
         val segmentMs = activeSegmentMillis()
-        val effectiveLimitMs = effectiveLimitMillis(rule)
-        val finalUsed = (state.usedMillis + segmentMs).coerceAtMost(effectiveLimitMs)
-        if (rule.mode == RuleMode.DAILY) writeDailyState(activity, rule, finalUsed)
-        else committedThisProcessMs += segmentMs
+        if (rule.dailyEnabled) {
+            val finalDailyUsed = (dailyUsedMillis(activity, rule) + segmentMs)
+                .coerceAtMost(effectiveLimitMillis(rule.dailyLimitMillis))
+            writeDailyState(activity, rule, finalDailyUsed)
+        }
+        if (rule.perLaunchEnabled) perLaunchCommittedMs += segmentMs
         foregroundStartedAt = NOT_RUNNING
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
@@ -215,7 +213,7 @@ private class RuntimeLimiter(
             activity,
             level = "WARN",
             event = "LIMIT_REACHED",
-            message = "达到 ${effectiveLimitMs / 1000}s 有效限制（含延时 ${grantedExtensionMs / 1000}s），准备结束 pid=${Process.myPid()}",
+            message = "达到${status.reachedLabels}阈值（本次已延时 ${grantedExtensionMs / 1000}s），准备结束 pid=${Process.myPid()}",
         )
         runCatching {
             Toast.makeText(activity, "已达到使用时长，应用即将退出", Toast.LENGTH_LONG).show()
@@ -235,21 +233,17 @@ private class RuntimeLimiter(
         )
     }
 
-    private fun commitActiveSegment(activity: Activity, rule: HookRule): Long {
+    private fun commitActiveSegment(activity: Activity, rule: HookRule) {
         val segmentMs = activeSegmentMillis()
         if (segmentMs <= 0L) {
             foregroundStartedAt = NOT_RUNNING
-            return usageState(activity, rule).usedMillis
+            return
         }
-        val totalMs = if (rule.mode == RuleMode.DAILY) {
-            val state = usageState(activity, rule)
-            (state.usedMillis + segmentMs).also { writeDailyState(activity, rule, it) }
-        } else {
-            committedThisProcessMs += segmentMs
-            committedThisProcessMs
+        if (rule.dailyEnabled) {
+            writeDailyState(activity, rule, dailyUsedMillis(activity, rule) + segmentMs)
         }
+        if (rule.perLaunchEnabled) perLaunchCommittedMs += segmentMs
         foregroundStartedAt = NOT_RUNNING
-        return totalMs
     }
 
     private fun stopTiming() {
@@ -266,27 +260,22 @@ private class RuntimeLimiter(
         val rule = readRule(activity, reloadFallback = true)
         if (!rule.enabled || !rule.exitWarningEnabled) return
 
-        val state = usageState(activity, rule)
-        val effectiveLimitMs = effectiveLimitMillis(rule)
-        val remainingMs = UsageMath.remainingMillis(
-            effectiveLimitMs,
-            state.usedMillis,
-            activeSegmentMillis(),
-        )
-        if (remainingMs == 0L) {
-            forceExit(activity, rule, state)
+        val status = thresholdStatus(activity, rule)
+        val remainingMs = status.remainingMillis
+        if (status.reached) {
+            forceExit(activity, rule, status)
             return
         }
         if (remainingMs > WARNING_LEAD_MS) {
             scheduleDeadline(activity, rule)
             return
         }
-        if (warningShownForLimitMs == effectiveLimitMs || warningDialog?.isShowing == true) return
-        warningShownForLimitMs = effectiveLimitMs
+        if (warningShownForExtensionMs == grantedExtensionMs || warningDialog?.isShowing == true) return
+        warningShownForExtensionMs = grantedExtensionMs
 
         val dialog = AlertDialog.Builder(activity)
-            .setTitle("即将达到使用时长")
-            .setMessage(exitWarningMessage(remainingMs, rule.extensionMillis))
+            .setTitle("${status.nextThresholdLabel}即将到期")
+            .setMessage(exitWarningMessage(remainingMs, rule.extensionMillis, status.nextThresholdLabel))
             .setPositiveButton("延时 ${formatDuration(rule.extensionMillis)}") { _, _ ->
                 grantExtension(activity, rule.extensionMillis)
             }
@@ -319,13 +308,11 @@ private class RuntimeLimiter(
         val countdown = object : Runnable {
             override fun run() {
                 if (!dialog.isShowing || exitScheduled) return
-                val state = usageState(activity, rule)
-                val remainingMs = UsageMath.remainingMillis(
-                    effectiveLimitMillis(rule),
-                    state.usedMillis,
-                    activeSegmentMillis(),
+                val status = thresholdStatus(activity, rule)
+                val remainingMs = status.remainingMillis
+                dialog.setMessage(
+                    exitWarningMessage(remainingMs, rule.extensionMillis, status.nextThresholdLabel),
                 )
-                dialog.setMessage(exitWarningMessage(remainingMs, rule.extensionMillis))
                 if (remainingMs > 0L) mainHandler.postDelayed(this, COUNTDOWN_REFRESH_MS)
             }
         }
@@ -340,7 +327,7 @@ private class RuntimeLimiter(
             granted,
             MAX_TOTAL_EXTENSION_MS,
         )
-        warningShownForLimitMs = Long.MIN_VALUE
+        warningShownForExtensionMs = Long.MIN_VALUE
         diagnostic(
             activity,
             event = "EXTENSION_GRANTED",
@@ -355,15 +342,20 @@ private class RuntimeLimiter(
         warningCountdown = null
         warningDialog?.let { dialog -> runCatching { dialog.dismiss() } }
         warningDialog = null
-        if (resetForCurrentLimit) warningShownForLimitMs = Long.MIN_VALUE
+        if (resetForCurrentLimit) warningShownForExtensionMs = Long.MIN_VALUE
     }
 
-    private fun effectiveLimitMillis(rule: HookRule): Long =
-        (rule.limitMillis + grantedExtensionMs).coerceAtMost(Long.MAX_VALUE / 2L)
+    private fun effectiveLimitMillis(baseLimitMillis: Long): Long =
+        (baseLimitMillis + grantedExtensionMs).coerceAtMost(Long.MAX_VALUE / 2L)
 
-    private fun exitWarningMessage(remainingMs: Long, extensionMillis: Long): String {
+    private fun exitWarningMessage(
+        remainingMs: Long,
+        extensionMillis: Long,
+        thresholdLabel: String,
+    ): String {
         val seconds = ((remainingMs + 999L) / 1000L).coerceAtLeast(0L)
-        return "将在 $seconds 秒后退出应用。\n点击延时可继续使用 ${formatDuration(extensionMillis)}。"
+        return "$thresholdLabel 将在 $seconds 秒后到期并退出应用。\n" +
+            "点击延时可同时延长两个已启用阈值 ${formatDuration(extensionMillis)}。"
     }
 
     private fun formatDuration(durationMs: Long): String {
@@ -371,19 +363,67 @@ private class RuntimeLimiter(
         return if (seconds < 60L) "$seconds 秒" else "${seconds / 60L} 分钟"
     }
 
-    private fun usageState(context: Context, rule: HookRule): UsageState {
-        if (rule.mode == RuleMode.PER_LAUNCH) return UsageState(committedThisProcessMs)
-
+    private fun dailyUsedMillis(context: Context, rule: HookRule): Long {
         val statePrefs = context.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE)
         val today = dayToken()
         val savedDay = statePrefs.getInt(KEY_DAY, -1)
         val savedVersion = statePrefs.getLong(KEY_VERSION, Long.MIN_VALUE)
         if (savedDay != today || savedVersion != rule.version) {
             writeDailyState(context, rule, 0L)
-            return UsageState(0L)
+            return 0L
         }
-        return UsageState(statePrefs.getLong(KEY_USED_MS, 0L).coerceAtLeast(0L))
+        return statePrefs.getLong(KEY_USED_MS, 0L).coerceAtLeast(0L)
     }
+
+    private fun thresholdStatus(context: Context, rule: HookRule): ThresholdStatus {
+        val activeMs = activeSegmentMillis()
+        val thresholds = buildList {
+            if (rule.dailyEnabled) {
+                add(
+                    ThresholdRemaining(
+                        label = "每日累计",
+                        remainingMillis = UsageMath.remainingMillis(
+                            effectiveLimitMillis(rule.dailyLimitMillis),
+                            dailyUsedMillis(context, rule),
+                            activeMs,
+                        ),
+                    ),
+                )
+            }
+            if (rule.perLaunchEnabled) {
+                add(
+                    ThresholdRemaining(
+                        label = "单次打开",
+                        remainingMillis = UsageMath.remainingMillis(
+                            effectiveLimitMillis(rule.perLaunchLimitMillis),
+                            perLaunchCommittedMs,
+                            activeMs,
+                        ),
+                    ),
+                )
+            }
+        }
+        if (thresholds.isEmpty()) {
+            return ThresholdStatus(Long.MAX_VALUE / 2L, false, "未启用", "未启用")
+        }
+        val earliestRemaining = UsageMath.earliestRemainingMillis(
+            thresholds.map { it.remainingMillis },
+        ) ?: Long.MAX_VALUE / 2L
+        val earliest = thresholds.first { it.remainingMillis == earliestRemaining }
+        val reachedLabels = thresholds.filter { it.remainingMillis == 0L }
+            .joinToString("、") { it.label }
+        return ThresholdStatus(
+            remainingMillis = earliest.remainingMillis,
+            reached = earliest.remainingMillis == 0L,
+            reachedLabels = reachedLabels,
+            nextThresholdLabel = earliest.label,
+        )
+    }
+
+    private fun usageSummary(context: Context, rule: HookRule): String = buildList {
+        if (rule.dailyEnabled) add("每日累计=${dailyUsedMillis(context, rule) / 1000.0}s")
+        if (rule.perLaunchEnabled) add("单次累计=${perLaunchCommittedMs / 1000.0}s")
+    }.joinToString("，")
 
     private fun writeDailyState(context: Context, rule: HookRule, usedMillis: Long) {
         context.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE)
@@ -403,16 +443,18 @@ private class RuntimeLimiter(
                 null,
             )
         }.getOrNull()?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) }?.let { result ->
-            val mode = result.getString(RuleContract.KEY_MODE)
-                ?.let { runCatching { RuleMode.valueOf(it) }.getOrNull() }
-                ?: RuleMode.DAILY
             val rule = HookRule(
                 enabled = result.getBoolean(RuleContract.KEY_ENABLED, false),
-                limitMillis = result.getLong(
-                    RuleContract.KEY_LIMIT_SECONDS,
+                dailyEnabled = result.getBoolean(RuleContract.KEY_DAILY_ENABLED, false),
+                dailyLimitMillis = result.getLong(
+                    RuleContract.KEY_DAILY_LIMIT_SECONDS,
                     RuleRepository.DEFAULT_LIMIT_SECONDS,
                 ).coerceAtLeast(1L) * 1000L,
-                mode = mode,
+                perLaunchEnabled = result.getBoolean(RuleContract.KEY_PER_LAUNCH_ENABLED, false),
+                perLaunchLimitMillis = result.getLong(
+                    RuleContract.KEY_PER_LAUNCH_LIMIT_SECONDS,
+                    RuleRepository.DEFAULT_LIMIT_SECONDS,
+                ).coerceAtLeast(1L) * 1000L,
                 version = result.getLong(RuleContract.KEY_VERSION, 0L),
                 exitWarningEnabled = result.getBoolean(RuleContract.KEY_EXIT_WARNING_ENABLED, true),
                 extensionMillis = result.getLong(
@@ -435,16 +477,36 @@ private class RuntimeLimiter(
         }
         if (reloadFallback) preferences.reload()
         val prefix = "rule.$packageName."
-        val mode = preferences.getString("${prefix}mode", RuleMode.DAILY.name)
-            ?.let { runCatching { RuleMode.valueOf(it) }.getOrNull() }
-            ?: RuleMode.DAILY
+        val legacyEnabled = preferences.getBoolean("${prefix}enabled", false)
+        val legacyLimitSeconds = preferences.getLong(
+            "${prefix}limit_seconds",
+            RuleRepository.DEFAULT_LIMIT_SECONDS,
+        )
+        val legacyDaily = preferences.getString("${prefix}mode", "DAILY") == "DAILY"
+        val dailyLimitSeconds = preferences.getLong("${prefix}daily_limit_seconds", -1L)
+        val perLaunchLimitSeconds = preferences.getLong("${prefix}per_launch_limit_seconds", -1L)
+        val hasDualThresholdRule = dailyLimitSeconds >= 0L || perLaunchLimitSeconds >= 0L
+        val dailyEnabled = if (hasDualThresholdRule) {
+            preferences.getBoolean("${prefix}daily_enabled", false)
+        } else {
+            legacyEnabled && legacyDaily
+        }
+        val perLaunchEnabled = if (hasDualThresholdRule) {
+            preferences.getBoolean("${prefix}per_launch_enabled", false)
+        } else {
+            legacyEnabled && !legacyDaily
+        }
         val rule = HookRule(
-            enabled = preferences.getBoolean("${prefix}enabled", false),
-            limitMillis = preferences.getLong(
-                "${prefix}limit_seconds",
-                RuleRepository.DEFAULT_LIMIT_SECONDS,
-            ).coerceAtLeast(1L) * 1000L,
-            mode = mode,
+            enabled = legacyEnabled && (dailyEnabled || perLaunchEnabled),
+            dailyEnabled = dailyEnabled,
+            dailyLimitMillis = (if (dailyLimitSeconds >= 0L) dailyLimitSeconds else legacyLimitSeconds)
+                .coerceAtLeast(1L) * 1000L,
+            perLaunchEnabled = perLaunchEnabled,
+            perLaunchLimitMillis = (if (perLaunchLimitSeconds >= 0L) {
+                perLaunchLimitSeconds
+            } else {
+                legacyLimitSeconds
+            }).coerceAtLeast(1L) * 1000L,
             version = preferences.getLong("${prefix}version", 0L),
             exitWarningEnabled = preferences.getBoolean(RuleRepository.KEY_EXIT_WARNING_ENABLED, true),
             extensionMillis = preferences.getLong(
@@ -495,8 +557,10 @@ private class RuntimeLimiter(
 
     private data class HookRule(
         val enabled: Boolean,
-        val limitMillis: Long,
-        val mode: RuleMode,
+        val dailyEnabled: Boolean,
+        val dailyLimitMillis: Long,
+        val perLaunchEnabled: Boolean,
+        val perLaunchLimitMillis: Long,
         val version: Long,
         val exitWarningEnabled: Boolean,
         val extensionMillis: Long,
@@ -504,7 +568,17 @@ private class RuntimeLimiter(
         val source: String,
     )
 
-    private data class UsageState(val usedMillis: Long)
+    private data class ThresholdRemaining(
+        val label: String,
+        val remainingMillis: Long,
+    )
+
+    private data class ThresholdStatus(
+        val remainingMillis: Long,
+        val reached: Boolean,
+        val reachedLabels: String,
+        val nextThresholdLabel: String,
+    )
 
     private companion object {
         const val NOT_RUNNING = -1L

@@ -11,13 +11,36 @@ class RuleRepository(context: Context) {
 
     fun getRule(packageName: String): AppRule {
         val prefix = prefix(packageName)
+        val legacyEnabled = prefs.getBoolean("${prefix}enabled", false)
+        val legacyLimitSeconds = prefs.getLong("${prefix}limit_seconds", DEFAULT_LIMIT_SECONDS)
+        val legacyMode = prefs.getString("${prefix}mode", RuleMode.DAILY.name)
+            ?.let { runCatching { RuleMode.valueOf(it) }.getOrNull() }
+            ?: RuleMode.DAILY
+        val hasDualThresholdRule = prefs.contains("${prefix}daily_enabled") ||
+            prefs.contains("${prefix}per_launch_enabled")
+        val dailyEnabled = if (hasDualThresholdRule) {
+            prefs.getBoolean("${prefix}daily_enabled", false)
+        } else {
+            legacyEnabled && legacyMode == RuleMode.DAILY
+        }
+        val perLaunchEnabled = if (hasDualThresholdRule) {
+            prefs.getBoolean("${prefix}per_launch_enabled", false)
+        } else {
+            legacyEnabled && legacyMode == RuleMode.PER_LAUNCH
+        }
         return AppRule(
             packageName = packageName,
-            enabled = prefs.getBoolean("${prefix}enabled", false),
-            limitSeconds = prefs.getLong("${prefix}limit_seconds", DEFAULT_LIMIT_SECONDS),
-            mode = prefs.getString("${prefix}mode", RuleMode.DAILY.name)
-                ?.let { runCatching { RuleMode.valueOf(it) }.getOrNull() }
-                ?: RuleMode.DAILY,
+            enabled = legacyEnabled && (dailyEnabled || perLaunchEnabled),
+            dailyEnabled = dailyEnabled,
+            dailyLimitSeconds = prefs.getLong(
+                "${prefix}daily_limit_seconds",
+                legacyLimitSeconds,
+            ).coerceAtLeast(1L),
+            perLaunchEnabled = perLaunchEnabled,
+            perLaunchLimitSeconds = prefs.getLong(
+                "${prefix}per_launch_limit_seconds",
+                legacyLimitSeconds,
+            ).coerceAtLeast(1L),
             version = prefs.getLong("${prefix}version", 0L),
         )
     }
@@ -28,9 +51,20 @@ class RuleRepository(context: Context) {
         val prefix = prefix(rule.packageName)
         prefs.edit()
             .putStringSet(KEY_PACKAGES, packages)
-            .putBoolean("${prefix}enabled", rule.enabled)
-            .putLong("${prefix}limit_seconds", rule.limitSeconds.coerceAtLeast(1L))
-            .putString("${prefix}mode", rule.mode.name)
+            .putBoolean("${prefix}enabled", rule.enabled && (rule.dailyEnabled || rule.perLaunchEnabled))
+            .putBoolean("${prefix}daily_enabled", rule.dailyEnabled)
+            .putLong("${prefix}daily_limit_seconds", rule.dailyLimitSeconds.coerceAtLeast(1L))
+            .putBoolean("${prefix}per_launch_enabled", rule.perLaunchEnabled)
+            .putLong("${prefix}per_launch_limit_seconds", rule.perLaunchLimitSeconds.coerceAtLeast(1L))
+            // Keep one legacy representation so downgrading does not leave an unreadable rule.
+            .putLong(
+                "${prefix}limit_seconds",
+                if (rule.dailyEnabled) rule.dailyLimitSeconds else rule.perLaunchLimitSeconds,
+            )
+            .putString(
+                "${prefix}mode",
+                if (rule.dailyEnabled) RuleMode.DAILY.name else RuleMode.PER_LAUNCH.name,
+            )
             .putLong("${prefix}version", System.currentTimeMillis())
             .commit()
         grantRuleAccess(rule.packageName)

@@ -24,8 +24,10 @@ class RuleProvider : ContentProvider() {
                 Bundle().apply {
                     putBoolean(RuleContract.KEY_OK, true)
                     putBoolean(RuleContract.KEY_ENABLED, rule.enabled)
-                    putLong(RuleContract.KEY_LIMIT_SECONDS, rule.limitSeconds)
-                    putString(RuleContract.KEY_MODE, rule.mode.name)
+                    putBoolean(RuleContract.KEY_DAILY_ENABLED, rule.dailyEnabled)
+                    putLong(RuleContract.KEY_DAILY_LIMIT_SECONDS, rule.dailyLimitSeconds)
+                    putBoolean(RuleContract.KEY_PER_LAUNCH_ENABLED, rule.perLaunchEnabled)
+                    putLong(RuleContract.KEY_PER_LAUNCH_LIMIT_SECONDS, rule.perLaunchLimitSeconds)
                     putLong(RuleContract.KEY_VERSION, rule.version)
                     putBoolean(RuleContract.KEY_EXIT_WARNING_ENABLED, settings.exitWarningEnabled)
                     putLong(RuleContract.KEY_EXTENSION_SECONDS, settings.extensionSeconds)

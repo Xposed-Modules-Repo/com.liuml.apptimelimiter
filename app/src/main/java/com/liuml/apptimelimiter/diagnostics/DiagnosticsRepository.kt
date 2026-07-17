@@ -29,6 +29,18 @@ class DiagnosticsRepository(context: Context) {
         }
     }
 
+    fun exportForFeedback(): File = synchronized(FILE_LOCK) {
+        val exportDir = File(logFile.parentFile?.parentFile, "cache/feedback").apply { mkdirs() }
+        File(exportDir, "app-time-limiter-diagnostics.txt").also { target ->
+            val contents = if (logFile.exists() && logFile.length() > 0L) {
+                logFile.readText()
+            } else {
+                "暂无诊断日志。请确认已在设置中开启诊断日志，并复现问题。\n"
+            }
+            target.writeText(contents)
+        }
+    }
+
     private fun rotateIfNeeded() {
         if (!logFile.exists() || logFile.length() < MAX_FILE_BYTES) return
         val retained = logFile.readLines().takeLast(RETAINED_LINES)

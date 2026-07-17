@@ -1,11 +1,13 @@
 # 应用计时退出（Android / LSPosed）
 
-这是一个可运行的 Android Xposed 模块原型：为指定应用设置前台可使用时长，达到限制后先关闭任务栈，再结束目标应用界面所在进程。当前版本为 `0.4.1`。
+[English documentation](README.en.md)
+
+这是一个可运行的 Android Xposed 模块原型：为指定应用设置前台可使用时长，达到限制后先关闭任务栈，再结束目标应用界面所在进程。当前版本为 `0.5.0`。
 
 ## 已实现
 
 - 展示应用真实图标，并可搜索设备上的可启动应用。
-- 为每个应用设置 1–1440 分钟限制。
+- 为每个应用分别设置 1–1440 分钟的每日累计和单次打开限制；两个阈值可同时启用，任意一个先到期都会退出应用。
 - **每日累计**：当天多次打开累计前台时长，第二天自动重置；超限后当天再次打开会立即退出。
 - **单次打开**：目标应用每次主进程启动后重新计时。
 - 仅在 `Activity.onResume` 到 `Activity.onPause` 之间计时，切到后台时暂停。
@@ -16,6 +18,8 @@
 - 顶部“设置”入口可开关退出提醒、开关诊断日志，并配置每次点击延时 1–60 分钟。
 - 到期前 5 秒在目标应用内显示倒计时；点击延时后追加本次额度，并在新截止点前再次提醒。
 - 设置页提供支付宝捐赠入口，尝试跳转到 `liuml.yx@139.com` 的账户转账页；不支持直接跳转时复制账号并打开支付宝。
+- 设置页可通过 GitHub Releases 检查新版本，并调用系统下载管理器下载新版 APK。
+- “关于”页面展示版本、项目主页和联系方式；“反馈问题”会调用用户选择的邮件应用，并附加诊断日志发送至 `liuml.yx@139.com`。
 
 ## 架构
 
@@ -40,26 +44,6 @@ flowchart LR
 - `app/src/main/java/com/liuml/apptimelimiter/diagnostics/DiagnosticsRepository.kt`：滚动诊断日志。
 - `app/src/main/java/com/liuml/apptimelimiter/xposed/AppTimeLimitHook.kt`：生命周期 Hook、计时、每日状态和退出逻辑。
 - `xposed-stubs/`：只用于编译的传统 Xposed API 签名，不会打包进 APK。
-
-## 跨平台方案
-
-“规则管理”可以跨平台，“Hook 任意应用并结束其进程”不能跨平台。建议正式版按以下边界拆分：
-
-| 层 | Android | iOS | 可共享性 |
-|---|---|---|---|
-| 规则模型、时长计算、同步协议 | Kotlin | Kotlin/Swift | 可放入 Kotlin Multiplatform `shared` 模块 |
-| 管理界面 | Compose Android 或 Compose Multiplatform | SwiftUI/Compose | 可部分共享 |
-| 使用时长监控 | LSPosed Hook；非 Root 版可用 UsageStats/无障碍做弱化方案 | DeviceActivity | 平台实现 |
-| 到时限制 | Root/LSPosed 可结束目标进程 | ManagedSettings Shield | 完全不同 |
-
-iOS 不允许第三方应用 Hook 或强杀任意应用。合规实现需要 Apple 的 Family Controls、Device Activity 和 Managed Settings，并申请 Family Controls entitlement；效果是到时显示系统 Shield，而不是结束进程。参考 [Apple Screen Time API](https://developer.apple.com/documentation/ScreenTimeAPIDocumentation) 和 [Family Controls 配置](https://developer.apple.com/documentation/Xcode/configuring-family-controls)。
-
-因此推荐产品路线：
-
-1. 先发布当前 Android Root/LSPosed 专用版，验证计时规则和用户体验。
-2. 抽取 `AppRule`、计时策略、规则同步 DTO 到 KMP `shared`。
-3. 增加 Android 非 Root 版，只做 UsageStats 统计和提醒/遮罩，能力弱于 Hook 版。
-4. 如需 iOS，再单独实现 Family Controls 扩展，不承诺“强制退出”。
 
 ## 构建
 
@@ -88,7 +72,7 @@ subst T: /d
 4. 强制停止目标应用后重新打开。修改 LSPosed 作用域后同样需要重启目标应用进程。
 5. 调试时可在 LSPosed 日志中搜索 `AppTimeLimiter`。
 
-应用不需要相机、存储、通知等危险运行时权限。Manifest 中的 `RECEIVE_BOOT_COMPLETED` 是普通权限，仅用于手机重启后恢复目标应用访问规则 Provider 的 URI 授权，不会在后台启动目标应用。
+应用不需要相机、存储、通知等危险运行时权限。联网权限只用于访问 GitHub Releases 检查和下载更新；`RECEIVE_BOOT_COMPLETED` 是普通权限，仅用于手机重启后恢复目标应用访问规则 Provider 的 URI 授权，不会在后台启动目标应用。
 
 ## 诊断日志判断方法
 

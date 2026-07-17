@@ -8,8 +8,10 @@ enum class RuleMode {
 data class AppRule(
     val packageName: String,
     val enabled: Boolean = false,
-    val limitSeconds: Long = 30 * 60,
-    val mode: RuleMode = RuleMode.DAILY,
+    val dailyEnabled: Boolean = false,
+    val dailyLimitSeconds: Long = 30 * 60,
+    val perLaunchEnabled: Boolean = false,
+    val perLaunchLimitSeconds: Long = 30 * 60,
     val version: Long = 0,
 )
 

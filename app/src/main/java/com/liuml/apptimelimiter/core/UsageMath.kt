@@ -12,4 +12,7 @@ object UsageMath {
 
     fun addExtensionMillis(currentMillis: Long, perClickMillis: Long, maximumMillis: Long): Long =
         (currentMillis + perClickMillis).coerceAtMost(maximumMillis)
+
+    fun earliestRemainingMillis(remainingValues: Iterable<Long>): Long? =
+        remainingValues.minOrNull()?.coerceAtLeast(0L)
 }

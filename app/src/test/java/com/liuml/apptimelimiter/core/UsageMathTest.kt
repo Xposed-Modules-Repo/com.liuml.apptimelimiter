@@ -33,4 +33,10 @@ class UsageMathTest {
         assertEquals(600_000L, UsageMath.addExtensionMillis(300_000L, 300_000L, 900_000L))
         assertEquals(900_000L, UsageMath.addExtensionMillis(800_000L, 300_000L, 900_000L))
     }
+
+    @Test
+    fun `earliest enabled threshold determines exit deadline`() {
+        assertEquals(20_000L, UsageMath.earliestRemainingMillis(listOf(120_000L, 20_000L)))
+        assertEquals(0L, UsageMath.earliestRemainingMillis(listOf(0L, 20_000L)))
+    }
 }
