@@ -1,5 +1,7 @@
 # 应用计时退出（Android / LSPosed）
 
+[English documentation](README.en.md)
+
 这是一个可运行的 Android Xposed 模块原型：为指定应用设置前台可使用时长，达到限制后先关闭任务栈，再结束目标应用界面所在进程。当前版本为 `0.4.1`。
 
 ## 已实现
