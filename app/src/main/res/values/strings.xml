@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">应用计时退出</string>
+    <string name="module_description">按应用限制前台使用时长，达到限制后退出应用</string>
+</resources>

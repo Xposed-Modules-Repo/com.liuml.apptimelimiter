@@ -1,0 +1,1 @@
+-keep class com.liuml.apptimelimiter.xposed.AppTimeLimitHook { *; }
