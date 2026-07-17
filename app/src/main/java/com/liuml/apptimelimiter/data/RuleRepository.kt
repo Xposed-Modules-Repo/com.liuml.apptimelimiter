@@ -28,9 +28,10 @@ class RuleRepository(context: Context) {
         } else {
             legacyEnabled && legacyMode == RuleMode.PER_LAUNCH
         }
+        val scheduleEnabled = prefs.getBoolean("${prefix}schedule_enabled", false)
         return AppRule(
             packageName = packageName,
-            enabled = legacyEnabled && (dailyEnabled || perLaunchEnabled),
+            enabled = legacyEnabled && (dailyEnabled || perLaunchEnabled || scheduleEnabled),
             dailyEnabled = dailyEnabled,
             dailyLimitSeconds = prefs.getLong(
                 "${prefix}daily_limit_seconds",
@@ -41,6 +42,15 @@ class RuleRepository(context: Context) {
                 "${prefix}per_launch_limit_seconds",
                 legacyLimitSeconds,
             ).coerceAtLeast(1L),
+            scheduleEnabled = scheduleEnabled,
+            scheduleMode = prefs.getString(
+                "${prefix}schedule_mode",
+                ScheduleMode.BLOCK_DURING.name,
+            )?.let { runCatching { ScheduleMode.valueOf(it) }.getOrNull() }
+                ?: ScheduleMode.BLOCK_DURING,
+            scheduleWindows = ScheduleCodec.decode(
+                prefs.getString("${prefix}schedule_windows", null),
+            ),
             version = prefs.getLong("${prefix}version", 0L),
         )
     }
@@ -51,11 +61,17 @@ class RuleRepository(context: Context) {
         val prefix = prefix(rule.packageName)
         prefs.edit()
             .putStringSet(KEY_PACKAGES, packages)
-            .putBoolean("${prefix}enabled", rule.enabled && (rule.dailyEnabled || rule.perLaunchEnabled))
+            .putBoolean(
+                "${prefix}enabled",
+                rule.enabled && (rule.dailyEnabled || rule.perLaunchEnabled || rule.scheduleEnabled),
+            )
             .putBoolean("${prefix}daily_enabled", rule.dailyEnabled)
             .putLong("${prefix}daily_limit_seconds", rule.dailyLimitSeconds.coerceAtLeast(1L))
             .putBoolean("${prefix}per_launch_enabled", rule.perLaunchEnabled)
             .putLong("${prefix}per_launch_limit_seconds", rule.perLaunchLimitSeconds.coerceAtLeast(1L))
+            .putBoolean("${prefix}schedule_enabled", rule.scheduleEnabled)
+            .putString("${prefix}schedule_mode", rule.scheduleMode.name)
+            .putString("${prefix}schedule_windows", ScheduleCodec.encode(rule.scheduleWindows))
             // Keep one legacy representation so downgrading does not leave an unreadable rule.
             .putLong(
                 "${prefix}limit_seconds",

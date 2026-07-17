@@ -2,12 +2,14 @@
 
 An Android Xposed module prototype that limits the foreground usage time of selected apps. When an app reaches its configured limit, the module closes its task stack and terminates the process hosting the target UI.
 
-Current version: `0.5.0`
+Current version: `0.6.0`
 
 ## Features
 
 - Browse and search launchable apps with their real application icons.
 - Configure independent daily cumulative and per-launch limits of 1–1,440 minutes for each app; either limit can trigger the exit.
+- Configure weekly schedule windows in either **allow-only** or **block-during** mode, with multiple weekdays and overnight windows supported.
+- Check the schedule immediately when an app opens, warn five seconds before a blocked boundary, and exit at the boundary. Schedule restrictions cannot be bypassed with the delay action.
 - **Daily cumulative mode:** accumulate foreground usage across multiple launches and reset automatically each day.
 - **Per-launch mode:** start a fresh timer whenever the target app's main process starts.
 - Count time only while an activity is between `onResume` and `onPause`; background time is paused.
@@ -42,6 +44,7 @@ Key source files:
 - `app/src/main/java/com/liuml/apptimelimiter/ipc/RuleProvider.kt`: controlled IPC for reading rules and sending diagnostic logs.
 - `app/src/main/java/com/liuml/apptimelimiter/diagnostics/DiagnosticsRepository.kt`: rolling diagnostic log storage.
 - `app/src/main/java/com/liuml/apptimelimiter/xposed/AppTimeLimitHook.kt`: lifecycle hooks, timers, daily state, and exit logic.
+- `app/src/main/java/com/liuml/apptimelimiter/core/ScheduleEvaluator.kt`: weekly schedule matching, overnight handling, and next-boundary calculation.
 - `xposed-stubs/`: compile-time Xposed API signatures; they are not packaged into the APK.
 
 ## Requirements

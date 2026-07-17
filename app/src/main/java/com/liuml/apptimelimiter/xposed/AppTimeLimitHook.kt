@@ -10,7 +10,12 @@ import android.os.Process
 import android.os.SystemClock
 import android.widget.Toast
 import com.liuml.apptimelimiter.core.UsageMath
+import com.liuml.apptimelimiter.core.ScheduleDecision
+import com.liuml.apptimelimiter.core.ScheduleEvaluator
 import com.liuml.apptimelimiter.data.RuleRepository
+import com.liuml.apptimelimiter.data.ScheduleCodec
+import com.liuml.apptimelimiter.data.ScheduleMode
+import com.liuml.apptimelimiter.data.ScheduleWindow
 import com.liuml.apptimelimiter.ipc.RuleContract
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -19,7 +24,10 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import java.util.Calendar
+import java.util.Locale
 
 class AppTimeLimitHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -88,9 +96,13 @@ private class RuntimeLimiter(
     private var warningShownForExtensionMs = Long.MIN_VALUE
     private var warningDialog: AlertDialog? = null
     private var warningCountdown: Runnable? = null
+    private var scheduleWarningDialog: AlertDialog? = null
+    private var scheduleWarningCountdown: Runnable? = null
 
     private val deadline = Runnable { checkDeadline() }
     private val warningDeadline = Runnable { showExitWarning() }
+    private val scheduleDeadline = Runnable { checkScheduleBoundary() }
+    private val scheduleWarningDeadline = Runnable { showScheduleWarning() }
 
     fun onActivityResumed(activity: Activity) {
         if (exitScheduled) return
@@ -104,13 +116,13 @@ private class RuntimeLimiter(
             )
         }
 
-        val ruleSummary = "${rule.enabled}/${rule.dailyEnabled}/${rule.dailyLimitMillis}/${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis}/${rule.version}/${rule.exitWarningEnabled}/${rule.extensionMillis}/${rule.diagnosticsEnabled}/${rule.source}"
+        val ruleSummary = "${rule.enabled}/${rule.dailyEnabled}/${rule.dailyLimitMillis}/${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis}/${rule.scheduleEnabled}/${rule.scheduleMode}/${ScheduleCodec.encode(rule.scheduleWindows)}/${rule.version}/${rule.exitWarningEnabled}/${rule.extensionMillis}/${rule.diagnosticsEnabled}/${rule.source}"
         if (lastRuleSummary != ruleSummary) {
             lastRuleSummary = ruleSummary
             diagnostic(
                 activity,
                 event = "RULE_READ",
-                message = "enabled=${rule.enabled}, daily=${rule.dailyEnabled}/${rule.dailyLimitMillis / 1000}s, perLaunch=${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis / 1000}s, warning=${rule.exitWarningEnabled}, extension=${rule.extensionMillis / 1000}s, source=${rule.source}",
+                message = "enabled=${rule.enabled}, daily=${rule.dailyEnabled}/${rule.dailyLimitMillis / 1000}s, perLaunch=${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis / 1000}s, schedule=${rule.scheduleEnabled}/${rule.scheduleMode}/${rule.scheduleWindows.size}, warning=${rule.exitWarningEnabled}, extension=${rule.extensionMillis / 1000}s, source=${rule.source}",
             )
         }
 
@@ -127,15 +139,32 @@ private class RuntimeLimiter(
             foregroundStartedAt = NOT_RUNNING
         }
 
+        if (rule.scheduleEnabled) {
+            val scheduleDecision = evaluateSchedule(rule)
+            if (!scheduleDecision.allowed) {
+                forceScheduleExit(activity, rule, scheduleDecision, openedDuringBlockedTime = true)
+                return
+            }
+        }
+
         activeActivity = WeakReference(activity)
         val startedNow = foregroundStartedAt == NOT_RUNNING
         if (startedNow) foregroundStartedAt = SystemClock.elapsedRealtime()
-        val remainingMs = scheduleDeadline(activity, rule)
+        val remainingMs = if (rule.dailyEnabled || rule.perLaunchEnabled) {
+            scheduleDeadline(activity, rule)
+        } else {
+            null
+        }
+        val scheduleRemainingMs = if (!exitScheduled) scheduleScheduleBoundary(activity, rule) else null
         if (startedNow && !exitScheduled) {
             diagnostic(
                 activity,
                 event = "TIMER_START",
-                message = "开始前台计时，最早阈值剩余=${remainingMs / 1000.0}s",
+                message = buildString {
+                    append("开始前台计时")
+                    remainingMs?.let { append("，最早时长阈值剩余=${it / 1000.0}s") }
+                    scheduleRemainingMs?.let { append("，时段边界剩余=${it / 1000.0}s") }
+                },
             )
         }
     }
@@ -148,7 +177,10 @@ private class RuntimeLimiter(
         activeActivity.clear()
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
+        mainHandler.removeCallbacks(scheduleDeadline)
+        mainHandler.removeCallbacks(scheduleWarningDeadline)
         dismissWarning(resetForCurrentLimit = true)
+        dismissScheduleWarning()
         if (rule.enabled && segmentMs >= LOGGABLE_SEGMENT_MS) {
             diagnostic(
                 activity,
@@ -194,6 +226,78 @@ private class RuntimeLimiter(
         }
     }
 
+    private fun scheduleScheduleBoundary(activity: Activity, rule: HookRule): Long? {
+        if (exitScheduled) return null
+        mainHandler.removeCallbacks(scheduleDeadline)
+        mainHandler.removeCallbacks(scheduleWarningDeadline)
+        if (!rule.scheduleEnabled) return null
+        val decision = evaluateSchedule(rule)
+        if (!decision.allowed) {
+            forceScheduleExit(activity, rule, decision, openedDuringBlockedTime = false)
+            return 0L
+        }
+        val remainingMs = decision.millisUntilTransition(ZonedDateTime.now()) ?: return null
+        mainHandler.postDelayed(scheduleDeadline, minOf(remainingMs, SCHEDULE_RECHECK_MAX_MS))
+        if (rule.exitWarningEnabled && remainingMs <= SCHEDULE_RECHECK_MAX_MS) {
+            mainHandler.postDelayed(
+                scheduleWarningDeadline,
+                UsageMath.warningDelayMillis(remainingMs, WARNING_LEAD_MS),
+            )
+        }
+        return remainingMs
+    }
+
+    private fun checkScheduleBoundary() {
+        val activity = activeActivity.get() ?: return
+        if (activity.isFinishing || activity.isDestroyed) return
+        val rule = readRule(activity, reloadFallback = true)
+        if (!rule.enabled) {
+            stopTiming()
+            return
+        }
+        if (!rule.scheduleEnabled) {
+            mainHandler.removeCallbacks(scheduleWarningDeadline)
+            dismissScheduleWarning()
+            return
+        }
+        val decision = evaluateSchedule(rule)
+        if (!decision.allowed) {
+            forceScheduleExit(activity, rule, decision, openedDuringBlockedTime = false)
+        } else {
+            scheduleScheduleBoundary(activity, rule)
+        }
+    }
+
+    private fun forceScheduleExit(
+        activity: Activity,
+        rule: HookRule,
+        decision: ScheduleDecision,
+        openedDuringBlockedTime: Boolean,
+    ) {
+        if (exitScheduled) return
+        exitScheduled = true
+        if (foregroundStartedAt != NOT_RUNNING) commitActiveSegment(activity, rule)
+        mainHandler.removeCallbacks(deadline)
+        mainHandler.removeCallbacks(warningDeadline)
+        mainHandler.removeCallbacks(scheduleDeadline)
+        mainHandler.removeCallbacks(scheduleWarningDeadline)
+        dismissWarning(resetForCurrentLimit = false)
+        dismissScheduleWarning()
+        val nextAllowed = formatNextTransition(decision)
+        diagnostic(
+            activity,
+            level = "WARN",
+            event = if (openedDuringBlockedTime) "SCHEDULE_DENIED" else "SCHEDULE_BOUNDARY_REACHED",
+            message = "当前时段不可使用；mode=${rule.scheduleMode}, nextAllowed=$nextAllowed, pid=${Process.myPid()}",
+        )
+        val message = if (nextAllowed == null) {
+            "当前处于不可用时段，应用即将退出"
+        } else {
+            "当前处于不可用时段，下次可用：$nextAllowed"
+        }
+        finishTarget(activity, message)
+    }
+
     private fun forceExit(activity: Activity, rule: HookRule, status: ThresholdStatus) {
         if (exitScheduled) return
         exitScheduled = true
@@ -208,6 +312,9 @@ private class RuntimeLimiter(
         foregroundStartedAt = NOT_RUNNING
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
+        mainHandler.removeCallbacks(scheduleDeadline)
+        mainHandler.removeCallbacks(scheduleWarningDeadline)
+        dismissScheduleWarning()
 
         diagnostic(
             activity,
@@ -215,8 +322,12 @@ private class RuntimeLimiter(
             event = "LIMIT_REACHED",
             message = "达到${status.reachedLabels}阈值（本次已延时 ${grantedExtensionMs / 1000}s），准备结束 pid=${Process.myPid()}",
         )
+        finishTarget(activity, "已达到使用时长，应用即将退出")
+    }
+
+    private fun finishTarget(activity: Activity, message: String) {
         runCatching {
-            Toast.makeText(activity, "已达到使用时长，应用即将退出", Toast.LENGTH_LONG).show()
+            Toast.makeText(activity, message, Toast.LENGTH_LONG).show()
             activity.finishAndRemoveTask()
             activity.finishAffinity()
             activity.moveTaskToBack(true)
@@ -251,12 +362,16 @@ private class RuntimeLimiter(
         activeActivity.clear()
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
+        mainHandler.removeCallbacks(scheduleDeadline)
+        mainHandler.removeCallbacks(scheduleWarningDeadline)
         dismissWarning(resetForCurrentLimit = true)
+        dismissScheduleWarning()
     }
 
     private fun showExitWarning() {
         val activity = activeActivity.get() ?: return
         if (activity.isFinishing || activity.isDestroyed || exitScheduled) return
+        if (scheduleWarningDialog?.isShowing == true) return
         val rule = readRule(activity, reloadFallback = true)
         if (!rule.enabled || !rule.exitWarningEnabled) return
 
@@ -304,6 +419,71 @@ private class RuntimeLimiter(
         }
     }
 
+    private fun showScheduleWarning() {
+        val activity = activeActivity.get() ?: return
+        if (activity.isFinishing || activity.isDestroyed || exitScheduled) return
+        val rule = readRule(activity, reloadFallback = true)
+        if (!rule.enabled || !rule.scheduleEnabled || !rule.exitWarningEnabled) return
+        val decision = evaluateSchedule(rule)
+        if (!decision.allowed) {
+            forceScheduleExit(activity, rule, decision, openedDuringBlockedTime = false)
+            return
+        }
+        val remainingMs = decision.millisUntilTransition(ZonedDateTime.now()) ?: return
+        if (remainingMs > WARNING_LEAD_MS) {
+            scheduleScheduleBoundary(activity, rule)
+            return
+        }
+        if (scheduleWarningDialog?.isShowing == true) return
+        dismissWarning(resetForCurrentLimit = false)
+        val dialog = AlertDialog.Builder(activity)
+            .setTitle("即将进入不可用时段")
+            .setMessage(scheduleWarningMessage(remainingMs))
+            .setPositiveButton("知道了", null)
+            .setCancelable(false)
+            .create()
+        dialog.setOnDismissListener {
+            scheduleWarningCountdown?.let(mainHandler::removeCallbacks)
+            scheduleWarningCountdown = null
+            if (scheduleWarningDialog === dialog) scheduleWarningDialog = null
+        }
+        runCatching {
+            dialog.show()
+            scheduleWarningDialog = dialog
+            diagnostic(
+                activity,
+                event = "SCHEDULE_WARNING_SHOWN",
+                message = "不可用时段开始前提醒已显示",
+            )
+            startScheduleWarningCountdown(dialog, rule)
+        }.onFailure {
+            diagnostic(activity, level = "ERROR", event = "SCHEDULE_WARNING_FAILED", message = it.toString())
+        }
+    }
+
+    private fun startScheduleWarningCountdown(dialog: AlertDialog, rule: HookRule) {
+        val countdown = object : Runnable {
+            override fun run() {
+                if (!dialog.isShowing || exitScheduled) return
+                val decision = evaluateSchedule(rule)
+                if (!decision.allowed) {
+                    checkScheduleBoundary()
+                    return
+                }
+                val remainingMs = decision.millisUntilTransition(ZonedDateTime.now()) ?: return
+                dialog.setMessage(scheduleWarningMessage(remainingMs))
+                if (remainingMs > 0L) mainHandler.postDelayed(this, COUNTDOWN_REFRESH_MS)
+            }
+        }
+        scheduleWarningCountdown = countdown
+        mainHandler.post(countdown)
+    }
+
+    private fun scheduleWarningMessage(remainingMs: Long): String {
+        val seconds = ((remainingMs + 999L) / 1000L).coerceAtLeast(0L)
+        return "将在 $seconds 秒后进入不可用时段并退出应用。\n时段限制不能通过延时按钮绕过。"
+    }
+
     private fun startWarningCountdown(dialog: AlertDialog, activity: Activity, rule: HookRule) {
         val countdown = object : Runnable {
             override fun run() {
@@ -344,6 +524,22 @@ private class RuntimeLimiter(
         warningDialog = null
         if (resetForCurrentLimit) warningShownForExtensionMs = Long.MIN_VALUE
     }
+
+    private fun dismissScheduleWarning() {
+        scheduleWarningCountdown?.let(mainHandler::removeCallbacks)
+        scheduleWarningCountdown = null
+        scheduleWarningDialog?.let { dialog -> runCatching { dialog.dismiss() } }
+        scheduleWarningDialog = null
+    }
+
+    private fun evaluateSchedule(rule: HookRule): ScheduleDecision = ScheduleEvaluator.evaluate(
+        mode = rule.scheduleMode,
+        windows = rule.scheduleWindows,
+        now = ZonedDateTime.now(),
+    )
+
+    private fun formatNextTransition(decision: ScheduleDecision): String? = decision.nextTransition
+        ?.format(DateTimeFormatter.ofPattern("M月d日 E HH:mm", Locale.CHINA))
 
     private fun effectiveLimitMillis(baseLimitMillis: Long): Long =
         (baseLimitMillis + grantedExtensionMs).coerceAtMost(Long.MAX_VALUE / 2L)
@@ -455,6 +651,13 @@ private class RuntimeLimiter(
                     RuleContract.KEY_PER_LAUNCH_LIMIT_SECONDS,
                     RuleRepository.DEFAULT_LIMIT_SECONDS,
                 ).coerceAtLeast(1L) * 1000L,
+                scheduleEnabled = result.getBoolean(RuleContract.KEY_SCHEDULE_ENABLED, false),
+                scheduleMode = result.getString(RuleContract.KEY_SCHEDULE_MODE)
+                    ?.let { runCatching { ScheduleMode.valueOf(it) }.getOrNull() }
+                    ?: ScheduleMode.BLOCK_DURING,
+                scheduleWindows = ScheduleCodec.decode(
+                    result.getString(RuleContract.KEY_SCHEDULE_WINDOWS),
+                ),
                 version = result.getLong(RuleContract.KEY_VERSION, 0L),
                 exitWarningEnabled = result.getBoolean(RuleContract.KEY_EXIT_WARNING_ENABLED, true),
                 extensionMillis = result.getLong(
@@ -496,8 +699,9 @@ private class RuntimeLimiter(
         } else {
             legacyEnabled && !legacyDaily
         }
+        val scheduleEnabled = preferences.getBoolean("${prefix}schedule_enabled", false)
         val rule = HookRule(
-            enabled = legacyEnabled && (dailyEnabled || perLaunchEnabled),
+            enabled = legacyEnabled && (dailyEnabled || perLaunchEnabled || scheduleEnabled),
             dailyEnabled = dailyEnabled,
             dailyLimitMillis = (if (dailyLimitSeconds >= 0L) dailyLimitSeconds else legacyLimitSeconds)
                 .coerceAtLeast(1L) * 1000L,
@@ -507,6 +711,15 @@ private class RuntimeLimiter(
             } else {
                 legacyLimitSeconds
             }).coerceAtLeast(1L) * 1000L,
+            scheduleEnabled = scheduleEnabled,
+            scheduleMode = preferences.getString(
+                "${prefix}schedule_mode",
+                ScheduleMode.BLOCK_DURING.name,
+            )?.let { runCatching { ScheduleMode.valueOf(it) }.getOrNull() }
+                ?: ScheduleMode.BLOCK_DURING,
+            scheduleWindows = ScheduleCodec.decode(
+                preferences.getString("${prefix}schedule_windows", null),
+            ),
             version = preferences.getLong("${prefix}version", 0L),
             exitWarningEnabled = preferences.getBoolean(RuleRepository.KEY_EXIT_WARNING_ENABLED, true),
             extensionMillis = preferences.getLong(
@@ -561,6 +774,9 @@ private class RuntimeLimiter(
         val dailyLimitMillis: Long,
         val perLaunchEnabled: Boolean,
         val perLaunchLimitMillis: Long,
+        val scheduleEnabled: Boolean,
+        val scheduleMode: ScheduleMode,
+        val scheduleWindows: List<ScheduleWindow>,
         val version: Long,
         val exitWarningEnabled: Boolean,
         val extensionMillis: Long,
@@ -590,6 +806,7 @@ private class RuntimeLimiter(
         const val EXIT_DELAY_MS = 350L
         const val WARNING_LEAD_MS = 5_000L
         const val COUNTDOWN_REFRESH_MS = 250L
+        const val SCHEDULE_RECHECK_MAX_MS = 60_000L
         const val MAX_TOTAL_EXTENSION_MS = 24L * 60L * 60L * 1000L
     }
 }

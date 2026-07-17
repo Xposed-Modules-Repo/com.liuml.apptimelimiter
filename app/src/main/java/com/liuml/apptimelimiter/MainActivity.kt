@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
+import android.app.TimePickerDialog
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
@@ -18,6 +19,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -37,6 +40,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -71,6 +75,8 @@ import com.liuml.apptimelimiter.data.GlobalSettings
 import com.liuml.apptimelimiter.data.InstalledApp
 import com.liuml.apptimelimiter.data.InstalledAppsRepository
 import com.liuml.apptimelimiter.data.RuleRepository
+import com.liuml.apptimelimiter.data.ScheduleMode
+import com.liuml.apptimelimiter.data.ScheduleWindow
 import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
 import com.liuml.apptimelimiter.support.FeedbackSender
 import com.liuml.apptimelimiter.update.ReleaseInfo
@@ -214,7 +220,7 @@ private fun TimeLimiterScreen(
                         "INFO",
                         app.packageName,
                         "RULE_SAVED",
-                        "enabled=${configuredRule.enabled}, daily=${configuredRule.dailyEnabled}/${configuredRule.dailyLimitSeconds}s, perLaunch=${configuredRule.perLaunchEnabled}/${configuredRule.perLaunchLimitSeconds}s",
+                        "enabled=${configuredRule.enabled}, daily=${configuredRule.dailyEnabled}/${configuredRule.dailyLimitSeconds}s, perLaunch=${configuredRule.perLaunchEnabled}/${configuredRule.perLaunchLimitSeconds}s, schedule=${configuredRule.scheduleEnabled}/${configuredRule.scheduleMode}/${configuredRule.scheduleWindows.size}",
                     )
                 }
                 rules[app.packageName] = repository.getRule(app.packageName)
@@ -665,7 +671,7 @@ private fun AboutDialog(
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("版本 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
                 Text("Android / LSPosed 应用前台使用时长限制模块。")
-                Text("单次打开与每日累计可同时启用，任一阈值到期即退出目标应用。")
+                Text("单次打开、每日累计和每周可用时段可以组合使用，任一限制触发即退出目标应用。")
                 Text("反馈邮箱：${FeedbackSender.EMAIL}")
                 TextButton(onClick = onOpenRepository) { Text("打开 GitHub 项目主页") }
                 TextButton(onClick = onFeedback) { Text("发送问题反馈") }
@@ -770,11 +776,17 @@ private fun RuleDialog(
     var perLaunchMinutes by remember(app.packageName) {
         mutableStateOf((initialRule.perLaunchLimitSeconds / 60L).coerceAtLeast(1L).toString())
     }
+    var scheduleEnabled by remember(app.packageName) { mutableStateOf(initialRule.scheduleEnabled) }
+    var scheduleMode by remember(app.packageName) { mutableStateOf(initialRule.scheduleMode) }
+    var scheduleWindows by remember(app.packageName) { mutableStateOf(initialRule.scheduleWindows) }
     val parsedDailyMinutes = dailyMinutes.toLongOrNull()?.takeIf { it in 1..1440 }
     val parsedPerLaunchMinutes = perLaunchMinutes.toLongOrNull()?.takeIf { it in 1..1440 }
-    val canSave = (dailyEnabled || perLaunchEnabled) &&
+    val scheduleValid = !scheduleEnabled ||
+        (scheduleWindows.isNotEmpty() && scheduleWindows.all(ScheduleWindow::isValid))
+    val canSave = (dailyEnabled || perLaunchEnabled || scheduleEnabled) &&
         (!dailyEnabled || parsedDailyMinutes != null) &&
-        (!perLaunchEnabled || parsedPerLaunchMinutes != null)
+        (!perLaunchEnabled || parsedPerLaunchMinutes != null) &&
+        scheduleValid
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -815,6 +827,17 @@ private fun RuleDialog(
                         color = MaterialTheme.colorScheme.primary,
                     )
                 }
+                item { HorizontalDivider() }
+                item {
+                    ScheduleEditor(
+                        enabled = scheduleEnabled,
+                        mode = scheduleMode,
+                        windows = scheduleWindows,
+                        onEnabledChange = { scheduleEnabled = it },
+                        onModeChange = { scheduleMode = it },
+                        onWindowsChange = { scheduleWindows = it },
+                    )
+                }
             }
         },
         confirmButton = {
@@ -827,6 +850,9 @@ private fun RuleDialog(
                             dailyLimitSeconds = (parsedDailyMinutes ?: 1L) * 60L,
                             perLaunchEnabled = perLaunchEnabled,
                             perLaunchLimitSeconds = (parsedPerLaunchMinutes ?: 1L) * 60L,
+                            scheduleEnabled = scheduleEnabled,
+                            scheduleMode = scheduleMode,
+                            scheduleWindows = scheduleWindows,
                         ),
                     )
                 },
@@ -845,6 +871,7 @@ private fun RuleDialog(
                                 dailyEnabled = false,
                                 perLaunchEnabled = true,
                                 perLaunchLimitSeconds = 10L,
+                                scheduleEnabled = false,
                             ),
                         )
                     },
@@ -854,6 +881,221 @@ private fun RuleDialog(
         },
     )
 }
+
+@Composable
+private fun ScheduleEditor(
+    enabled: Boolean,
+    mode: ScheduleMode,
+    windows: List<ScheduleWindow>,
+    onEnabledChange: (Boolean) -> Unit,
+    onModeChange: (ScheduleMode) -> Unit,
+    onWindowsChange: (List<ScheduleWindow>) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("可用时段", fontWeight = FontWeight.Medium)
+                Text("按星期和时间限制应用是否允许打开", style = MaterialTheme.typography.bodySmall)
+            }
+            Switch(checked = enabled, onCheckedChange = onEnabledChange)
+        }
+        if (enabled) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val allowSelected = mode == ScheduleMode.ALLOW_ONLY
+                FilterChip(
+                    selected = allowSelected,
+                    onClick = { onModeChange(ScheduleMode.ALLOW_ONLY) },
+                    label = {
+                        Text(
+                            if (allowSelected) "✓ 仅指定时段允许" else "仅指定时段允许",
+                            fontWeight = if (allowSelected) FontWeight.Bold else FontWeight.Normal,
+                        )
+                    },
+                    colors = FilterChipDefaults.filterChipColors(
+                        containerColor = Color(0xFFE5E7EB),
+                        labelColor = Color(0xFF6B7280),
+                        selectedContainerColor = Color(0xFF19734A),
+                        selectedLabelColor = Color.White,
+                    ),
+                )
+                val blockSelected = mode == ScheduleMode.BLOCK_DURING
+                FilterChip(
+                    selected = blockSelected,
+                    onClick = { onModeChange(ScheduleMode.BLOCK_DURING) },
+                    label = {
+                        Text(
+                            if (blockSelected) "✓ 指定时段禁止" else "指定时段禁止",
+                            fontWeight = if (blockSelected) FontWeight.Bold else FontWeight.Normal,
+                        )
+                    },
+                    colors = FilterChipDefaults.filterChipColors(
+                        containerColor = Color(0xFFE5E7EB),
+                        labelColor = Color(0xFF6B7280),
+                        selectedContainerColor = Color(0xFFB3261E),
+                        selectedLabelColor = Color.White,
+                    ),
+                )
+            }
+            Text(
+                if (mode == ScheduleMode.ALLOW_ONLY) {
+                    "只有下列时段可以使用，其他时间打开会立即退出。"
+                } else {
+                    "下列时段不能使用，其他时间正常开放。"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            windows.forEachIndexed { index, window ->
+                ScheduleWindowEditor(
+                    window = window,
+                    onChange = { updated ->
+                        onWindowsChange(windows.toMutableList().also { it[index] = updated })
+                    },
+                    onDelete = {
+                        onWindowsChange(windows.toMutableList().also { it.removeAt(index) })
+                    },
+                )
+            }
+            OutlinedButton(
+                onClick = {
+                    onWindowsChange(
+                        windows + ScheduleWindow(
+                            daysOfWeek = (1..7).toSet(),
+                            startMinute = 8 * 60,
+                            endMinute = 22 * 60,
+                        ),
+                    )
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("添加时段") }
+            if (windows.isEmpty()) {
+                Text(
+                    "请至少添加一个时段。",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ScheduleWindowEditor(
+    window: ScheduleWindow,
+    onChange: (ScheduleWindow) -> Unit,
+    onDelete: () -> Unit,
+) {
+    val context = LocalContext.current
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFF2F4F8)),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("重复日期", fontWeight = FontWeight.Medium)
+                TextButton(onClick = onDelete) { Text("删除") }
+            }
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                WEEKDAY_LABELS.forEachIndexed { index, label ->
+                    val day = index + 1
+                    val selected = day in window.daysOfWeek
+                    FilterChip(
+                        selected = selected,
+                        onClick = {
+                            val days = window.daysOfWeek.toMutableSet()
+                            if (!days.add(day)) days.remove(day)
+                            onChange(window.copy(daysOfWeek = days))
+                        },
+                        label = {
+                            Text(
+                                if (selected) "✓$label" else label,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                            )
+                        },
+                        colors = FilterChipDefaults.filterChipColors(
+                            containerColor = Color(0xFFE2E4E8),
+                            labelColor = Color(0xFF7A7F89),
+                            selectedContainerColor = Color(0xFF315EA8),
+                            selectedLabelColor = Color.White,
+                        ),
+                    )
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = {
+                        showTimePicker(context, window.startMinute) { minute ->
+                            onChange(window.copy(startMinute = minute))
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                ) { Text("开始 ${formatMinuteOfDay(window.startMinute)}") }
+                OutlinedButton(
+                    onClick = {
+                        showTimePicker(context, window.endMinute) { minute ->
+                            onChange(window.copy(endMinute = minute))
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                ) { Text("结束 ${formatMinuteOfDay(window.endMinute)}") }
+            }
+            when {
+                window.startMinute == window.endMinute -> Text(
+                    "开始和结束时间不能相同。",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                window.daysOfWeek.isEmpty() -> Text(
+                    "请至少选择一天。",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                window.crossesMidnight -> Text(
+                    "该时段将在次日 ${formatMinuteOfDay(window.endMinute)} 结束。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+    }
+}
+
+private fun showTimePicker(context: Context, initialMinute: Int, onSelected: (Int) -> Unit) {
+    TimePickerDialog(
+        context,
+        { _, hour, minute -> onSelected(hour * 60 + minute) },
+        initialMinute / 60,
+        initialMinute % 60,
+        true,
+    ).show()
+}
+
+private fun formatMinuteOfDay(minute: Int): String = String.format(
+    java.util.Locale.ROOT,
+    "%02d:%02d",
+    minute / 60,
+    minute % 60,
+)
+
+private val WEEKDAY_LABELS = listOf("一", "二", "三", "四", "五", "六", "日")
 
 @Composable
 private fun ThresholdEditor(
@@ -897,6 +1139,9 @@ private fun formatDuration(seconds: Long): String =
 private fun ruleSummary(rule: AppRule): String = buildList {
     if (rule.dailyEnabled) add("每日 ${formatDuration(rule.dailyLimitSeconds)}")
     if (rule.perLaunchEnabled) add("单次 ${formatDuration(rule.perLaunchLimitSeconds)}")
+    if (rule.scheduleEnabled) {
+        add(if (rule.scheduleMode == ScheduleMode.ALLOW_ONLY) "限定允许时段" else "设有禁止时段")
+    }
 }.joinToString(" · ")
 
 @Composable

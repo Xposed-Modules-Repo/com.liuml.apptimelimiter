@@ -2,12 +2,14 @@
 
 [English documentation](README.en.md)
 
-这是一个可运行的 Android Xposed 模块原型：为指定应用设置前台可使用时长，达到限制后先关闭任务栈，再结束目标应用界面所在进程。当前版本为 `0.5.0`。
+这是一个可运行的 Android Xposed 模块原型：为指定应用设置前台可使用时长和可用时段，达到限制后先关闭任务栈，再结束目标应用界面所在进程。当前版本为 `0.6.0`。
 
 ## 已实现
 
 - 展示应用真实图标，并可搜索设备上的可启动应用。
 - 为每个应用分别设置 1–1440 分钟的每日累计和单次打开限制；两个阈值可同时启用，任意一个先到期都会退出应用。
+- 可为每个应用选择“仅指定时段允许”或“指定时段禁止”，支持多个星期组合和跨午夜时段。
+- 打开应用时立即检查时段；应用保持前台时会在不可用边界前 5 秒提醒，到达边界后退出。时段限制不能通过延时按钮绕过。
 - **每日累计**：当天多次打开累计前台时长，第二天自动重置；超限后当天再次打开会立即退出。
 - **单次打开**：目标应用每次主进程启动后重新计时。
 - 仅在 `Activity.onResume` 到 `Activity.onPause` 之间计时，切到后台时暂停。
@@ -43,6 +45,7 @@ flowchart LR
 - `app/src/main/java/com/liuml/apptimelimiter/ipc/RuleProvider.kt`：目标进程读取规则和回传日志的受控 IPC 通道。
 - `app/src/main/java/com/liuml/apptimelimiter/diagnostics/DiagnosticsRepository.kt`：滚动诊断日志。
 - `app/src/main/java/com/liuml/apptimelimiter/xposed/AppTimeLimitHook.kt`：生命周期 Hook、计时、每日状态和退出逻辑。
+- `app/src/main/java/com/liuml/apptimelimiter/core/ScheduleEvaluator.kt`：每周时段匹配、跨午夜处理和下一访问边界计算。
 - `xposed-stubs/`：只用于编译的传统 Xposed API 签名，不会打包进 APK。
 
 ## 构建

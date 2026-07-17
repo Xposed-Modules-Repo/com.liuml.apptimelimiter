@@ -8,6 +8,7 @@ import android.os.Binder
 import android.os.Bundle
 import android.os.Process
 import com.liuml.apptimelimiter.data.RuleRepository
+import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
 
 class RuleProvider : ContentProvider() {
@@ -28,6 +29,12 @@ class RuleProvider : ContentProvider() {
                     putLong(RuleContract.KEY_DAILY_LIMIT_SECONDS, rule.dailyLimitSeconds)
                     putBoolean(RuleContract.KEY_PER_LAUNCH_ENABLED, rule.perLaunchEnabled)
                     putLong(RuleContract.KEY_PER_LAUNCH_LIMIT_SECONDS, rule.perLaunchLimitSeconds)
+                    putBoolean(RuleContract.KEY_SCHEDULE_ENABLED, rule.scheduleEnabled)
+                    putString(RuleContract.KEY_SCHEDULE_MODE, rule.scheduleMode.name)
+                    putString(
+                        RuleContract.KEY_SCHEDULE_WINDOWS,
+                        ScheduleCodec.encode(rule.scheduleWindows),
+                    )
                     putLong(RuleContract.KEY_VERSION, rule.version)
                     putBoolean(RuleContract.KEY_EXIT_WARNING_ENABLED, settings.exitWarningEnabled)
                     putLong(RuleContract.KEY_EXTENSION_SECONDS, settings.extensionSeconds)
