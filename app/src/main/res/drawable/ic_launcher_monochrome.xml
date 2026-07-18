@@ -1,13 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Legacy launcher icon. The segmented dial and angular T form a time-control mark. -->
+<!-- Android 13+ themed icon mask. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <path
-        android:fillColor="#050505"
-        android:pathData="M18,6 L90,6 A12,12 0,0 1,102 18 L102,90 A12,12 0,0 1,90 102 L18,102 A12,12 0,0 1,6 90 L6,18 A12,12 0,0 1,18 6 Z" />
     <path
         android:fillColor="@android:color/transparent"
         android:pathData="M54,19 A35,35 0,0 1,85.72 39.21 M89,54 A35,35 0,0 1,68.79 85.72 M54,89 A35,35 0,0 1,22.28 68.79 M19,54 A35,35 0,0 1,39.21 22.28"
@@ -17,12 +14,6 @@
     <path
         android:fillColor="#FFFFFF"
         android:pathData="M27,29 L81,29 L81,41 L61,41 L61,73 L54,82 L47,73 L47,41 L27,41 Z" />
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M55,51 L71,43 L75,49 L58,58 Z" />
-    <path
-        android:fillColor="#050505"
-        android:pathData="M54,50 A4,4 0,1 0,54,58 A4,4 0,1 0,54,50" />
     <path
         android:fillColor="#FFFFFF"
         android:pathData="M51,16 L57,16 L57,22 L51,22 Z M86,51 L92,51 L92,57 L86,57 Z M51,86 L57,86 L57,92 L51,92 Z M16,51 L22,51 L22,57 L16,57 Z" />

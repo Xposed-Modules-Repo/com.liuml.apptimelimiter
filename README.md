@@ -1,8 +1,8 @@
-# 应用计时退出（Android / LSPosed）
+# 时停（Android / LSPosed）
 
 [English documentation](README.en.md)
 
-这是一个可运行的 Android Xposed 模块原型：为指定应用设置前台可使用时长和可用时段，达到限制后先关闭任务栈，再结束目标应用界面所在进程。当前版本为 `0.6.0`。
+这是一个可运行的 Android Xposed 模块原型：为指定应用设置前台可使用时长和可用时段，达到限制后先关闭任务栈，再结束目标应用界面所在进程。当前版本为 `0.8.0`。
 
 ## 已实现
 
@@ -22,6 +22,9 @@
 - 设置页提供支付宝捐赠入口，尝试跳转到 `liuml.yx@139.com` 的账户转账页；不支持直接跳转时复制账号并打开支付宝。
 - 设置页可通过 GitHub Releases 检查新版本，并调用系统下载管理器下载新版 APK。
 - “关于”页面展示版本、项目主页和联系方式；“反馈问题”会调用用户选择的邮件应用，并附加诊断日志发送至 `liuml.yx@139.com`。
+- 设置页可隐藏桌面启动图标。隐藏后可尝试从 LSPosed 模块页打开，或通过 `adb shell am start -a android.intent.action.VIEW -d apptimelimiter://settings` 进入设置并恢复图标。
+- 首页仪表盘显示真实 Hook 验证状态、已启用管控应用数和今日总使用时长；底部导航分为首页、应用和统计。
+- 每日使用时长在打开“时停”时通过 Android `UsageStatsManager` 按需读取，不轮询、不启动常驻服务；Hook 仅记录启动次数和限制触发次数。
 
 ## 架构
 
@@ -36,6 +39,7 @@ flowchart LR
     Lifecycle --> Timer["前台计时器"]
     Timer -->|"达到限制"| Exit["关闭任务栈 + 结束进程"]
     Timer --> State["目标应用本地累计状态"]
+    UI -->|"打开页面时按需查询"| UsageStats["Android UsageStatsManager"]
 ```
 
 主要代码：
@@ -70,12 +74,12 @@ subst T: /d
 ## 安装和使用
 
 1. 设备需已 Root，并安装可用的 LSPosed 框架。
-2. 安装 APK，打开“应用计时退出”，选择目标应用并保存规则。
+2. 安装 APK，打开“时停”，选择目标应用并保存规则。
 3. 进入 LSPosed，启用本模块，在作用域中只勾选需要限制的应用。
 4. 强制停止目标应用后重新打开。修改 LSPosed 作用域后同样需要重启目标应用进程。
 5. 调试时可在 LSPosed 日志中搜索 `AppTimeLimiter`。
 
-应用不需要相机、存储、通知等危险运行时权限。联网权限只用于访问 GitHub Releases 检查和下载更新；`RECEIVE_BOOT_COMPLETED` 是普通权限，仅用于手机重启后恢复目标应用访问规则 Provider 的 URI 授权，不会在后台启动目标应用。
+应用不需要相机、存储、通知等危险运行时权限。使用统计需要用户在系统特殊权限页面授予“使用情况访问权限”，仅在打开首页或统计页时读取。联网权限只用于访问 GitHub Releases 检查和下载更新；`RECEIVE_BOOT_COMPLETED` 是普通权限，仅用于手机重启后恢复目标应用访问规则 Provider 的 URI 授权，不会在后台启动目标应用。
 
 ## 诊断日志判断方法
 

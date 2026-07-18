@@ -51,4 +51,6 @@ data class GlobalSettings(
     val exitWarningEnabled: Boolean = true,
     val extensionSeconds: Long = 5 * 60L,
     val diagnosticsEnabled: Boolean = true,
+    val launcherIconHidden: Boolean = false,
+    val usageStatsEnabled: Boolean = true,
 )

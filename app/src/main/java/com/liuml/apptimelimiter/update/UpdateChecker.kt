@@ -43,7 +43,7 @@ object UpdateChecker {
             ?.takeIf(File::exists)
             ?.delete()
         val request = DownloadManager.Request(Uri.parse(release.apkDownloadUrl))
-            .setTitle("应用计时退出 ${release.version}")
+            .setTitle("时停 ${release.version}")
             .setDescription("正在从 GitHub 下载更新")
             .setMimeType(APK_MIME_TYPE)
             .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)

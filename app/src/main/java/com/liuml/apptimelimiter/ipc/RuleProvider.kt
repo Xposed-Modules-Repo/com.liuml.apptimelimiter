@@ -10,6 +10,7 @@ import android.os.Process
 import com.liuml.apptimelimiter.data.RuleRepository
 import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
+import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 
 class RuleProvider : ContentProvider() {
     override fun onCreate(): Boolean = true
@@ -39,6 +40,7 @@ class RuleProvider : ContentProvider() {
                     putBoolean(RuleContract.KEY_EXIT_WARNING_ENABLED, settings.exitWarningEnabled)
                     putLong(RuleContract.KEY_EXTENSION_SECONDS, settings.extensionSeconds)
                     putBoolean(RuleContract.KEY_DIAGNOSTICS_ENABLED, settings.diagnosticsEnabled)
+                    putBoolean(RuleContract.KEY_USAGE_STATS_ENABLED, settings.usageStatsEnabled)
                 }
             }
 
@@ -52,6 +54,21 @@ class RuleProvider : ContentProvider() {
                     message = extras?.getString(RuleContract.KEY_MESSAGE).orEmpty(),
                 )
                 Bundle().apply { putBoolean(RuleContract.KEY_OK, true) }
+            }
+
+            RuleContract.METHOD_RECORD_USAGE -> {
+                val packageName = arg.orEmpty()
+                if (!isCallerAllowed(packageName)) return denied()
+                val persisted = UsageStatsRepository(appContext).record(
+                    packageName = packageName,
+                    durationMillis = extras?.getLong(RuleContract.KEY_DURATION_MS, 0L) ?: 0L,
+                    launchIncrement = extras?.getInt(RuleContract.KEY_LAUNCH_INCREMENT, 0) ?: 0,
+                    limitHitIncrement = extras?.getInt(
+                        RuleContract.KEY_LIMIT_HIT_INCREMENT,
+                        0,
+                    ) ?: 0,
+                )
+                Bundle().apply { putBoolean(RuleContract.KEY_OK, persisted) }
             }
 
             else -> super.call(method, arg, extras)

@@ -1,8 +1,8 @@
-# App Time Limiter (Android / LSPosed)
+# Time Stop (Android / LSPosed)
 
 An Android Xposed module prototype that limits the foreground usage time of selected apps. When an app reaches its configured limit, the module closes its task stack and terminates the process hosting the target UI.
 
-Current version: `0.6.0`
+Current version: `0.8.0`
 
 ## Features
 
@@ -21,6 +21,9 @@ Current version: `0.6.0`
 - Include an optional Alipay donation entry.
 - Check GitHub Releases for updates and download a newer APK through the system download manager.
 - Provide an About page and a feedback action that sends diagnostic logs through the user's mail app.
+- Show a dashboard with the real hook status, enabled-app count, and today's usage time.
+- Read foreground usage from Android's `UsageStatsManager` only when the dashboard or statistics page is opened.
+- Optionally hide the launcher icon and reopen settings from LSPosed or the `apptimelimiter://settings` deep link.
 
 ## Architecture
 
@@ -65,12 +68,12 @@ The debug APK is generated at `app/build/outputs/apk/debug/app-debug.apk`.
 ## Installation and Usage
 
 1. Install the APK on a rooted Android device.
-2. Open **App Time Limiter**, select target apps, and save their rules.
+2. Open **Time Stop**, select target apps, and save their rules.
 3. Enable the module in LSPosed and select only the apps that should be limited in the module scope.
 4. Force-stop and reopen each target app. Restart the target process after changing its LSPosed scope.
 5. Search for `AppTimeLimiter` in the LSPosed log when diagnosing a setup.
 
-The app does not request camera, storage, notification, or other dangerous runtime permissions. `RECEIVE_BOOT_COMPLETED` is used only to restore URI access after reboot; it does not launch target apps in the background.
+The app does not request camera, storage, notification, or other dangerous runtime permissions. Usage statistics require the user to grant Android's special usage-access permission and are read only when the dashboard or statistics page is opened. `RECEIVE_BOOT_COMPLETED` is used only to restore URI access after reboot; it does not launch target apps in the background.
 
 ## Diagnostics
 

@@ -98,11 +98,24 @@ private class RuntimeLimiter(
     private var warningCountdown: Runnable? = null
     private var scheduleWarningDialog: AlertDialog? = null
     private var scheduleWarningCountdown: Runnable? = null
+    private var sessionLaunchReported = false
+    private var statsContext: Context? = null
+    private var pendingStatsDurationMs = 0L
+    private var pendingStatsLaunches = 0
+    private var pendingStatsLimitHits = 0
+    private var pendingStatsHeartbeat = false
+    private var statsRetryCount = 0
+    private var statsSuccessLogged = false
+    private var statsFailureLogged = false
+    private var statsOutboxLoaded = false
 
     private val deadline = Runnable { checkDeadline() }
     private val warningDeadline = Runnable { showExitWarning() }
     private val scheduleDeadline = Runnable { checkScheduleBoundary() }
     private val scheduleWarningDeadline = Runnable { showScheduleWarning() }
+    private val statsRetry = Runnable {
+        statsContext?.let(::flushUsageEvents)
+    }
 
     fun onActivityResumed(activity: Activity) {
         if (exitScheduled) return
@@ -139,6 +152,16 @@ private class RuntimeLimiter(
             foregroundStartedAt = NOT_RUNNING
         }
 
+        if (!sessionLaunchReported) {
+            recordUsageEvent(
+                activity = activity,
+                durationMillis = 0L,
+                launchIncrement = if (rule.usageStatsEnabled) 1 else 0,
+                limitHitIncrement = 0,
+            )
+            sessionLaunchReported = true
+        }
+
         if (rule.scheduleEnabled) {
             val scheduleDecision = evaluateSchedule(rule)
             if (!scheduleDecision.allowed) {
@@ -149,7 +172,9 @@ private class RuntimeLimiter(
 
         activeActivity = WeakReference(activity)
         val startedNow = foregroundStartedAt == NOT_RUNNING
-        if (startedNow) foregroundStartedAt = SystemClock.elapsedRealtime()
+        if (startedNow) {
+            foregroundStartedAt = SystemClock.elapsedRealtime()
+        }
         val remainingMs = if (rule.dailyEnabled || rule.perLaunchEnabled) {
             scheduleDeadline(activity, rule)
         } else {
@@ -276,6 +301,7 @@ private class RuntimeLimiter(
     ) {
         if (exitScheduled) return
         exitScheduled = true
+        reportLimitHit(activity, rule)
         if (foregroundStartedAt != NOT_RUNNING) commitActiveSegment(activity, rule)
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
@@ -301,6 +327,7 @@ private class RuntimeLimiter(
     private fun forceExit(activity: Activity, rule: HookRule, status: ThresholdStatus) {
         if (exitScheduled) return
         exitScheduled = true
+        reportLimitHit(activity, rule)
         dismissWarning(resetForCurrentLimit = false)
         val segmentMs = activeSegmentMillis()
         if (rule.dailyEnabled) {
@@ -355,6 +382,109 @@ private class RuntimeLimiter(
         }
         if (rule.perLaunchEnabled) perLaunchCommittedMs += segmentMs
         foregroundStartedAt = NOT_RUNNING
+    }
+
+    private fun reportLimitHit(activity: Activity, rule: HookRule) {
+        recordUsageEvent(
+            activity = activity,
+            durationMillis = 0L,
+            launchIncrement = 0,
+            limitHitIncrement = if (rule.usageStatsEnabled) 1 else 0,
+        )
+    }
+
+    private fun recordUsageEvent(
+        activity: Activity,
+        durationMillis: Long,
+        launchIncrement: Int,
+        limitHitIncrement: Int,
+    ) {
+        val context = activity.applicationContext
+        statsContext = context
+        loadStatsOutbox(context)
+        pendingStatsDurationMs += durationMillis.coerceAtLeast(0L)
+        pendingStatsLaunches += launchIncrement.coerceAtLeast(0)
+        pendingStatsLimitHits += limitHitIncrement.coerceAtLeast(0)
+        pendingStatsHeartbeat = true
+        persistStatsOutbox(context)
+        flushUsageEvents(context)
+    }
+
+    private fun loadStatsOutbox(context: Context) {
+        if (statsOutboxLoaded) return
+        val prefs = context.getSharedPreferences(STATS_OUTBOX_PREFS, Context.MODE_PRIVATE)
+        pendingStatsDurationMs = prefs.getLong(OUTBOX_DURATION_MS, 0L).coerceAtLeast(0L)
+        pendingStatsLaunches = prefs.getInt(OUTBOX_LAUNCHES, 0).coerceAtLeast(0)
+        pendingStatsLimitHits = prefs.getInt(OUTBOX_LIMIT_HITS, 0).coerceAtLeast(0)
+        pendingStatsHeartbeat = prefs.getBoolean(OUTBOX_PENDING, false)
+        statsOutboxLoaded = true
+    }
+
+    private fun persistStatsOutbox(context: Context) {
+        context.getSharedPreferences(STATS_OUTBOX_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putLong(OUTBOX_DURATION_MS, pendingStatsDurationMs)
+            .putInt(OUTBOX_LAUNCHES, pendingStatsLaunches)
+            .putInt(OUTBOX_LIMIT_HITS, pendingStatsLimitHits)
+            .putBoolean(OUTBOX_PENDING, pendingStatsHeartbeat)
+            .commit()
+    }
+
+    private fun flushUsageEvents(context: Context) {
+        if (!pendingStatsHeartbeat) return
+        val extras = Bundle().apply {
+            putLong(RuleContract.KEY_DURATION_MS, pendingStatsDurationMs)
+            putInt(RuleContract.KEY_LAUNCH_INCREMENT, pendingStatsLaunches)
+            putInt(RuleContract.KEY_LIMIT_HIT_INCREMENT, pendingStatsLimitHits)
+        }
+        val result = runCatching {
+            context.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_RECORD_USAGE,
+                packageName,
+                extras,
+            )
+        }
+        val persisted = result.getOrNull()?.getBoolean(RuleContract.KEY_OK, false) == true
+        if (persisted) {
+            pendingStatsDurationMs = 0L
+            pendingStatsLaunches = 0
+            pendingStatsLimitHits = 0
+            pendingStatsHeartbeat = false
+            persistStatsOutbox(context)
+            statsRetryCount = 0
+            mainHandler.removeCallbacks(statsRetry)
+            if (!statsSuccessLogged) {
+                statsSuccessLogged = true
+                XposedBridge.log("AppTimeLimiter: STATS_REPORT_OK package=$packageName")
+                diagnostic(
+                    context,
+                    event = "STATS_REPORT_OK",
+                    message = "使用统计已成功写入；管理应用无需后台常驻",
+                )
+            }
+            return
+        }
+
+        if (!statsFailureLogged) {
+            statsFailureLogged = true
+            XposedBridge.log(
+                "AppTimeLimiter: STATS_REPORT_FAILED package=$packageName error=${result.exceptionOrNull()?.javaClass?.simpleName ?: "provider_rejected"}",
+            )
+            result.exceptionOrNull()?.let(XposedBridge::log)
+            diagnostic(
+                context,
+                level = "WARN",
+                event = "STATS_REPORT_FAILED",
+                message = "使用统计写入失败，将自动重试；原因=${result.exceptionOrNull()?.javaClass?.simpleName ?: "provider_rejected"}",
+            )
+        }
+        mainHandler.removeCallbacks(statsRetry)
+        if (statsRetryCount < MAX_STATS_RETRIES) {
+            val delayMs = STATS_RETRY_DELAYS_MS[statsRetryCount]
+            statsRetryCount++
+            mainHandler.postDelayed(statsRetry, delayMs)
+        }
     }
 
     private fun stopTiming() {
@@ -668,18 +798,37 @@ private class RuntimeLimiter(
                     RuleRepository.MAX_EXTENSION_SECONDS,
                 ) * 1000L,
                 diagnosticsEnabled = result.getBoolean(RuleContract.KEY_DIAGNOSTICS_ENABLED, true),
+                usageStatsEnabled = result.getBoolean(RuleContract.KEY_USAGE_STATS_ENABLED, true),
                 source = "provider",
             )
             diagnosticsEnabled = rule.diagnosticsEnabled
+            cacheRule(context, rule)
             return rule
         }
 
         if (!providerFailureLogged) {
             providerFailureLogged = true
-            XposedBridge.log("AppTimeLimiter: PROVIDER_UNAVAILABLE package=$packageName, fallback=XSharedPreferences")
+            XposedBridge.log("AppTimeLimiter: PROVIDER_UNAVAILABLE package=$packageName, fallback=XSharedPreferences/local_cache")
         }
         if (reloadFallback) preferences.reload()
+        val sharedRule = readXSharedRule()
+        val cachedRule = readCachedRule(context)
+        val rule = when {
+            sharedRule != null && (cachedRule == null || sharedRule.version >= cachedRule.version) -> {
+                cacheRule(context, sharedRule)
+                sharedRule
+            }
+            cachedRule != null -> cachedRule
+            else -> unavailableRule()
+        }
+        diagnosticsEnabled = rule.diagnosticsEnabled
+        return rule
+    }
+
+    private fun readXSharedRule(): HookRule? {
         val prefix = "rule.$packageName."
+        val version = preferences.getLong("${prefix}version", Long.MIN_VALUE)
+        if (version == Long.MIN_VALUE) return null
         val legacyEnabled = preferences.getBoolean("${prefix}enabled", false)
         val legacyLimitSeconds = preferences.getLong(
             "${prefix}limit_seconds",
@@ -700,7 +849,7 @@ private class RuntimeLimiter(
             legacyEnabled && !legacyDaily
         }
         val scheduleEnabled = preferences.getBoolean("${prefix}schedule_enabled", false)
-        val rule = HookRule(
+        return HookRule(
             enabled = legacyEnabled && (dailyEnabled || perLaunchEnabled || scheduleEnabled),
             dailyEnabled = dailyEnabled,
             dailyLimitMillis = (if (dailyLimitSeconds >= 0L) dailyLimitSeconds else legacyLimitSeconds)
@@ -720,7 +869,7 @@ private class RuntimeLimiter(
             scheduleWindows = ScheduleCodec.decode(
                 preferences.getString("${prefix}schedule_windows", null),
             ),
-            version = preferences.getLong("${prefix}version", 0L),
+            version = version,
             exitWarningEnabled = preferences.getBoolean(RuleRepository.KEY_EXIT_WARNING_ENABLED, true),
             extensionMillis = preferences.getLong(
                 RuleRepository.KEY_EXTENSION_SECONDS,
@@ -730,11 +879,99 @@ private class RuntimeLimiter(
                 RuleRepository.MAX_EXTENSION_SECONDS,
             ) * 1000L,
             diagnosticsEnabled = preferences.getBoolean(RuleRepository.KEY_DIAGNOSTICS_ENABLED, true),
+            usageStatsEnabled = preferences.getBoolean(RuleRepository.KEY_USAGE_STATS_ENABLED, true),
             source = "xsharedpreferences",
         )
-        diagnosticsEnabled = rule.diagnosticsEnabled
-        return rule
     }
+
+    private fun cacheRule(context: Context, rule: HookRule) {
+        val signature = listOf(
+            rule.enabled,
+            rule.dailyEnabled,
+            rule.dailyLimitMillis,
+            rule.perLaunchEnabled,
+            rule.perLaunchLimitMillis,
+            rule.scheduleEnabled,
+            rule.scheduleMode.name,
+            ScheduleCodec.encode(rule.scheduleWindows),
+            rule.version,
+            rule.exitWarningEnabled,
+            rule.extensionMillis,
+            rule.diagnosticsEnabled,
+            rule.usageStatsEnabled,
+        ).joinToString("|")
+        val prefs = context.getSharedPreferences(RULE_CACHE_PREFS, Context.MODE_PRIVATE)
+        if (prefs.getString(CACHE_SIGNATURE, null) == signature) return
+        prefs.edit()
+            .putBoolean(CACHE_PRESENT, true)
+            .putBoolean(CACHE_ENABLED, rule.enabled)
+            .putBoolean(CACHE_DAILY_ENABLED, rule.dailyEnabled)
+            .putLong(CACHE_DAILY_LIMIT_MS, rule.dailyLimitMillis)
+            .putBoolean(CACHE_PER_LAUNCH_ENABLED, rule.perLaunchEnabled)
+            .putLong(CACHE_PER_LAUNCH_LIMIT_MS, rule.perLaunchLimitMillis)
+            .putBoolean(CACHE_SCHEDULE_ENABLED, rule.scheduleEnabled)
+            .putString(CACHE_SCHEDULE_MODE, rule.scheduleMode.name)
+            .putString(CACHE_SCHEDULE_WINDOWS, ScheduleCodec.encode(rule.scheduleWindows))
+            .putLong(CACHE_RULE_VERSION, rule.version)
+            .putBoolean(CACHE_EXIT_WARNING_ENABLED, rule.exitWarningEnabled)
+            .putLong(CACHE_EXTENSION_MS, rule.extensionMillis)
+            .putBoolean(CACHE_DIAGNOSTICS_ENABLED, rule.diagnosticsEnabled)
+            .putBoolean(CACHE_USAGE_STATS_ENABLED, rule.usageStatsEnabled)
+            .putString(CACHE_SIGNATURE, signature)
+            .commit()
+    }
+
+    private fun readCachedRule(context: Context): HookRule? {
+        val prefs = context.getSharedPreferences(RULE_CACHE_PREFS, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(CACHE_PRESENT, false)) return null
+        return HookRule(
+            enabled = prefs.getBoolean(CACHE_ENABLED, false),
+            dailyEnabled = prefs.getBoolean(CACHE_DAILY_ENABLED, false),
+            dailyLimitMillis = prefs.getLong(
+                CACHE_DAILY_LIMIT_MS,
+                RuleRepository.DEFAULT_LIMIT_SECONDS * 1000L,
+            ).coerceAtLeast(1_000L),
+            perLaunchEnabled = prefs.getBoolean(CACHE_PER_LAUNCH_ENABLED, false),
+            perLaunchLimitMillis = prefs.getLong(
+                CACHE_PER_LAUNCH_LIMIT_MS,
+                RuleRepository.DEFAULT_LIMIT_SECONDS * 1000L,
+            ).coerceAtLeast(1_000L),
+            scheduleEnabled = prefs.getBoolean(CACHE_SCHEDULE_ENABLED, false),
+            scheduleMode = prefs.getString(CACHE_SCHEDULE_MODE, ScheduleMode.BLOCK_DURING.name)
+                ?.let { runCatching { ScheduleMode.valueOf(it) }.getOrNull() }
+                ?: ScheduleMode.BLOCK_DURING,
+            scheduleWindows = ScheduleCodec.decode(prefs.getString(CACHE_SCHEDULE_WINDOWS, null)),
+            version = prefs.getLong(CACHE_RULE_VERSION, 0L),
+            exitWarningEnabled = prefs.getBoolean(CACHE_EXIT_WARNING_ENABLED, true),
+            extensionMillis = prefs.getLong(
+                CACHE_EXTENSION_MS,
+                RuleRepository.DEFAULT_EXTENSION_SECONDS * 1000L,
+            ).coerceIn(
+                RuleRepository.MIN_EXTENSION_SECONDS * 1000L,
+                RuleRepository.MAX_EXTENSION_SECONDS * 1000L,
+            ),
+            diagnosticsEnabled = prefs.getBoolean(CACHE_DIAGNOSTICS_ENABLED, true),
+            usageStatsEnabled = prefs.getBoolean(CACHE_USAGE_STATS_ENABLED, true),
+            source = "local_cache",
+        )
+    }
+
+    private fun unavailableRule() = HookRule(
+        enabled = false,
+        dailyEnabled = false,
+        dailyLimitMillis = RuleRepository.DEFAULT_LIMIT_SECONDS * 1000L,
+        perLaunchEnabled = false,
+        perLaunchLimitMillis = RuleRepository.DEFAULT_LIMIT_SECONDS * 1000L,
+        scheduleEnabled = false,
+        scheduleMode = ScheduleMode.BLOCK_DURING,
+        scheduleWindows = emptyList(),
+        version = Long.MIN_VALUE,
+        exitWarningEnabled = true,
+        extensionMillis = RuleRepository.DEFAULT_EXTENSION_SECONDS * 1000L,
+        diagnosticsEnabled = true,
+        usageStatsEnabled = true,
+        source = "unavailable",
+    )
 
     private fun diagnostic(
         context: Context,
@@ -781,6 +1018,7 @@ private class RuntimeLimiter(
         val exitWarningEnabled: Boolean,
         val extensionMillis: Long,
         val diagnosticsEnabled: Boolean,
+        val usageStatsEnabled: Boolean,
         val source: String,
     )
 
@@ -799,14 +1037,37 @@ private class RuntimeLimiter(
     private companion object {
         const val NOT_RUNNING = -1L
         const val STATE_PREFS = "__app_time_limiter_state__"
+        const val RULE_CACHE_PREFS = "__app_time_limiter_rule_cache__"
+        const val STATS_OUTBOX_PREFS = "__app_time_limiter_stats_outbox__"
         const val KEY_DAY = "day"
         const val KEY_VERSION = "rule_version"
         const val KEY_USED_MS = "used_ms"
+        const val CACHE_PRESENT = "present"
+        const val CACHE_SIGNATURE = "signature"
+        const val CACHE_ENABLED = "enabled"
+        const val CACHE_DAILY_ENABLED = "daily_enabled"
+        const val CACHE_DAILY_LIMIT_MS = "daily_limit_ms"
+        const val CACHE_PER_LAUNCH_ENABLED = "per_launch_enabled"
+        const val CACHE_PER_LAUNCH_LIMIT_MS = "per_launch_limit_ms"
+        const val CACHE_SCHEDULE_ENABLED = "schedule_enabled"
+        const val CACHE_SCHEDULE_MODE = "schedule_mode"
+        const val CACHE_SCHEDULE_WINDOWS = "schedule_windows"
+        const val CACHE_RULE_VERSION = "rule_version"
+        const val CACHE_EXIT_WARNING_ENABLED = "exit_warning_enabled"
+        const val CACHE_EXTENSION_MS = "extension_ms"
+        const val CACHE_DIAGNOSTICS_ENABLED = "diagnostics_enabled"
+        const val CACHE_USAGE_STATS_ENABLED = "usage_stats_enabled"
+        const val OUTBOX_PENDING = "pending"
+        const val OUTBOX_DURATION_MS = "duration_ms"
+        const val OUTBOX_LAUNCHES = "launches"
+        const val OUTBOX_LIMIT_HITS = "limit_hits"
         const val LOGGABLE_SEGMENT_MS = 1_000L
         const val EXIT_DELAY_MS = 350L
         const val WARNING_LEAD_MS = 5_000L
         const val COUNTDOWN_REFRESH_MS = 250L
         const val SCHEDULE_RECHECK_MAX_MS = 60_000L
+        const val MAX_STATS_RETRIES = 3
+        val STATS_RETRY_DELAYS_MS = longArrayOf(1_000L, 5_000L, 15_000L)
         const val MAX_TOTAL_EXTENSION_MS = 24L * 60L * 60L * 1000L
     }
 }

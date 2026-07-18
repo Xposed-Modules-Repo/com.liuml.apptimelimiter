@@ -32,7 +32,7 @@ object FeedbackSender {
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_EMAIL, arrayOf(EMAIL))
-            putExtra(Intent.EXTRA_SUBJECT, "[应用计时退出] 问题反馈 ${BuildConfig.VERSION_NAME}")
+            putExtra(Intent.EXTRA_SUBJECT, "[时停] 问题反馈 ${BuildConfig.VERSION_NAME}")
             putExtra(Intent.EXTRA_TEXT, body)
             putExtra(Intent.EXTRA_STREAM, uri)
             clipData = ClipData.newUri(context.contentResolver, "诊断日志", uri)
@@ -43,7 +43,7 @@ object FeedbackSender {
         }.onFailure {
             val fallback = Intent(
                 Intent.ACTION_SENDTO,
-                Uri.parse("mailto:$EMAIL?subject=${Uri.encode("[应用计时退出] 问题反馈")}"),
+                Uri.parse("mailto:$EMAIL?subject=${Uri.encode("[时停] 问题反馈")}"),
             )
             runCatching { context.startActivity(fallback) }
                 .onFailure {

@@ -8,6 +8,7 @@ object RuleContract {
 
     const val METHOD_GET_RULE = "get_rule"
     const val METHOD_APPEND_LOG = "append_log"
+    const val METHOD_RECORD_USAGE = "record_usage"
 
     const val KEY_OK = "ok"
     const val KEY_ENABLED = "enabled"
@@ -24,6 +25,10 @@ object RuleContract {
     const val KEY_EXIT_WARNING_ENABLED = "exit_warning_enabled"
     const val KEY_EXTENSION_SECONDS = "extension_seconds"
     const val KEY_DIAGNOSTICS_ENABLED = "diagnostics_enabled"
+    const val KEY_USAGE_STATS_ENABLED = "usage_stats_enabled"
+    const val KEY_DURATION_MS = "duration_ms"
+    const val KEY_LAUNCH_INCREMENT = "launch_increment"
+    const val KEY_LIMIT_HIT_INCREMENT = "limit_hit_increment"
     const val KEY_LEVEL = "level"
     const val KEY_EVENT = "event"
     const val KEY_MESSAGE = "message"

@@ -1,13 +1,25 @@
 package com.liuml.apptimelimiter.data
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import com.liuml.apptimelimiter.ipc.RuleContract
 import java.io.File
 
 class RuleRepository(context: Context) {
     private val appContext = context.applicationContext
-    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val prefs = openPreferences()
+
+    @SuppressLint("WorldReadableFiles")
+    private fun openPreferences(): SharedPreferences = try {
+        // LSPosed API 93+ redirects this to its protected cross-process preference area.
+        // Hooked apps can then read rules with XSharedPreferences even if this app is stopped.
+        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_WORLD_READABLE)
+    } catch (_: SecurityException) {
+        // Keeps the UI usable on unsupported frameworks; the ContentProvider remains available.
+        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
 
     fun getRule(packageName: String): AppRule {
         val prefix = prefix(packageName)
@@ -95,6 +107,8 @@ class RuleRepository(context: Context) {
         extensionSeconds = prefs.getLong(KEY_EXTENSION_SECONDS, DEFAULT_EXTENSION_SECONDS)
             .coerceIn(MIN_EXTENSION_SECONDS, MAX_EXTENSION_SECONDS),
         diagnosticsEnabled = prefs.getBoolean(KEY_DIAGNOSTICS_ENABLED, true),
+        launcherIconHidden = prefs.getBoolean(KEY_LAUNCHER_ICON_HIDDEN, false),
+        usageStatsEnabled = prefs.getBoolean(KEY_USAGE_STATS_ENABLED, true),
     )
 
     fun saveGlobalSettings(settings: GlobalSettings) {
@@ -105,6 +119,8 @@ class RuleRepository(context: Context) {
                 settings.extensionSeconds.coerceIn(MIN_EXTENSION_SECONDS, MAX_EXTENSION_SECONDS),
             )
             .putBoolean(KEY_DIAGNOSTICS_ENABLED, settings.diagnosticsEnabled)
+            .putBoolean(KEY_LAUNCHER_ICON_HIDDEN, settings.launcherIconHidden)
+            .putBoolean(KEY_USAGE_STATS_ENABLED, settings.usageStatsEnabled)
             .commit()
         makePreferencesReadable()
     }
@@ -140,6 +156,8 @@ class RuleRepository(context: Context) {
         const val KEY_EXIT_WARNING_ENABLED = "global.exit_warning_enabled"
         const val KEY_EXTENSION_SECONDS = "global.extension_seconds"
         const val KEY_DIAGNOSTICS_ENABLED = "global.diagnostics_enabled"
+        const val KEY_LAUNCHER_ICON_HIDDEN = "global.launcher_icon_hidden"
+        const val KEY_USAGE_STATS_ENABLED = "global.usage_stats_enabled"
         const val DEFAULT_EXTENSION_SECONDS = 5L * 60L
         const val MIN_EXTENSION_SECONDS = 60L
         const val MAX_EXTENSION_SECONDS = 60L * 60L

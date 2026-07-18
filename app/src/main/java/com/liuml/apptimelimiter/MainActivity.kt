@@ -43,6 +43,8 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -53,7 +55,9 @@ import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -79,19 +83,34 @@ import com.liuml.apptimelimiter.data.ScheduleMode
 import com.liuml.apptimelimiter.data.ScheduleWindow
 import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
 import com.liuml.apptimelimiter.support.FeedbackSender
+import com.liuml.apptimelimiter.settings.LauncherIconController
+import com.liuml.apptimelimiter.statistics.AppUsageSummary
+import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
+import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.update.ReleaseInfo
 import com.liuml.apptimelimiter.update.UpdateCheckResult
 import com.liuml.apptimelimiter.update.UpdateChecker
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val ruleRepository = RuleRepository(this)
         val diagnosticsRepository = DiagnosticsRepository(this)
+        val usageStatsRepository = UsageStatsRepository(this)
+        val deviceUsageStatsRepository = DeviceUsageStatsRepository(this)
         val apps = InstalledAppsRepository(this).loadLaunchableApps()
         setContent {
             AppTimeLimiterTheme {
-                TimeLimiterScreen(apps, ruleRepository, diagnosticsRepository)
+                TimeLimiterScreen(
+                    apps,
+                    ruleRepository,
+                    diagnosticsRepository,
+                    usageStatsRepository,
+                    deviceUsageStatsRepository,
+                )
             }
         }
     }
@@ -103,6 +122,8 @@ private fun TimeLimiterScreen(
     apps: List<InstalledApp>,
     repository: RuleRepository,
     diagnosticsRepository: DiagnosticsRepository,
+    usageStatsRepository: UsageStatsRepository,
+    deviceUsageStatsRepository: DeviceUsageStatsRepository,
 ) {
     val context = LocalContext.current
     val rules = remember {
@@ -118,6 +139,8 @@ private fun TimeLimiterScreen(
     var showAbout by remember { mutableStateOf(false) }
     var checkingUpdate by remember { mutableStateOf(false) }
     var updateResult by remember { mutableStateOf<UpdateCheckResult?>(null) }
+    var selectedSection by remember { mutableStateOf(MainSection.HOME) }
+    var usageRevision by remember { mutableIntStateOf(0) }
     var showSetupGuide by remember {
         mutableStateOf(
             !context.getSharedPreferences("ui", Context.MODE_PRIVATE)
@@ -131,6 +154,44 @@ private fun TimeLimiterScreen(
                 (search.isBlank() || app.label.contains(search, true) || app.packageName.contains(search, true))
         }
     }
+    val enabledPackages = rules.values.filter(AppRule::enabled).map(AppRule::packageName).toSet()
+    val statsEnabled = remember(usageRevision) {
+        repository.getGlobalSettings().usageStatsEnabled
+    }
+    val usageAccessGranted = remember(usageRevision) {
+        deviceUsageStatsRepository.hasUsageAccess()
+    }
+    val hookSummaries = remember(enabledPackages, usageRevision) {
+        usageStatsRepository.summariesToday(enabledPackages)
+    }
+    val systemDurations = remember(enabledPackages, usageRevision, usageAccessGranted, statsEnabled) {
+        if (statsEnabled && usageAccessGranted) {
+            deviceUsageStatsRepository.todayDurations(enabledPackages)
+        } else {
+            emptyMap()
+        }
+    }
+    val todaySummaries = remember(hookSummaries, systemDurations, usageAccessGranted) {
+        hookSummaries.map { summary ->
+            if (usageAccessGranted) {
+                summary.copy(durationMillis = systemDurations[summary.packageName] ?: 0L)
+            } else {
+                summary.copy(durationMillis = 0L)
+            }
+        }
+    }
+    val todayTotalMillis = todaySummaries.sumOf(AppUsageSummary::durationMillis)
+    val latestHookHeartbeat = remember(enabledPackages, usageRevision) {
+        usageStatsRepository.latestHookHeartbeat(enabledPackages)
+    }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) usageRevision++
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     Scaffold(
         containerColor = Color(0xFFF7F8FC),
@@ -138,9 +199,20 @@ private fun TimeLimiterScreen(
             TopAppBar(
                 title = {
                     Column {
-                        Text("应用计时退出", fontWeight = FontWeight.SemiBold)
                         Text(
-                            "已启用 ${rules.values.count { it.enabled }} 个应用",
+                            when (selectedSection) {
+                                MainSection.HOME -> "时停"
+                                MainSection.APPS -> "应用管理"
+                                MainSection.STATS -> "使用统计"
+                            },
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            when (selectedSection) {
+                                MainSection.HOME -> "应用使用时长管控"
+                                MainSection.APPS -> "已启用 ${enabledPackages.size} 个应用"
+                                MainSection.STATS -> "仅统计已启用管控的应用"
+                            },
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -152,59 +224,113 @@ private fun TimeLimiterScreen(
                 },
             )
         },
+        bottomBar = {
+            NavigationBar(containerColor = Color(0xFFF1ECF8)) {
+                MainSection.entries.forEach { section ->
+                    val selected = selectedSection == section
+                    NavigationBarItem(
+                        selected = selected,
+                        onClick = {
+                            selectedSection = section
+                            usageRevision++
+                        },
+                        icon = {
+                            Text(
+                                when (section) {
+                                    MainSection.HOME -> "⌂"
+                                    MainSection.APPS -> "▦"
+                                    MainSection.STATS -> "▥"
+                                },
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                            )
+                        },
+                        label = { Text(section.label) },
+                    )
+                }
+            }
+        },
     ) { padding ->
-        LazyColumn(
-            modifier = Modifier.fillMaxSize().padding(padding),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            item {
-                SetupCard(
-                    onOpenGuide = { showSetupGuide = true },
-                    onOpenLogs = { showLogs = true },
-                )
-                Spacer(Modifier.height(12.dp))
-                TextField(
-                    value = search,
-                    onValueChange = { search = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text("搜索应用或包名") },
-                    singleLine = true,
-                    shape = RoundedCornerShape(16.dp),
-                )
-                Spacer(Modifier.height(10.dp))
-                FilterChip(
-                    selected = onlyEnabled,
-                    onClick = { onlyEnabled = !onlyEnabled },
-                    label = { Text("仅看已启用") },
-                )
+        when (selectedSection) {
+            MainSection.HOME -> HomeDashboard(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                enabledCount = enabledPackages.size,
+                todayTotalMillis = todayTotalMillis,
+                latestHookHeartbeat = latestHookHeartbeat,
+                statsEnabled = statsEnabled,
+                usageAccessGranted = usageAccessGranted,
+                onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
+                onManageApps = { selectedSection = MainSection.APPS },
+                onOpenStats = {
+                    usageRevision++
+                    selectedSection = MainSection.STATS
+                },
+                onOpenGuide = { showSetupGuide = true },
+                onOpenLogs = { showLogs = true },
+            )
+
+            MainSection.APPS -> LazyColumn(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                item {
+                    TextField(
+                        value = search,
+                        onValueChange = { search = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text("搜索应用或包名") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(16.dp),
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    FilterChip(
+                        selected = onlyEnabled,
+                        onClick = { onlyEnabled = !onlyEnabled },
+                        label = { Text("仅看已启用") },
+                    )
+                }
+
+                items(visibleApps, key = { it.packageName }) { app ->
+                    val rule = rules.getValue(app.packageName)
+                    AppRow(
+                        app = app,
+                        rule = rule,
+                        onClick = { editingApp = app },
+                        onToggle = { enabled ->
+                            if (enabled) {
+                                editingApp = app
+                            } else {
+                                val updated = rule.copy(enabled = false)
+                                repository.save(updated)
+                                if (repository.getGlobalSettings().diagnosticsEnabled) {
+                                    diagnosticsRepository.append(
+                                        "INFO",
+                                        app.packageName,
+                                        "RULE_SAVED",
+                                        "规则已停用",
+                                    )
+                                }
+                                rules[app.packageName] = repository.getRule(app.packageName)
+                                usageRevision++
+                            }
+                        },
+                    )
+                }
             }
 
-            items(visibleApps, key = { it.packageName }) { app ->
-                val rule = rules.getValue(app.packageName)
-                AppRow(
-                    app = app,
-                    rule = rule,
-                    onClick = { editingApp = app },
-                    onToggle = { enabled ->
-                        if (enabled) {
-                            editingApp = app
-                        } else {
-                            val updated = rule.copy(enabled = false)
-                            repository.save(updated)
-                            if (repository.getGlobalSettings().diagnosticsEnabled) {
-                                diagnosticsRepository.append(
-                                    "INFO",
-                                    app.packageName,
-                                    "RULE_SAVED",
-                                    "规则已停用",
-                                )
-                            }
-                            rules[app.packageName] = repository.getRule(app.packageName)
-                        }
-                    },
-                )
-            }
+            MainSection.STATS -> UsageStatisticsScreen(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                apps = apps,
+                summaries = todaySummaries,
+                statsEnabled = statsEnabled,
+                usageAccessGranted = usageAccessGranted,
+                onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
+                onClear = {
+                    usageStatsRepository.clearAll()
+                    usageRevision++
+                },
+            )
         }
     }
 
@@ -240,6 +366,7 @@ private fun TimeLimiterScreen(
     if (showSettings) {
         SettingsDialog(
             initialSettings = repository.getGlobalSettings(),
+            usageAccessGranted = usageAccessGranted,
             onDismiss = { showSettings = false },
             onDonate = { openAlipayDonation(context) },
             onCheckUpdates = {
@@ -255,16 +382,42 @@ private fun TimeLimiterScreen(
                 showAbout = true
             },
             onFeedback = { FeedbackSender.send(context, diagnosticsRepository) },
-            onSave = { settings ->
+            onCopyRecoveryCommand = {
+                context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
+                    ClipData.newPlainText("恢复应用入口", LauncherIconController.RECOVERY_COMMAND),
+                )
+                Toast.makeText(context, "恢复命令已复制", Toast.LENGTH_SHORT).show()
+            },
+            onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
+            onSave = saveSettings@{ settings ->
+                val iconResult = runCatching {
+                    LauncherIconController.setHidden(context, settings.launcherIconHidden)
+                }
+                if (iconResult.isFailure) {
+                    Toast.makeText(
+                        context,
+                        "修改桌面图标失败：${iconResult.exceptionOrNull()?.message}",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    return@saveSettings
+                }
                 repository.saveGlobalSettings(settings)
                 if (settings.diagnosticsEnabled) {
                     diagnosticsRepository.append(
                         "INFO",
                         context.packageName,
                         "SETTINGS_SAVED",
-                        "warning=${settings.exitWarningEnabled}, extension=${settings.extensionSeconds}s, diagnostics=true",
+                        "warning=${settings.exitWarningEnabled}, extension=${settings.extensionSeconds}s, diagnostics=true, iconHidden=${settings.launcherIconHidden}, usageStats=${settings.usageStatsEnabled}",
                     )
                 }
+                if (settings.launcherIconHidden) {
+                    Toast.makeText(
+                        context,
+                        "桌面图标已关闭，可从 LSPosed 模块页打开应用",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                usageRevision++
                 showSettings = false
             },
         )
@@ -321,6 +474,319 @@ private fun TimeLimiterScreen(
         )
     }
 }
+
+private enum class MainSection(val label: String) {
+    HOME("首页"),
+    APPS("应用"),
+    STATS("统计"),
+}
+
+@Composable
+private fun HomeDashboard(
+    modifier: Modifier,
+    enabledCount: Int,
+    todayTotalMillis: Long,
+    latestHookHeartbeat: Long,
+    statsEnabled: Boolean,
+    usageAccessGranted: Boolean,
+    onRequestUsageAccess: () -> Unit,
+    onManageApps: () -> Unit,
+    onOpenStats: () -> Unit,
+    onOpenGuide: () -> Unit,
+    onOpenLogs: () -> Unit,
+) {
+    val hookRecentlyVerified = latestHookHeartbeat > 0L &&
+        System.currentTimeMillis() - latestHookHeartbeat <= HOOK_VERIFIED_WINDOW_MS
+    val statusTitle = when {
+        enabledCount == 0 -> "未启用管控"
+        hookRecentlyVerified -> "管控运行中"
+        else -> "等待 Hook 验证"
+    }
+    val statusDescription = when {
+        enabledCount == 0 -> "请先选择需要管控的应用"
+        hookRecentlyVerified -> "LSPosed Hook 已在目标应用中运行"
+        else -> "打开一次已管控应用以确认模块状态"
+    }
+    LazyColumn(
+        modifier = modifier,
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(20.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth().clickable {
+                    if (enabledCount == 0) onManageApps() else onOpenGuide()
+                },
+                colors = CardDefaults.cardColors(
+                    containerColor = if (hookRecentlyVerified) Color(0xFFE0F4E8) else Color(0xFFE9DDFB),
+                ),
+                shape = RoundedCornerShape(28.dp),
+            ) {
+                Column(
+                    modifier = Modifier.padding(28.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Surface(
+                        color = if (hookRecentlyVerified) Color(0xFF19734A) else Color(0xFF351078),
+                        shape = CircleShape,
+                    ) {
+                        Text(
+                            if (hookRecentlyVerified) "✓" else "◆",
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                            color = Color.White,
+                            style = MaterialTheme.typography.headlineMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(statusTitle, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                    Text(
+                        statusDescription,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+        if (statsEnabled && !usageAccessGranted) {
+            item {
+                UsageAccessCard(onRequestUsageAccess)
+            }
+        }
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                DashboardMetricCard(
+                    modifier = Modifier.weight(1f),
+                    symbol = "◷",
+                    symbolColor = Color(0xFFF59E0B),
+                    value = formatDashboardDuration(todayTotalMillis),
+                    label = "今日总使用",
+                    onClick = onOpenStats,
+                )
+                DashboardMetricCard(
+                    modifier = Modifier.weight(1f),
+                    symbol = "▦",
+                    symbolColor = Color(0xFF3FA34D),
+                    value = "$enabledCount 个",
+                    label = "管控应用数",
+                    onClick = onManageApps,
+                )
+            }
+        }
+        item {
+            Text("快捷操作", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        }
+        item {
+            DashboardActionCard(
+                symbol = "▦",
+                title = "管理应用",
+                description = "选择需要管控的应用并设置时间限制",
+                onClick = onManageApps,
+            )
+        }
+        item {
+            DashboardActionCard(
+                symbol = "▥",
+                title = "使用统计",
+                description = "查看各应用今天的使用时长记录",
+                onClick = onOpenStats,
+            )
+        }
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onOpenGuide) { Text("配置要求") }
+                OutlinedButton(onClick = onOpenLogs) { Text("诊断日志") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun UsageAccessCard(onRequestUsageAccess: () -> Unit) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE9C7)),
+        shape = RoundedCornerShape(18.dp),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("需要使用情况访问权限", fontWeight = FontWeight.Bold)
+            Text(
+                "授权后由 Android 系统提供今日使用时长，仅在打开时停时读取，不需要后台服务。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(onClick = onRequestUsageAccess) { Text("去授权") }
+        }
+    }
+}
+
+@Composable
+private fun DashboardMetricCard(
+    modifier: Modifier,
+    symbol: String,
+    symbolColor: Color,
+    value: String,
+    label: String,
+    onClick: () -> Unit,
+) {
+    Card(
+        modifier = modifier.clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFE9E7EC)),
+        shape = RoundedCornerShape(24.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(symbol, color = symbolColor, style = MaterialTheme.typography.headlineMedium)
+            Text(value, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+            Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun DashboardActionCard(
+    symbol: String,
+    title: String,
+    description: String,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        color = Color(0xFFE9E7EC),
+        shape = RoundedCornerShape(22.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(20.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(18.dp),
+        ) {
+            Text(symbol, color = Color(0xFF6548B5), style = MaterialTheme.typography.headlineMedium)
+            Column {
+                Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(
+                    description,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun UsageStatisticsScreen(
+    modifier: Modifier,
+    apps: List<InstalledApp>,
+    summaries: List<AppUsageSummary>,
+    statsEnabled: Boolean,
+    usageAccessGranted: Boolean,
+    onRequestUsageAccess: () -> Unit,
+    onClear: () -> Unit,
+) {
+    val appByPackage = remember(apps) { apps.associateBy(InstalledApp::packageName) }
+    val sorted = summaries.sortedWith(
+        compareByDescending<AppUsageSummary> { it.durationMillis }
+            .thenByDescending { it.lastUsedAtMillis },
+    )
+    LazyColumn(
+        modifier = modifier,
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        if (!statsEnabled) {
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE9C7))) {
+                    Text(
+                        "使用统计已在设置中关闭，以下数据不会继续更新。",
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+            }
+        } else if (!usageAccessGranted) {
+            item {
+                UsageAccessCard(onRequestUsageAccess)
+            }
+        }
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text("今日总使用", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        formatDashboardDuration(sorted.sumOf(AppUsageSummary::durationMillis)),
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        if (usageAccessGranted) "Android 系统按需读取 · 无后台服务" else "授权后显示系统使用时长",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                TextButton(onClick = onClear) { Text("清空模块记录") }
+            }
+        }
+        if (sorted.isEmpty()) {
+            item { Text("暂无已启用的管控应用。") }
+        } else {
+            items(sorted, key = AppUsageSummary::packageName) { summary ->
+                val app = appByPackage[summary.packageName]
+                Surface(
+                    color = Color.White,
+                    shape = RoundedCornerShape(18.dp),
+                    tonalElevation = 1.dp,
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        if (app != null) {
+                            Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
+                                AppIcon(app)
+                            }
+                        }
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                app?.label ?: summary.packageName,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                "启动 ${summary.launchCount} 次 · 限制触发 ${summary.limitHitCount} 次",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Text(formatDashboardDuration(summary.durationMillis), fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun formatDashboardDuration(durationMillis: Long): String {
+    val totalMinutes = durationMillis.coerceAtLeast(0L) / 60_000L
+    return if (totalMinutes < 60L) {
+        "${totalMinutes}分"
+    } else {
+        "${totalMinutes / 60L}时${totalMinutes % 60L}分"
+    }
+}
+
+private const val HOOK_VERIFIED_WINDOW_MS = 7L * 24L * 60L * 60L * 1000L
 
 @Composable
 private fun SetupCard(
@@ -433,7 +899,7 @@ private fun SetupGuideDialog(onDismiss: () -> Unit) {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("本版本不需要相机、存储、通知等 Android 运行时权限。")
                 Text("1. 手机已 Root，并安装可用的 LSPosed。")
-                Text("2. 在 LSPosed 中启用“应用计时退出”模块。")
+                Text("2. 在 LSPosed 中启用“时停”模块。")
                 Text("3. 在模块作用域中勾选需要限制的目标应用。")
                 Text("4. 保存规则后，强制停止目标应用并重新打开。")
                 Text(
@@ -449,15 +915,20 @@ private fun SetupGuideDialog(onDismiss: () -> Unit) {
 @Composable
 private fun SettingsDialog(
     initialSettings: GlobalSettings,
+    usageAccessGranted: Boolean,
     onDismiss: () -> Unit,
     onDonate: () -> Unit,
     onCheckUpdates: () -> Unit,
     onAbout: () -> Unit,
     onFeedback: () -> Unit,
+    onCopyRecoveryCommand: () -> Unit,
+    onRequestUsageAccess: () -> Unit,
     onSave: (GlobalSettings) -> Unit,
 ) {
     var warningEnabled by remember { mutableStateOf(initialSettings.exitWarningEnabled) }
     var diagnosticsEnabled by remember { mutableStateOf(initialSettings.diagnosticsEnabled) }
+    var launcherIconHidden by remember { mutableStateOf(initialSettings.launcherIconHidden) }
+    var usageStatsEnabled by remember { mutableStateOf(initialSettings.usageStatsEnabled) }
     var extensionMinutes by remember {
         mutableStateOf((initialSettings.extensionSeconds / 60L).coerceAtLeast(1L).toString())
     }
@@ -465,7 +936,7 @@ private fun SettingsDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("退出与延时设置") },
+        title = { Text("设置") },
         text = {
             LazyColumn(
                 modifier = Modifier.heightIn(max = 520.dp),
@@ -483,6 +954,50 @@ private fun SettingsDialog(
                     }
                     Switch(checked = warningEnabled, onCheckedChange = { warningEnabled = it })
                 }
+                }
+                item {
+                HorizontalDivider()
+                }
+                item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("使用时长统计", fontWeight = FontWeight.Medium)
+                        Text("系统按需读取时长，Hook 仅记录启动与退出事件", style = MaterialTheme.typography.bodySmall)
+                    }
+                    Switch(checked = usageStatsEnabled, onCheckedChange = { usageStatsEnabled = it })
+                }
+                }
+                if (usageStatsEnabled) {
+                    item {
+                        Surface(
+                            color = if (usageAccessGranted) Color(0xFFE0F4E8) else Color(0xFFFFE9C7),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        if (usageAccessGranted) "使用情况访问权限已授予" else "尚未授予使用情况访问权限",
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                    Text(
+                                        "仅在打开时停时读取，不会启动后台服务",
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
+                                if (!usageAccessGranted) {
+                                    TextButton(onClick = onRequestUsageAccess) { Text("去授权") }
+                                }
+                            }
+                        }
+                    }
                 }
                 item {
                 HorizontalDivider()
@@ -512,6 +1027,53 @@ private fun SettingsDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                }
+                item { HorizontalDivider() }
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("隐藏桌面图标", fontWeight = FontWeight.Medium)
+                            Text(
+                                "关闭后可从 LSPosed 模块页打开应用",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        Switch(
+                            checked = launcherIconHidden,
+                            onCheckedChange = { launcherIconHidden = it },
+                        )
+                    }
+                }
+                if (launcherIconHidden) {
+                    item {
+                        Surface(
+                            color = Color(0xFFFFE9E7),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Text(
+                                    "隐藏后请先尝试从 LSPosed 模块页打开设置。若没有入口，可连接电脑执行：",
+                                    color = Color(0xFF8C1D18),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Text(
+                                    LauncherIconController.RECOVERY_COMMAND,
+                                    color = Color(0xFF5F1411),
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
+                                TextButton(onClick = onCopyRecoveryCommand) {
+                                    Text("复制恢复命令")
+                                }
+                            }
+                        }
+                    }
                 }
                 item { HorizontalDivider() }
                 item {
@@ -568,6 +1130,8 @@ private fun SettingsDialog(
                             exitWarningEnabled = warningEnabled,
                             extensionSeconds = (parsedMinutes ?: 5L) * 60L,
                             diagnosticsEnabled = diagnosticsEnabled,
+                            launcherIconHidden = launcherIconHidden,
+                            usageStatsEnabled = usageStatsEnabled,
                         ),
                     )
                 },
@@ -666,7 +1230,7 @@ private fun AboutDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("关于应用计时退出") },
+        title = { Text("关于时停") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("版本 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
