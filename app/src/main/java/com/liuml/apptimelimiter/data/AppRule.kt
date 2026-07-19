@@ -38,6 +38,8 @@ data class AppRule(
     val scheduleEnabled: Boolean = false,
     val scheduleMode: ScheduleMode = ScheduleMode.BLOCK_DURING,
     val scheduleWindows: List<ScheduleWindow> = emptyList(),
+    val cooldownEnabled: Boolean = false,
+    val cooldownSeconds: Long = 5 * 60L,
     val version: Long = 0,
 )
 

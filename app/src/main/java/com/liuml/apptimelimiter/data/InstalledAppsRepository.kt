@@ -30,7 +30,8 @@ class InstalledAppsRepository(private val context: Context) {
                 InstalledApp(
                     label = appInfo.loadLabel(packageManager).toString().ifBlank { appInfo.packageName },
                     packageName = appInfo.packageName,
-                    isSystemApp = appInfo.flags and ApplicationInfo.FLAG_SYSTEM != 0,
+                    isSystemApp = appInfo.flags and
+                        (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0,
                 )
             }
             .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })

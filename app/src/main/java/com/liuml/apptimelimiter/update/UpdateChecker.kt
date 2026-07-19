@@ -71,13 +71,18 @@ object UpdateChecker {
             val release = (0 until releases.length())
                 .asSequence()
                 .map(releases::getJSONObject)
-                .firstOrNull { !it.optBoolean("draft", false) }
+                .firstOrNull {
+                    isStableRelease(
+                        draft = it.optBoolean("draft", false),
+                        prerelease = it.optBoolean("prerelease", false),
+                    )
+                }
                 ?: return UpdateCheckResult.Error("GitHub 中暂时没有可用版本")
             val assets = release.optJSONArray("assets") ?: JSONArray()
             val apkAsset = (0 until assets.length())
                 .asSequence()
                 .map(assets::getJSONObject)
-                .firstOrNull { it.optString("name").endsWith(".apk", ignoreCase = true) }
+                .firstOrNull { isPublishableApkAsset(it.optString("name")) }
                 ?: return UpdateCheckResult.Error("最新版本没有附带 APK")
             val info = ReleaseInfo(
                 version = release.optString("tag_name").ifBlank { release.optString("name") },
@@ -96,9 +101,20 @@ object UpdateChecker {
         }
     }
 
-    const val REPOSITORY_URL = "https://github.com/TACPR/android-app-time-limiter"
-    private const val RELEASES_API = "https://api.github.com/repos/TACPR/android-app-time-limiter/releases?per_page=10"
+    const val REPOSITORY_URL =
+        "https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter"
+    private const val RELEASES_API =
+        "https://api.github.com/repos/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases?per_page=10"
     private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
+}
+
+internal fun isStableRelease(draft: Boolean, prerelease: Boolean): Boolean = !draft && !prerelease
+
+internal fun isPublishableApkAsset(name: String): Boolean {
+    val normalized = name.trim().lowercase()
+    return normalized.endsWith(".apk") &&
+        "debug" !in normalized &&
+        "unsigned" !in normalized
 }
 
 internal fun isVersionNewer(candidate: String, current: String): Boolean {
@@ -113,10 +129,13 @@ internal fun isVersionNewer(candidate: String, current: String): Boolean {
     return false
 }
 
-private fun versionParts(value: String): List<Int> = value
-    .trim()
-    .removePrefix("v")
-    .removePrefix("V")
-    .substringBefore('-')
-    .split('.')
-    .map { part -> part.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
+private fun versionParts(value: String): List<Int> {
+    val normalized = value.trim().removePrefix("v").removePrefix("V")
+    val releaseName = normalized.substringAfter('-', missingDelimiterValue = normalized)
+        .takeIf { normalized.substringBefore('-').all(Char::isDigit) }
+        ?: normalized
+    return releaseName
+        .substringBefore('-')
+        .split('.')
+        .map { part -> part.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
+}

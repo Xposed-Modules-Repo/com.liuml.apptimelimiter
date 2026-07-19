@@ -39,4 +39,10 @@ class UsageMathTest {
         assertEquals(20_000L, UsageMath.earliestRemainingMillis(listOf(120_000L, 20_000L)))
         assertEquals(0L, UsageMath.earliestRemainingMillis(listOf(0L, 20_000L)))
     }
+
+    @Test
+    fun `system usage wins when it is greater than hook usage`() {
+        assertEquals(90_000L, UsageMath.authoritativeDailyUsedMillis(60_000L, 90_000L))
+        assertEquals(60_000L, UsageMath.authoritativeDailyUsedMillis(60_000L, -1L))
+    }
 }

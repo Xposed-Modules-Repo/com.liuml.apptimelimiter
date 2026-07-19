@@ -37,6 +37,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -56,6 +57,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -85,6 +87,7 @@ import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
 import com.liuml.apptimelimiter.support.FeedbackSender
 import com.liuml.apptimelimiter.settings.LauncherIconController
 import com.liuml.apptimelimiter.statistics.AppUsageSummary
+import com.liuml.apptimelimiter.statistics.CalculatedUsageSummary
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.update.ReleaseInfo
@@ -93,6 +96,11 @@ import com.liuml.apptimelimiter.update.UpdateChecker
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import java.time.LocalDate
+import java.time.ZoneId
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -101,22 +109,35 @@ class MainActivity : ComponentActivity() {
         val diagnosticsRepository = DiagnosticsRepository(this)
         val usageStatsRepository = UsageStatsRepository(this)
         val deviceUsageStatsRepository = DeviceUsageStatsRepository(this)
-        val apps = InstalledAppsRepository(this).loadLaunchableApps()
+        val installedAppsRepository = InstalledAppsRepository(this)
         setContent {
+            var apps by remember { mutableStateOf<List<InstalledApp>?>(null) }
+            LaunchedEffect(Unit) {
+                apps = withContext(Dispatchers.IO) {
+                    installedAppsRepository.loadLaunchableApps()
+                }
+            }
             AppTimeLimiterTheme {
-                TimeLimiterScreen(
-                    apps,
-                    ruleRepository,
-                    diagnosticsRepository,
-                    usageStatsRepository,
-                    deviceUsageStatsRepository,
-                )
+                val loadedApps = apps
+                if (loadedApps == null) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                } else {
+                    TimeLimiterScreen(
+                        loadedApps,
+                        ruleRepository,
+                        diagnosticsRepository,
+                        usageStatsRepository,
+                        deviceUsageStatsRepository,
+                    )
+                }
             }
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun TimeLimiterScreen(
     apps: List<InstalledApp>,
@@ -133,6 +154,12 @@ private fun TimeLimiterScreen(
     }
     var search by remember { mutableStateOf("") }
     var onlyEnabled by remember { mutableStateOf(false) }
+    var showSystemApps by remember {
+        mutableStateOf(
+            context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+                .getBoolean("show_system_apps", false),
+        )
+    }
     var editingApp by remember { mutableStateOf<InstalledApp?>(null) }
     var showLogs by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
@@ -148,11 +175,15 @@ private fun TimeLimiterScreen(
         )
     }
 
-    val visibleApps = remember(apps, search, onlyEnabled, rules.toMap()) {
+    val visibleApps = remember(apps, search, onlyEnabled, showSystemApps, rules.toMap()) {
         apps.filter { app ->
+            (showSystemApps || !app.isSystemApp) &&
             (!onlyEnabled || rules[app.packageName]?.enabled == true) &&
                 (search.isBlank() || app.label.contains(search, true) || app.packageName.contains(search, true))
-        }
+        }.sortedWith(
+            compareByDescending<InstalledApp> { rules[it.packageName]?.enabled == true }
+                .thenBy { it.label.lowercase() },
+        )
     }
     val enabledPackages = rules.values.filter(AppRule::enabled).map(AppRule::packageName).toSet()
     val statsEnabled = remember(usageRevision) {
@@ -164,20 +195,36 @@ private fun TimeLimiterScreen(
     val hookSummaries = remember(enabledPackages, usageRevision) {
         usageStatsRepository.summariesToday(enabledPackages)
     }
-    val systemDurations = remember(enabledPackages, usageRevision, usageAccessGranted, statsEnabled) {
-        if (statsEnabled && usageAccessGranted) {
-            deviceUsageStatsRepository.todayDurations(enabledPackages)
+    val allLaunchablePackages = remember(apps) { apps.map(InstalledApp::packageName).toSet() }
+    var systemSummaries by remember {
+        mutableStateOf<Map<String, CalculatedUsageSummary>>(emptyMap())
+    }
+    LaunchedEffect(allLaunchablePackages, usageRevision, usageAccessGranted, statsEnabled) {
+        systemSummaries = if (statsEnabled && usageAccessGranted) {
+            withContext(Dispatchers.IO) {
+                deviceUsageStatsRepository.todayUsageSummaries(allLaunchablePackages)
+            }
         } else {
             emptyMap()
         }
     }
-    val todaySummaries = remember(hookSummaries, systemDurations, usageAccessGranted) {
-        hookSummaries.map { summary ->
-            if (usageAccessGranted) {
-                summary.copy(durationMillis = systemDurations[summary.packageName] ?: 0L)
-            } else {
-                summary.copy(durationMillis = 0L)
-            }
+    val todaySummaries = remember(hookSummaries, systemSummaries, usageAccessGranted) {
+        val hookByPackage = hookSummaries.associateBy(AppUsageSummary::packageName)
+        apps.mapNotNull { app ->
+            val hook = hookByPackage[app.packageName] ?: AppUsageSummary(
+                packageName = app.packageName,
+                durationMillis = 0L,
+                launchCount = 0,
+                limitHitCount = 0,
+                lastUsedAtMillis = 0L,
+            )
+            val system = systemSummaries[app.packageName]
+            hook.copy(
+                durationMillis = if (usageAccessGranted) system?.durationMillis ?: 0L else 0L,
+                launchCount = system?.launchCount ?: hook.launchCount,
+                lastUsedAtMillis = maxOf(hook.lastUsedAtMillis, system?.lastUsedAtMillis ?: 0L),
+            )
+                .takeIf { it.durationMillis > 0L || it.launchCount > 0 || it.limitHitCount > 0 }
         }
     }
     val todayTotalMillis = todaySummaries.sumOf(AppUsageSummary::durationMillis)
@@ -191,6 +238,27 @@ private fun TimeLimiterScreen(
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val nextMidnight = LocalDate.now()
+                .plusDays(1)
+                .atStartOfDay(ZoneId.systemDefault())
+                .toInstant()
+                .toEpochMilli()
+            delay((nextMidnight - System.currentTimeMillis() + 250L).coerceAtLeast(1_000L))
+            usageRevision++
+        }
+    }
+    LaunchedEffect(selectedSection, statsEnabled, usageAccessGranted) {
+        while (
+            selectedSection == MainSection.STATS &&
+            statsEnabled &&
+            usageAccessGranted
+        ) {
+            delay(STATS_REFRESH_INTERVAL_MS)
+            usageRevision++
+        }
     }
 
     Scaffold(
@@ -211,7 +279,7 @@ private fun TimeLimiterScreen(
                             when (selectedSection) {
                                 MainSection.HOME -> "应用使用时长管控"
                                 MainSection.APPS -> "已启用 ${enabledPackages.size} 个应用"
-                                MainSection.STATS -> "仅统计已启用管控的应用"
+                                MainSection.STATS -> "展示今日使用过的全部应用"
                             },
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -284,11 +352,24 @@ private fun TimeLimiterScreen(
                         shape = RoundedCornerShape(16.dp),
                     )
                     Spacer(Modifier.height(10.dp))
-                    FilterChip(
-                        selected = onlyEnabled,
-                        onClick = { onlyEnabled = !onlyEnabled },
-                        label = { Text("仅看已启用") },
-                    )
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = onlyEnabled,
+                            onClick = { onlyEnabled = !onlyEnabled },
+                            label = { Text("仅看已启用") },
+                        )
+                        FilterChip(
+                            selected = showSystemApps,
+                            onClick = {
+                                showSystemApps = !showSystemApps
+                                context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+                                    .edit()
+                                    .putBoolean("show_system_apps", showSystemApps)
+                                    .apply()
+                            },
+                            label = { Text("显示系统应用") },
+                        )
+                    }
                 }
 
                 items(visibleApps, key = { it.packageName }) { app ->
@@ -323,6 +404,7 @@ private fun TimeLimiterScreen(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 apps = apps,
                 summaries = todaySummaries,
+                controlledPackages = enabledPackages,
                 statsEnabled = statsEnabled,
                 usageAccessGranted = usageAccessGranted,
                 onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
@@ -346,7 +428,7 @@ private fun TimeLimiterScreen(
                         "INFO",
                         app.packageName,
                         "RULE_SAVED",
-                        "enabled=${configuredRule.enabled}, daily=${configuredRule.dailyEnabled}/${configuredRule.dailyLimitSeconds}s, perLaunch=${configuredRule.perLaunchEnabled}/${configuredRule.perLaunchLimitSeconds}s, schedule=${configuredRule.scheduleEnabled}/${configuredRule.scheduleMode}/${configuredRule.scheduleWindows.size}",
+                        "enabled=${configuredRule.enabled}, daily=${configuredRule.dailyEnabled}/${configuredRule.dailyLimitSeconds}s, perLaunch=${configuredRule.perLaunchEnabled}/${configuredRule.perLaunchLimitSeconds}s, schedule=${configuredRule.scheduleEnabled}/${configuredRule.scheduleMode}/${configuredRule.scheduleWindows.size}, cooldown=${configuredRule.cooldownEnabled}/${configuredRule.cooldownSeconds}s",
                     )
                 }
                 rules[app.packageName] = repository.getRule(app.packageName)
@@ -685,6 +767,7 @@ private fun UsageStatisticsScreen(
     modifier: Modifier,
     apps: List<InstalledApp>,
     summaries: List<AppUsageSummary>,
+    controlledPackages: Set<String>,
     statsEnabled: Boolean,
     usageAccessGranted: Boolean,
     onRequestUsageAccess: () -> Unit,
@@ -692,7 +775,8 @@ private fun UsageStatisticsScreen(
 ) {
     val appByPackage = remember(apps) { apps.associateBy(InstalledApp::packageName) }
     val sorted = summaries.sortedWith(
-        compareByDescending<AppUsageSummary> { it.durationMillis }
+        compareByDescending<AppUsageSummary> { it.packageName in controlledPackages }
+            .thenByDescending { it.durationMillis }
             .thenByDescending { it.lastUsedAtMillis },
     )
     LazyColumn(
@@ -737,12 +821,17 @@ private fun UsageStatisticsScreen(
             }
         }
         if (sorted.isEmpty()) {
-            item { Text("暂无已启用的管控应用。") }
+            item { Text("今天暂无应用使用记录。") }
         } else {
             items(sorted, key = AppUsageSummary::packageName) { summary ->
                 val app = appByPackage[summary.packageName]
+                val controlled = summary.packageName in controlledPackages
+                val currentHookReported = summary.lastHookEventAtMillis > 0L &&
+                    summary.hookVersionCode >= BuildConfig.VERSION_CODE
+                val hookReportMissing = controlled && !currentHookReported &&
+                    (summary.durationMillis > 0L || summary.launchCount > 0 || summary.limitHitCount > 0)
                 Surface(
-                    color = Color.White,
+                    color = if (controlled) Color(0xFFF2F6FF) else Color.White,
                     shape = RoundedCornerShape(18.dp),
                     tonalElevation = 1.dp,
                 ) {
@@ -757,17 +846,35 @@ private fun UsageStatisticsScreen(
                             }
                         }
                         Column(Modifier.weight(1f)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    app?.label ?: summary.packageName,
+                                    modifier = Modifier.weight(1f, fill = false),
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                if (controlled) ManagedBadge()
+                            }
                             Text(
-                                app?.label ?: summary.packageName,
-                                fontWeight = FontWeight.Medium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                "启动 ${summary.launchCount} 次 · 限制触发 ${summary.limitHitCount} 次",
+                                if (controlled) {
+                                    "启动 ${summary.launchCount} 次 · 限制触发 ${summary.limitHitCount} 次"
+                                } else {
+                                    "Android 系统使用统计"
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
+                            if (hookReportMissing) {
+                                Text(
+                                    "Hook 计数未同步，请强停该应用后重新打开",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color(0xFFB54708),
+                                )
+                            }
                         }
                         Text(formatDashboardDuration(summary.durationMillis), fontWeight = FontWeight.Bold)
                     }
@@ -786,7 +893,8 @@ private fun formatDashboardDuration(durationMillis: Long): String {
     }
 }
 
-private const val HOOK_VERIFIED_WINDOW_MS = 7L * 24L * 60L * 60L * 1000L
+private const val HOOK_VERIFIED_WINDOW_MS = 15L * 60L * 1000L
+private const val STATS_REFRESH_INTERVAL_MS = 15_000L
 
 @Composable
 private fun SetupCard(
@@ -821,7 +929,7 @@ private fun AppRow(
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
-        color = Color.White,
+        color = if (rule.enabled) Color(0xFFF2F6FF) else Color.White,
         shape = RoundedCornerShape(18.dp),
         tonalElevation = 1.dp,
     ) {
@@ -840,7 +948,19 @@ private fun AppRow(
                 }
             }
             Column(Modifier.weight(1f)) {
-                Text(app.label, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        app.label,
+                        modifier = Modifier.weight(1f, fill = false),
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (rule.enabled) ManagedBadge()
+                }
                 Text(
                     if (rule.enabled) {
                         ruleSummary(rule)
@@ -855,6 +975,22 @@ private fun AppRow(
             }
             Switch(checked = rule.enabled, onCheckedChange = onToggle)
         }
+    }
+}
+
+@Composable
+private fun ManagedBadge() {
+    Surface(
+        color = Color(0xFF315EA8),
+        contentColor = Color.White,
+        shape = RoundedCornerShape(999.dp),
+    ) {
+        Text(
+            "管控中",
+            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
+        )
     }
 }
 
@@ -950,7 +1086,7 @@ private fun SettingsDialog(
                 ) {
                     Column(Modifier.weight(1f)) {
                         Text("退出前提醒", fontWeight = FontWeight.Medium)
-                        Text("到期前 5 秒弹出倒计时", style = MaterialTheme.typography.bodySmall)
+                        Text("到期前 5 秒在屏幕顶部显示倒计时", style = MaterialTheme.typography.bodySmall)
                     }
                     Switch(checked = warningEnabled, onCheckedChange = { warningEnabled = it })
                 }
@@ -966,7 +1102,10 @@ private fun SettingsDialog(
                 ) {
                     Column(Modifier.weight(1f)) {
                         Text("使用时长统计", fontWeight = FontWeight.Medium)
-                        Text("系统按需读取时长，Hook 仅记录启动与退出事件", style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            "系统按需读取时长和启动次数，Hook 记录限制触发事件",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
                     }
                     Switch(checked = usageStatsEnabled, onCheckedChange = { usageStatsEnabled = it })
                 }
@@ -988,7 +1127,7 @@ private fun SettingsDialog(
                                         fontWeight = FontWeight.Medium,
                                     )
                                     Text(
-                                        "仅在打开时停时读取，不会启动后台服务",
+                                        "仅在查看统计或校验每日限额时按需读取，不会常驻后台",
                                         style = MaterialTheme.typography.bodySmall,
                                     )
                                 }
@@ -1235,7 +1374,7 @@ private fun AboutDialog(
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("版本 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
                 Text("Android / LSPosed 应用前台使用时长限制模块。")
-                Text("单次打开、每日累计和每周可用时段可以组合使用，任一限制触发即退出目标应用。")
+                Text("单次打开、每日累计、每周可用时段和退出后冷却可以组合使用。")
                 Text("反馈邮箱：${FeedbackSender.EMAIL}")
                 TextButton(onClick = onOpenRepository) { Text("打开 GitHub 项目主页") }
                 TextButton(onClick = onFeedback) { Text("发送问题反馈") }
@@ -1343,13 +1482,19 @@ private fun RuleDialog(
     var scheduleEnabled by remember(app.packageName) { mutableStateOf(initialRule.scheduleEnabled) }
     var scheduleMode by remember(app.packageName) { mutableStateOf(initialRule.scheduleMode) }
     var scheduleWindows by remember(app.packageName) { mutableStateOf(initialRule.scheduleWindows) }
+    var cooldownEnabled by remember(app.packageName) { mutableStateOf(initialRule.cooldownEnabled) }
+    var cooldownMinutes by remember(app.packageName) {
+        mutableStateOf((initialRule.cooldownSeconds / 60L).coerceAtLeast(1L).toString())
+    }
     val parsedDailyMinutes = dailyMinutes.toLongOrNull()?.takeIf { it in 1..1440 }
     val parsedPerLaunchMinutes = perLaunchMinutes.toLongOrNull()?.takeIf { it in 1..1440 }
+    val parsedCooldownMinutes = cooldownMinutes.toLongOrNull()?.takeIf { it in 1..1440 }
     val scheduleValid = !scheduleEnabled ||
         (scheduleWindows.isNotEmpty() && scheduleWindows.all(ScheduleWindow::isValid))
     val canSave = (dailyEnabled || perLaunchEnabled || scheduleEnabled) &&
         (!dailyEnabled || parsedDailyMinutes != null) &&
         (!perLaunchEnabled || parsedPerLaunchMinutes != null) &&
+        (!cooldownEnabled || parsedCooldownMinutes != null) &&
         scheduleValid
 
     AlertDialog(
@@ -1361,6 +1506,21 @@ private fun RuleDialog(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 item { Text(app.packageName, style = MaterialTheme.typography.bodySmall) }
+                if (app.isSystemApp) {
+                    item {
+                        Surface(
+                            color = Color(0xFFFFE9C7),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Text(
+                                "这是系统应用。达到限制时只关闭应用界面，不结束系统进程，以避免影响桌面或系统稳定性。",
+                                modifier = Modifier.padding(12.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF7A4B00),
+                            )
+                        }
+                    }
+                }
                 item {
                     ThresholdEditor(
                         title = "每日累计",
@@ -1402,6 +1562,27 @@ private fun RuleDialog(
                         onWindowsChange = { scheduleWindows = it },
                     )
                 }
+                item { HorizontalDivider() }
+                item {
+                    ThresholdEditor(
+                        title = "退出后冷却",
+                        description = "被时停强制退出后，在设定时间内禁止再次打开",
+                        enabled = cooldownEnabled,
+                        minutes = cooldownMinutes,
+                        parsedMinutes = parsedCooldownMinutes,
+                        onEnabledChange = { cooldownEnabled = it },
+                        onMinutesChange = { cooldownMinutes = it },
+                    )
+                }
+                if (cooldownEnabled) {
+                    item {
+                        Text(
+                            "冷却期间反复打开不会重新计算冷却时间，也不会重复增加限制触发次数。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
             }
         },
         confirmButton = {
@@ -1417,6 +1598,8 @@ private fun RuleDialog(
                             scheduleEnabled = scheduleEnabled,
                             scheduleMode = scheduleMode,
                             scheduleWindows = scheduleWindows,
+                            cooldownEnabled = cooldownEnabled,
+                            cooldownSeconds = (parsedCooldownMinutes ?: 1L) * 60L,
                         ),
                     )
                 },
@@ -1436,6 +1619,7 @@ private fun RuleDialog(
                                 perLaunchEnabled = true,
                                 perLaunchLimitSeconds = 10L,
                                 scheduleEnabled = false,
+                                cooldownEnabled = false,
                             ),
                         )
                     },
@@ -1706,6 +1890,7 @@ private fun ruleSummary(rule: AppRule): String = buildList {
     if (rule.scheduleEnabled) {
         add(if (rule.scheduleMode == ScheduleMode.ALLOW_ONLY) "限定允许时段" else "设有禁止时段")
     }
+    if (rule.cooldownEnabled) add("冷却 ${formatDuration(rule.cooldownSeconds)}")
 }.joinToString(" · ")
 
 @Composable

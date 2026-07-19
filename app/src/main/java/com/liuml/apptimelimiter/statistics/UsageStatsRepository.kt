@@ -9,6 +9,8 @@ data class AppUsageSummary(
     val launchCount: Int,
     val limitHitCount: Int,
     val lastUsedAtMillis: Long,
+    val lastHookEventAtMillis: Long = 0L,
+    val hookVersionCode: Int = 0,
 )
 
 class UsageStatsRepository(context: Context) {
@@ -22,28 +24,40 @@ class UsageStatsRepository(context: Context) {
         durationMillis: Long,
         launchIncrement: Int,
         limitHitIncrement: Int,
+        hookVersionCode: Int,
+        dayToken: String? = null,
     ): Boolean {
         if (packageName.isBlank()) return false
+        val day = normalizedUsageDayToken(dayToken) ?: return false
         return synchronized(LOCK) {
-            val day = dayToken()
             val prefix = "$day.$packageName."
             // ContentProvider calls can cold-start this process for a single short write.
             // Commit synchronously so Android cannot kill the process before apply() flushes it.
             prefs.edit()
                 .putLong(
                     "${prefix}duration_ms",
-                    prefs.getLong("${prefix}duration_ms", 0L) + durationMillis.coerceAtLeast(0L),
+                    safeAdd(
+                        prefs.getLong("${prefix}duration_ms", 0L).coerceAtLeast(0L),
+                        durationMillis.coerceAtLeast(0L),
+                    ),
                 )
                 .putInt(
                     "${prefix}launches",
-                    prefs.getInt("${prefix}launches", 0) + launchIncrement.coerceAtLeast(0),
+                    safeAdd(
+                        prefs.getInt("${prefix}launches", 0).coerceAtLeast(0),
+                        launchIncrement.coerceAtLeast(0),
+                    ),
                 )
                 .putInt(
                     "${prefix}limit_hits",
-                    prefs.getInt("${prefix}limit_hits", 0) + limitHitIncrement.coerceAtLeast(0),
+                    safeAdd(
+                        prefs.getInt("${prefix}limit_hits", 0).coerceAtLeast(0),
+                        limitHitIncrement.coerceAtLeast(0),
+                    ),
                 )
                 .putLong("${prefix}last_used_at", System.currentTimeMillis())
                 .putLong("heartbeat.$packageName", System.currentTimeMillis())
+                .putInt("hook_version.$packageName", hookVersionCode.coerceAtLeast(0))
                 .commit()
         }
     }
@@ -56,6 +70,8 @@ class UsageStatsRepository(context: Context) {
             launchCount = prefs.getInt("${prefix}launches", 0).coerceAtLeast(0),
             limitHitCount = prefs.getInt("${prefix}limit_hits", 0).coerceAtLeast(0),
             lastUsedAtMillis = prefs.getLong("${prefix}last_used_at", 0L).coerceAtLeast(0L),
+            lastHookEventAtMillis = prefs.getLong("${prefix}last_used_at", 0L).coerceAtLeast(0L),
+            hookVersionCode = prefs.getInt("hook_version.$packageName", 0).coerceAtLeast(0),
         )
     }
 
@@ -71,9 +87,7 @@ class UsageStatsRepository(context: Context) {
 
     fun clearAll() {
         synchronized(LOCK) {
-            val editor = prefs.edit()
-            prefs.all.keys.filterNot { it.startsWith("heartbeat.") }.forEach(editor::remove)
-            editor.apply()
+            prefs.edit().clear().commit()
         }
     }
 
@@ -84,3 +98,24 @@ class UsageStatsRepository(context: Context) {
         val LOCK = Any()
     }
 }
+
+private fun safeAdd(current: Long, increment: Long): Long =
+    if (increment > Long.MAX_VALUE - current) Long.MAX_VALUE else current + increment
+
+private fun safeAdd(current: Int, increment: Int): Int =
+    if (increment > Int.MAX_VALUE - current) Int.MAX_VALUE else current + increment
+
+internal fun normalizedUsageDayToken(
+    value: String?,
+    today: LocalDate = LocalDate.now(),
+): String? {
+    if (value.isNullOrBlank()) return today.toString()
+    val parsed = runCatching { LocalDate.parse(value) }.getOrNull() ?: return null
+    return parsed.toString().takeIf {
+        !parsed.isBefore(today.minusDays(MAX_PENDING_DAYS)) &&
+            !parsed.isAfter(today.plusDays(MAX_FUTURE_DAYS))
+    }
+}
+
+private const val MAX_PENDING_DAYS = 31L
+private const val MAX_FUTURE_DAYS = 1L

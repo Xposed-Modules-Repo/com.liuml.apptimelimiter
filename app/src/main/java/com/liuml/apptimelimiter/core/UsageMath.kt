@@ -15,4 +15,7 @@ object UsageMath {
 
     fun earliestRemainingMillis(remainingValues: Iterable<Long>): Long? =
         remainingValues.minOrNull()?.coerceAtLeast(0L)
+
+    fun authoritativeDailyUsedMillis(localMillis: Long, systemMillis: Long): Long =
+        maxOf(localMillis.coerceAtLeast(0L), systemMillis.coerceAtLeast(0L))
 }

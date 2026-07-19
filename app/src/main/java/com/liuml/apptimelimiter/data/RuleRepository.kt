@@ -25,6 +25,7 @@ class RuleRepository(context: Context) {
         val prefix = prefix(packageName)
         val legacyEnabled = prefs.getBoolean("${prefix}enabled", false)
         val legacyLimitSeconds = prefs.getLong("${prefix}limit_seconds", DEFAULT_LIMIT_SECONDS)
+            .coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS)
         val legacyMode = prefs.getString("${prefix}mode", RuleMode.DAILY.name)
             ?.let { runCatching { RuleMode.valueOf(it) }.getOrNull() }
             ?: RuleMode.DAILY
@@ -48,12 +49,12 @@ class RuleRepository(context: Context) {
             dailyLimitSeconds = prefs.getLong(
                 "${prefix}daily_limit_seconds",
                 legacyLimitSeconds,
-            ).coerceAtLeast(1L),
+            ).coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS),
             perLaunchEnabled = perLaunchEnabled,
             perLaunchLimitSeconds = prefs.getLong(
                 "${prefix}per_launch_limit_seconds",
                 legacyLimitSeconds,
-            ).coerceAtLeast(1L),
+            ).coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS),
             scheduleEnabled = scheduleEnabled,
             scheduleMode = prefs.getString(
                 "${prefix}schedule_mode",
@@ -63,6 +64,11 @@ class RuleRepository(context: Context) {
             scheduleWindows = ScheduleCodec.decode(
                 prefs.getString("${prefix}schedule_windows", null),
             ),
+            cooldownEnabled = prefs.getBoolean("${prefix}cooldown_enabled", false),
+            cooldownSeconds = prefs.getLong(
+                "${prefix}cooldown_seconds",
+                DEFAULT_COOLDOWN_SECONDS,
+            ).coerceIn(MIN_COOLDOWN_SECONDS, MAX_COOLDOWN_SECONDS),
             version = prefs.getLong("${prefix}version", 0L),
         )
     }
@@ -71,6 +77,8 @@ class RuleRepository(context: Context) {
         val packages = prefs.getStringSet(KEY_PACKAGES, emptySet()).orEmpty().toMutableSet()
         packages += rule.packageName
         val prefix = prefix(rule.packageName)
+        val previousVersion = prefs.getLong("${prefix}version", 0L)
+        val nextVersion = maxOf(System.currentTimeMillis(), previousVersion + 1L)
         prefs.edit()
             .putStringSet(KEY_PACKAGES, packages)
             .putBoolean(
@@ -78,22 +86,34 @@ class RuleRepository(context: Context) {
                 rule.enabled && (rule.dailyEnabled || rule.perLaunchEnabled || rule.scheduleEnabled),
             )
             .putBoolean("${prefix}daily_enabled", rule.dailyEnabled)
-            .putLong("${prefix}daily_limit_seconds", rule.dailyLimitSeconds.coerceAtLeast(1L))
+            .putLong(
+                "${prefix}daily_limit_seconds",
+                rule.dailyLimitSeconds.coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS),
+            )
             .putBoolean("${prefix}per_launch_enabled", rule.perLaunchEnabled)
-            .putLong("${prefix}per_launch_limit_seconds", rule.perLaunchLimitSeconds.coerceAtLeast(1L))
+            .putLong(
+                "${prefix}per_launch_limit_seconds",
+                rule.perLaunchLimitSeconds.coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS),
+            )
             .putBoolean("${prefix}schedule_enabled", rule.scheduleEnabled)
             .putString("${prefix}schedule_mode", rule.scheduleMode.name)
             .putString("${prefix}schedule_windows", ScheduleCodec.encode(rule.scheduleWindows))
+            .putBoolean("${prefix}cooldown_enabled", rule.cooldownEnabled)
+            .putLong(
+                "${prefix}cooldown_seconds",
+                rule.cooldownSeconds.coerceIn(MIN_COOLDOWN_SECONDS, MAX_COOLDOWN_SECONDS),
+            )
             // Keep one legacy representation so downgrading does not leave an unreadable rule.
             .putLong(
                 "${prefix}limit_seconds",
-                if (rule.dailyEnabled) rule.dailyLimitSeconds else rule.perLaunchLimitSeconds,
+                (if (rule.dailyEnabled) rule.dailyLimitSeconds else rule.perLaunchLimitSeconds)
+                    .coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS),
             )
             .putString(
                 "${prefix}mode",
                 if (rule.dailyEnabled) RuleMode.DAILY.name else RuleMode.PER_LAUNCH.name,
             )
-            .putLong("${prefix}version", System.currentTimeMillis())
+            .putLong("${prefix}version", nextVersion)
             .commit()
         grantRuleAccess(rule.packageName)
         makePreferencesReadable()
@@ -153,12 +173,17 @@ class RuleRepository(context: Context) {
         const val PREFS_NAME = "rules"
         const val KEY_PACKAGES = "configured_packages"
         const val DEFAULT_LIMIT_SECONDS = 30L * 60L
+        const val MIN_LIMIT_SECONDS = 1L
+        const val MAX_LIMIT_SECONDS = 24L * 60L * 60L
         const val KEY_EXIT_WARNING_ENABLED = "global.exit_warning_enabled"
         const val KEY_EXTENSION_SECONDS = "global.extension_seconds"
         const val KEY_DIAGNOSTICS_ENABLED = "global.diagnostics_enabled"
         const val KEY_LAUNCHER_ICON_HIDDEN = "global.launcher_icon_hidden"
         const val KEY_USAGE_STATS_ENABLED = "global.usage_stats_enabled"
         const val DEFAULT_EXTENSION_SECONDS = 5L * 60L
+        const val DEFAULT_COOLDOWN_SECONDS = 5L * 60L
+        const val MIN_COOLDOWN_SECONDS = 60L
+        const val MAX_COOLDOWN_SECONDS = 24L * 60L * 60L
         const val MIN_EXTENSION_SECONDS = 60L
         const val MAX_EXTENSION_SECONDS = 60L * 60L
     }
