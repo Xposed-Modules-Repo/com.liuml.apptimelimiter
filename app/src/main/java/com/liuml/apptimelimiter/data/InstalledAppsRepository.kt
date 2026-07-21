@@ -5,6 +5,8 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Process
+import android.os.UserHandle
 
 class InstalledAppsRepository(private val context: Context) {
     private val packageManager = context.packageManager
@@ -25,6 +27,10 @@ class InstalledAppsRepository(private val context: Context) {
             .asSequence()
             .mapNotNull { it.activityInfo?.applicationInfo }
             .filter { it.packageName != context.packageName }
+            // LSPosed scopes packages per Android user. Rules in this app are currently keyed
+            // only by package name, so showing a clone from another user/profile would imply a
+            // level of control that we cannot represent safely yet.
+            .filter { UserHandle.getUserHandleForUid(it.uid) == Process.myUserHandle() }
             .distinctBy { it.packageName }
             .map { appInfo ->
                 InstalledApp(

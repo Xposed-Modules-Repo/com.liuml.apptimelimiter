@@ -1,1 +1,1 @@
-时停：区别于系统屏幕时间的精细应用管控，集每日额度、单次时长、每周时段、退出后冷却、使用统计、Hook 验证和诊断日志于一体。
+Time Stop: precision LSPosed app-time control with daily quotas, per-launch timers, shared app-group budgets, weekly windows, cooldowns, Hook verification, and diagnostics. / 时停：区别于系统屏幕时间的精细应用管控，集每日额度、单次时长、应用分组共享额度、每周时段、退出后冷却、Hook 验证和诊断日志于一体。

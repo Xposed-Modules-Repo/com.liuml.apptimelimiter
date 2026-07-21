@@ -25,11 +25,11 @@ internal enum class WarningBannerKind {
 }
 
 /**
- * A small non-modal banner attached to the target Activity's decor view.
+ * A warning attached to the target Activity's decor view.
  *
- * It does not require overlay permission and only its optional action button consumes touches.
- * Insets are applied at the decor level so edge-to-edge, display-cutout and landscape windows
- * keep the warning away from unsafe screen areas.
+ * The default mode is a small non-modal top banner. The optional full-screen mode is still an
+ * in-Activity view, so neither mode needs overlay permission. Insets are applied at the decor
+ * level so edge-to-edge, display-cutout and landscape windows keep content in safe areas.
  */
 internal class TopWarningBanner private constructor(
     val kind: WarningBannerKind,
@@ -63,6 +63,7 @@ internal class TopWarningBanner private constructor(
             message: String,
             remainingMillis: Long,
             maxProgressMillis: Long,
+            fullScreen: Boolean = false,
             actionLabel: String? = null,
             onAction: (() -> Unit)? = null,
         ): TopWarningBanner {
@@ -72,43 +73,52 @@ internal class TopWarningBanner private constructor(
 
             val root = LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(dp(16), dp(12), dp(12), dp(8))
+                gravity = if (fullScreen) Gravity.CENTER else Gravity.NO_GRAVITY
+                setPadding(
+                    dp(if (fullScreen) FULL_SCREEN_PADDING_DP else 16),
+                    dp(if (fullScreen) FULL_SCREEN_PADDING_DP else 12),
+                    dp(if (fullScreen) FULL_SCREEN_PADDING_DP else 12),
+                    dp(if (fullScreen) FULL_SCREEN_PADDING_DP else 8),
+                )
                 background = roundedBackground(
                     color = BANNER_BACKGROUND,
-                    radius = dp(20).toFloat(),
-                    strokeWidth = dp(1),
-                    strokeColor = BANNER_BORDER,
+                    radius = dp(if (fullScreen) 0 else 20).toFloat(),
+                    strokeWidth = if (fullScreen) 0 else dp(1),
+                    strokeColor = if (fullScreen) Color.TRANSPARENT else BANNER_BORDER,
                 )
-                elevation = dp(12).toFloat()
+                elevation = if (fullScreen) 0f else dp(12).toFloat()
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
-                isClickable = false
-                isFocusable = false
+                isClickable = fullScreen
+                isFocusable = fullScreen
             }
 
             val contentRow = LinearLayout(activity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
+                orientation = if (fullScreen) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+                gravity = if (fullScreen) Gravity.CENTER_HORIZONTAL else Gravity.CENTER_VERTICAL
                 isClickable = false
                 isFocusable = false
             }
             val textColumn = LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
+                gravity = if (fullScreen) Gravity.CENTER_HORIZONTAL else Gravity.NO_GRAVITY
                 isClickable = false
                 isFocusable = false
             }
             val titleView = TextView(activity).apply {
                 setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, if (fullScreen) 28f else 15f)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-                maxLines = 1
+                maxLines = if (fullScreen) 2 else 1
+                gravity = if (fullScreen) Gravity.CENTER else Gravity.NO_GRAVITY
                 isClickable = false
                 isFocusable = false
             }
             val messageView = TextView(activity).apply {
                 setTextColor(BANNER_SECONDARY_TEXT)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-                maxLines = 2
-                setPadding(0, dp(2), 0, 0)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, if (fullScreen) 16f else 12.5f)
+                maxLines = if (fullScreen) 3 else 2
+                gravity = if (fullScreen) Gravity.CENTER else Gravity.NO_GRAVITY
+                setPadding(0, dp(if (fullScreen) 8 else 2), 0, 0)
                 isClickable = false
                 isFocusable = false
             }
@@ -128,11 +138,18 @@ internal class TopWarningBanner private constructor(
             )
             contentRow.addView(
                 textColumn,
-                LinearLayout.LayoutParams(
-                    0,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    1f,
-                ),
+                if (fullScreen) {
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    )
+                } else {
+                    LinearLayout.LayoutParams(
+                        0,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        1f,
+                    )
+                },
             )
 
             if (actionLabel != null && onAction != null) {
@@ -158,7 +175,14 @@ internal class TopWarningBanner private constructor(
                     LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ).apply { marginStart = dp(12) },
+                    ).apply {
+                        if (fullScreen) {
+                            topMargin = dp(24)
+                            gravity = Gravity.CENTER_HORIZONTAL
+                        } else {
+                            marginStart = dp(12)
+                        }
+                    },
                 )
             }
 
@@ -185,8 +209,8 @@ internal class TopWarningBanner private constructor(
                 progressView,
                 LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(3),
-                ).apply { topMargin = dp(8) },
+                    dp(if (fullScreen) 5 else 3),
+                ).apply { topMargin = dp(if (fullScreen) 24 else 8) },
             )
 
             val horizontalMargin = dp(
@@ -200,25 +224,36 @@ internal class TopWarningBanner private constructor(
                 activity.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
             val windowWidth = windowWidth(activity)
             val maxLandscapeWidth = dp(MAX_LANDSCAPE_WIDTH_DP)
-            val layoutParams = FrameLayout.LayoutParams(
-                bannerWidth(isLandscape, windowWidth, horizontalMargin, maxLandscapeWidth),
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.CENTER_HORIZONTAL,
-            ).apply {
-                topMargin = dp(TOP_MARGIN_DP)
-                leftMargin = horizontalMargin
-                rightMargin = horizontalMargin
+            val layoutParams = if (fullScreen) {
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                )
+            } else {
+                FrameLayout.LayoutParams(
+                    bannerWidth(isLandscape, windowWidth, horizontalMargin, maxLandscapeWidth),
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP or Gravity.CENTER_HORIZONTAL,
+                ).apply {
+                    topMargin = dp(TOP_MARGIN_DP)
+                    leftMargin = horizontalMargin
+                    rightMargin = horizontalMargin
+                }
             }
             root.setOnApplyWindowInsetsListener { view, insets ->
-                applySafeInsets(
-                    view = view,
-                    insets = insets,
-                    baseTopMargin = dp(TOP_MARGIN_DP),
-                    baseHorizontalMargin = horizontalMargin,
-                    isLandscape = isLandscape,
-                    windowWidth = windowWidth,
-                    maxLandscapeWidth = maxLandscapeWidth,
-                )
+                if (fullScreen) {
+                    applyFullScreenInsets(view, insets, dp(FULL_SCREEN_PADDING_DP))
+                } else {
+                    applySafeInsets(
+                        view = view,
+                        insets = insets,
+                        baseTopMargin = dp(TOP_MARGIN_DP),
+                        baseHorizontalMargin = horizontalMargin,
+                        isLandscape = isLandscape,
+                        windowWidth = windowWidth,
+                        maxLandscapeWidth = maxLandscapeWidth,
+                    )
+                }
                 insets
             }
             decor.addView(root, layoutParams)
@@ -265,6 +300,28 @@ internal class TopWarningBanner private constructor(
                 @Suppress("DEPRECATION")
                 activity.resources.displayMetrics.widthPixels
             }
+
+        @Suppress("DEPRECATION")
+        private fun applyFullScreenInsets(view: View, insets: WindowInsets, basePadding: Int) {
+            val systemInsets = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                insets.getInsets(
+                    WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout(),
+                ).let { SafeInsets(it.left, it.top, it.right, it.bottom) }
+            } else {
+                SafeInsets(
+                    insets.systemWindowInsetLeft,
+                    insets.systemWindowInsetTop,
+                    insets.systemWindowInsetRight,
+                    insets.systemWindowInsetBottom,
+                )
+            }
+            view.setPadding(
+                basePadding + systemInsets.left,
+                basePadding + systemInsets.top,
+                basePadding + systemInsets.right,
+                basePadding + systemInsets.bottom,
+            )
+        }
 
         @Suppress("DEPRECATION")
         private fun applySafeInsets(
@@ -338,6 +395,7 @@ internal class TopWarningBanner private constructor(
             val left: Int,
             val top: Int,
             val right: Int,
+            val bottom: Int = 0,
         ) {
             companion object {
                 val NONE = SafeInsets(0, 0, 0)
@@ -348,6 +406,7 @@ internal class TopWarningBanner private constructor(
         private const val LANDSCAPE_MARGIN_DP = 16
         private const val TOP_MARGIN_DP = 10
         private const val MAX_LANDSCAPE_WIDTH_DP = 520
+        private const val FULL_SCREEN_PADDING_DP = 28
         private const val BANNER_BACKGROUND = 0xF20A0A0A.toInt()
         private const val BANNER_BORDER = 0x3DFFFFFF
         private const val BANNER_SECONDARY_TEXT = 0xC7FFFFFF.toInt()

@@ -81,9 +81,13 @@ class UsageStatsRepository(context: Context) {
     fun totalToday(packageNames: Collection<String>): Long =
         packageNames.sumOf { summaryToday(it).durationMillis }
 
-    fun latestHookHeartbeat(packageNames: Collection<String>): Long = packageNames
-        .maxOfOrNull { prefs.getLong("heartbeat.$it", 0L) }
-        ?: 0L
+    fun verifiedHookPackages(
+        packageNames: Collection<String>,
+        minimumVersionCode: Int,
+    ): Set<String> = packageNames.filterTo(mutableSetOf()) { packageName ->
+        prefs.getLong("heartbeat.$packageName", 0L) > 0L &&
+            prefs.getInt("hook_version.$packageName", 0) >= minimumVersionCode
+    }
 
     fun clearAll() {
         synchronized(LOCK) {

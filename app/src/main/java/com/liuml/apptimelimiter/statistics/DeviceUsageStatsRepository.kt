@@ -17,6 +17,7 @@ import java.time.ZoneId
 class DeviceUsageStatsRepository(context: Context) {
     private val appContext = context.applicationContext
     private val durationCache = mutableMapOf<String, CachedDuration>()
+    private var summariesCache: CachedSummaries? = null
 
     fun hasUsageAccess(): Boolean {
         val appOps = appContext.getSystemService(AppOpsManager::class.java) ?: return false
@@ -40,7 +41,17 @@ class DeviceUsageStatsRepository(context: Context) {
     fun todayUsageSummaries(packageNames: Collection<String>): Map<String, CalculatedUsageSummary> {
         if (packageNames.isEmpty() || !hasUsageAccess()) return emptyMap()
         val now = System.currentTimeMillis()
-        val startOfDay = LocalDate.now()
+        val today = LocalDate.now()
+        val tracked = packageNames.toSet()
+        val nowElapsed = SystemClock.elapsedRealtime()
+        synchronized(this) {
+            summariesCache?.takeIf {
+                it.day == today &&
+                    it.packageNames == tracked &&
+                    nowElapsed - it.measuredAtElapsedMillis <= PROVIDER_CACHE_MS
+            }?.let { return it.summaries }
+        }
+        val startOfDay = today
             .atStartOfDay(ZoneId.systemDefault())
             .toInstant()
             .toEpochMilli()
@@ -49,7 +60,6 @@ class DeviceUsageStatsRepository(context: Context) {
         val usageEvents = runCatching {
             manager.queryEvents((startOfDay - EVENT_LOOKBACK_MS).coerceAtLeast(0L), now)
         }.getOrElse { return emptyMap() }
-        val tracked = packageNames.toSet()
         val transitions = buildList<UsageTimelineEvent> {
             val event = UsageEvents.Event()
             while (usageEvents.hasNextEvent()) {
@@ -78,7 +88,16 @@ class DeviceUsageStatsRepository(context: Context) {
                 }
             }
         }
-        return UsageEventDurationCalculator.calculateSummaries(tracked, startOfDay, now, transitions)
+        val summaries = UsageEventDurationCalculator.calculateSummaries(
+            tracked,
+            startOfDay,
+            now,
+            transitions,
+        )
+        synchronized(this) {
+            summariesCache = CachedSummaries(today, tracked, nowElapsed, summaries)
+        }
+        return summaries
     }
 
     fun todayDurations(packageNames: Collection<String>): Map<String, Long> =
@@ -122,5 +141,12 @@ class DeviceUsageStatsRepository(context: Context) {
         val day: LocalDate,
         val measuredAtElapsedMillis: Long,
         val durationMillis: Long,
+    )
+
+    private data class CachedSummaries(
+        val day: LocalDate,
+        val packageNames: Set<String>,
+        val measuredAtElapsedMillis: Long,
+        val summaries: Map<String, CalculatedUsageSummary>,
     )
 }

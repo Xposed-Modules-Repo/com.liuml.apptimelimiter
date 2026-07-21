@@ -8,11 +8,14 @@ import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
 import android.os.Process
+import android.os.SystemClock
+import com.liuml.apptimelimiter.core.GroupUsagePolicy
 import com.liuml.apptimelimiter.data.RuleRepository
 import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
+import java.time.LocalDate
 
 class RuleProvider : ContentProvider() {
     private var deviceUsageStatsRepository: DeviceUsageStatsRepository? = null
@@ -30,19 +33,43 @@ class RuleProvider : ContentProvider() {
                 val packageName = arg.orEmpty()
                 if (!isCallerAllowed(packageName)) return denied()
                 val rule = ruleRepository.getRule(packageName)
+                val group = ruleRepository.groupForPackage(packageName)
+                    ?.takeIf { it.enabled && it.packageNames.isNotEmpty() }
                 val settings = ruleRepository.getGlobalSettings()
                 val systemUsageRepository = deviceUsageStatsRepository
                     ?: DeviceUsageStatsRepository(appContext).also {
                         deviceUsageStatsRepository = it
                     }
-                val systemTodayUsedMillis = if (rule.dailyEnabled) {
-                    systemUsageRepository.todayDuration(packageName) ?: -1L
+                val trackedPackages = buildSet {
+                    if (rule.dailyEnabled) add(packageName)
+                    group?.packageNames?.let(::addAll)
+                }
+                val hasUsageAccess = trackedPackages.isNotEmpty() &&
+                    systemUsageRepository.hasUsageAccess()
+                val systemDurations = if (hasUsageAccess) {
+                    systemUsageRepository.todayDurations(trackedPackages)
+                } else {
+                    emptyMap()
+                }
+                val systemTodayUsedMillis = if (rule.dailyEnabled && hasUsageAccess) {
+                    systemDurations[packageName] ?: 0L
                 } else {
                     -1L
                 }
+                val groupTodayUsedMillis = group?.let { activeGroup ->
+                    val moduleDurations = UsageStatsRepository(appContext)
+                        .summariesToday(activeGroup.packageNames)
+                        .associate { it.packageName to it.durationMillis }
+                    GroupUsagePolicy.authoritativeTotalMillis(
+                        packageNames = activeGroup.packageNames,
+                        systemDurations = systemDurations,
+                        moduleDurations = moduleDurations,
+                    )
+                } ?: -1L
+                val groupMeasuredAtElapsedMillis = SystemClock.elapsedRealtime()
                 Bundle().apply {
                     putBoolean(RuleContract.KEY_OK, true)
-                    putBoolean(RuleContract.KEY_ENABLED, rule.enabled)
+                    putBoolean(RuleContract.KEY_ENABLED, rule.enabled || group != null)
                     putBoolean(RuleContract.KEY_DAILY_ENABLED, rule.dailyEnabled)
                     putLong(RuleContract.KEY_DAILY_LIMIT_SECONDS, rule.dailyLimitSeconds)
                     putBoolean(RuleContract.KEY_PER_LAUNCH_ENABLED, rule.perLaunchEnabled)
@@ -57,10 +84,28 @@ class RuleProvider : ContentProvider() {
                     putLong(RuleContract.KEY_COOLDOWN_SECONDS, rule.cooldownSeconds)
                     putLong(RuleContract.KEY_VERSION, rule.version)
                     putBoolean(RuleContract.KEY_EXIT_WARNING_ENABLED, settings.exitWarningEnabled)
+                    putBoolean(
+                        RuleContract.KEY_FULL_SCREEN_EXIT_WARNING_ENABLED,
+                        settings.fullScreenExitWarningEnabled,
+                    )
                     putLong(RuleContract.KEY_EXTENSION_SECONDS, settings.extensionSeconds)
                     putBoolean(RuleContract.KEY_DIAGNOSTICS_ENABLED, settings.diagnosticsEnabled)
                     putBoolean(RuleContract.KEY_USAGE_STATS_ENABLED, settings.usageStatsEnabled)
                     putLong(RuleContract.KEY_SYSTEM_TODAY_USED_MS, systemTodayUsedMillis)
+                    putBoolean(RuleContract.KEY_GROUP_ENABLED, group != null)
+                    putString(RuleContract.KEY_GROUP_ID, group?.id.orEmpty())
+                    putString(RuleContract.KEY_GROUP_NAME, group?.name.orEmpty())
+                    putLong(
+                        RuleContract.KEY_GROUP_DAILY_LIMIT_SECONDS,
+                        group?.dailyLimitSeconds ?: RuleRepository.DEFAULT_GROUP_LIMIT_SECONDS,
+                    )
+                    putLong(RuleContract.KEY_GROUP_TODAY_USED_MS, groupTodayUsedMillis)
+                    putLong(RuleContract.KEY_GROUP_VERSION, group?.version ?: 0L)
+                    putString(RuleContract.KEY_GROUP_DAY_TOKEN, LocalDate.now().toString())
+                    putLong(
+                        RuleContract.KEY_GROUP_MEASURED_AT_ELAPSED_MS,
+                        groupMeasuredAtElapsedMillis,
+                    )
                 }
             }
 

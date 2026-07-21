@@ -77,12 +77,15 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.liuml.apptimelimiter.data.AppRule
+import com.liuml.apptimelimiter.data.AppGroup
 import com.liuml.apptimelimiter.data.GlobalSettings
 import com.liuml.apptimelimiter.data.InstalledApp
 import com.liuml.apptimelimiter.data.InstalledAppsRepository
 import com.liuml.apptimelimiter.data.RuleRepository
+import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.data.ScheduleMode
 import com.liuml.apptimelimiter.data.ScheduleWindow
+import com.liuml.apptimelimiter.core.GroupUsagePolicy
 import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
 import com.liuml.apptimelimiter.support.FeedbackSender
 import com.liuml.apptimelimiter.settings.LauncherIconController
@@ -167,6 +170,9 @@ private fun TimeLimiterScreen(
     var checkingUpdate by remember { mutableStateOf(false) }
     var updateResult by remember { mutableStateOf<UpdateCheckResult?>(null) }
     var selectedSection by remember { mutableStateOf(MainSection.HOME) }
+    var groups by remember { mutableStateOf(repository.getGroups()) }
+    var editingGroup by remember { mutableStateOf<AppGroup?>(null) }
+    var scopeReminderPackages by remember { mutableStateOf<Set<String>>(emptySet()) }
     var usageRevision by remember { mutableIntStateOf(0) }
     var showSetupGuide by remember {
         mutableStateOf(
@@ -175,40 +181,62 @@ private fun TimeLimiterScreen(
         )
     }
 
-    val visibleApps = remember(apps, search, onlyEnabled, showSystemApps, rules.toMap()) {
+    val groupByPackage = remember(groups) {
+        groups.filter(AppGroup::enabled)
+            .flatMap { group -> group.packageNames.map { it to group } }
+            .toMap()
+    }
+    val selectableApps = remember(apps, showSystemApps) {
+        if (showSystemApps) apps else apps.filterNot(InstalledApp::isSystemApp)
+    }
+    val visibleApps = remember(apps, search, onlyEnabled, showSystemApps, rules.toMap(), groupByPackage) {
         apps.filter { app ->
             (showSystemApps || !app.isSystemApp) &&
-            (!onlyEnabled || rules[app.packageName]?.enabled == true) &&
+            (!onlyEnabled || rules[app.packageName]?.enabled == true || app.packageName in groupByPackage) &&
                 (search.isBlank() || app.label.contains(search, true) || app.packageName.contains(search, true))
         }.sortedWith(
-            compareByDescending<InstalledApp> { rules[it.packageName]?.enabled == true }
+            compareByDescending<InstalledApp> {
+                rules[it.packageName]?.enabled == true || it.packageName in groupByPackage
+            }
                 .thenBy { it.label.lowercase() },
         )
     }
-    val enabledPackages = rules.values.filter(AppRule::enabled).map(AppRule::packageName).toSet()
+    val enabledPackages = remember(rules.toMap(), groupByPackage) {
+        rules.values.filter(AppRule::enabled).map(AppRule::packageName).toSet() + groupByPackage.keys
+    }
     val statsEnabled = remember(usageRevision) {
         repository.getGlobalSettings().usageStatsEnabled
     }
     val usageAccessGranted = remember(usageRevision) {
         deviceUsageStatsRepository.hasUsageAccess()
     }
-    val hookSummaries = remember(enabledPackages, usageRevision) {
-        usageStatsRepository.summariesToday(enabledPackages)
-    }
     val allLaunchablePackages = remember(apps) { apps.map(InstalledApp::packageName).toSet() }
+    val groupPackages = remember(groups) { groups.flatMapTo(mutableSetOf(), AppGroup::packageNames) }
+    val hookSummaries = remember(allLaunchablePackages, usageRevision) {
+        usageStatsRepository.summariesToday(allLaunchablePackages)
+    }
+    val systemTrackedPackages = remember(allLaunchablePackages, groupPackages, statsEnabled) {
+        if (statsEnabled) allLaunchablePackages else groupPackages
+    }
     var systemSummaries by remember {
         mutableStateOf<Map<String, CalculatedUsageSummary>>(emptyMap())
     }
-    LaunchedEffect(allLaunchablePackages, usageRevision, usageAccessGranted, statsEnabled) {
-        systemSummaries = if (statsEnabled && usageAccessGranted) {
+    LaunchedEffect(systemTrackedPackages, usageRevision, usageAccessGranted) {
+        systemSummaries = if (usageAccessGranted && systemTrackedPackages.isNotEmpty()) {
             withContext(Dispatchers.IO) {
-                deviceUsageStatsRepository.todayUsageSummaries(allLaunchablePackages)
+                deviceUsageStatsRepository.todayUsageSummaries(systemTrackedPackages)
             }
         } else {
             emptyMap()
         }
     }
-    val todaySummaries = remember(hookSummaries, systemSummaries, usageAccessGranted) {
+    val todaySummaries = remember(
+        hookSummaries,
+        systemSummaries,
+        usageAccessGranted,
+        statsEnabled,
+    ) {
+        if (!statsEnabled) return@remember emptyList()
         val hookByPackage = hookSummaries.associateBy(AppUsageSummary::packageName)
         apps.mapNotNull { app ->
             val hook = hookByPackage[app.packageName] ?: AppUsageSummary(
@@ -220,7 +248,10 @@ private fun TimeLimiterScreen(
             )
             val system = systemSummaries[app.packageName]
             hook.copy(
-                durationMillis = if (usageAccessGranted) system?.durationMillis ?: 0L else 0L,
+                durationMillis = maxOf(
+                    hook.durationMillis,
+                    if (usageAccessGranted) system?.durationMillis ?: 0L else 0L,
+                ),
                 launchCount = system?.launchCount ?: hook.launchCount,
                 lastUsedAtMillis = maxOf(hook.lastUsedAtMillis, system?.lastUsedAtMillis ?: 0L),
             )
@@ -228,8 +259,19 @@ private fun TimeLimiterScreen(
         }
     }
     val todayTotalMillis = todaySummaries.sumOf(AppUsageSummary::durationMillis)
-    val latestHookHeartbeat = remember(enabledPackages, usageRevision) {
-        usageStatsRepository.latestHookHeartbeat(enabledPackages)
+    val groupUsageById = remember(groups, hookSummaries, systemSummaries) {
+        val moduleDurations = hookSummaries.associate { it.packageName to it.durationMillis }
+        val systemDurations = systemSummaries.mapValues { it.value.durationMillis }
+        groups.associate { group ->
+            group.id to GroupUsagePolicy.authoritativeTotalMillis(
+                packageNames = group.packageNames,
+                systemDurations = systemDurations,
+                moduleDurations = moduleDurations,
+            )
+        }
+    }
+    val verifiedHookPackages = remember(enabledPackages, usageRevision) {
+        usageStatsRepository.verifiedHookPackages(enabledPackages, BuildConfig.VERSION_CODE)
     }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -252,9 +294,12 @@ private fun TimeLimiterScreen(
     }
     LaunchedEffect(selectedSection, statsEnabled, usageAccessGranted) {
         while (
-            selectedSection == MainSection.STATS &&
-            statsEnabled &&
-            usageAccessGranted
+            selectedSection == MainSection.GROUPS ||
+            (
+                selectedSection == MainSection.STATS &&
+                    statsEnabled &&
+                    usageAccessGranted
+                )
         ) {
             delay(STATS_REFRESH_INTERVAL_MS)
             usageRevision++
@@ -271,6 +316,7 @@ private fun TimeLimiterScreen(
                             when (selectedSection) {
                                 MainSection.HOME -> "时停"
                                 MainSection.APPS -> "应用管理"
+                                MainSection.GROUPS -> "应用分组"
                                 MainSection.STATS -> "使用统计"
                             },
                             fontWeight = FontWeight.SemiBold,
@@ -279,6 +325,7 @@ private fun TimeLimiterScreen(
                             when (selectedSection) {
                                 MainSection.HOME -> "应用使用时长管控"
                                 MainSection.APPS -> "已启用 ${enabledPackages.size} 个应用"
+                                MainSection.GROUPS -> "${groups.size} 个分组共享每日额度"
                                 MainSection.STATS -> "展示今日使用过的全部应用"
                             },
                             style = MaterialTheme.typography.labelMedium,
@@ -307,6 +354,7 @@ private fun TimeLimiterScreen(
                                 when (section) {
                                     MainSection.HOME -> "⌂"
                                     MainSection.APPS -> "▦"
+                                    MainSection.GROUPS -> "◫"
                                     MainSection.STATS -> "▥"
                                 },
                                 style = MaterialTheme.typography.headlineSmall,
@@ -324,7 +372,7 @@ private fun TimeLimiterScreen(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 enabledCount = enabledPackages.size,
                 todayTotalMillis = todayTotalMillis,
-                latestHookHeartbeat = latestHookHeartbeat,
+                verifiedHookPackages = verifiedHookPackages,
                 statsEnabled = statsEnabled,
                 usageAccessGranted = usageAccessGranted,
                 onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
@@ -377,6 +425,8 @@ private fun TimeLimiterScreen(
                     AppRow(
                         app = app,
                         rule = rule,
+                        groupName = groupByPackage[app.packageName]?.name,
+                        hookVerified = app.packageName in verifiedHookPackages,
                         onClick = { editingApp = app },
                         onToggle = { enabled ->
                             if (enabled) {
@@ -400,6 +450,20 @@ private fun TimeLimiterScreen(
                 }
             }
 
+            MainSection.GROUPS -> GroupManagementScreen(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                groups = groups,
+                apps = apps,
+                usageByGroupId = groupUsageById,
+                onAdd = {
+                    editingGroup = AppGroup(
+                        id = repository.newGroupId(),
+                        name = "新分组",
+                    )
+                },
+                onEdit = { editingGroup = it },
+            )
+
             MainSection.STATS -> UsageStatisticsScreen(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 apps = apps,
@@ -422,6 +486,7 @@ private fun TimeLimiterScreen(
             initialRule = rules.getValue(app.packageName),
             onDismiss = { editingApp = null },
             onSave = { configuredRule ->
+                val newlyControlled = configuredRule.enabled && app.packageName !in enabledPackages
                 repository.save(configuredRule)
                 if (repository.getGlobalSettings().diagnosticsEnabled) {
                     diagnosticsRepository.append(
@@ -432,7 +497,46 @@ private fun TimeLimiterScreen(
                     )
                 }
                 rules[app.packageName] = repository.getRule(app.packageName)
+                if (
+                    newlyControlled &&
+                    app.packageName !in verifiedHookPackages
+                ) {
+                    scopeReminderPackages = setOf(app.packageName)
+                }
                 editingApp = null
+            },
+        )
+    }
+
+    editingGroup?.let { group ->
+        GroupEditorDialog(
+            initialGroup = group,
+            apps = selectableApps,
+            groups = groups,
+            onDismiss = { editingGroup = null },
+            onSave = { updated ->
+                val newlyControlledPackages = if (updated.enabled) {
+                    updated.packageNames - enabledPackages
+                } else {
+                    emptySet()
+                }
+                if (repository.saveGroup(updated)) {
+                    groups = repository.getGroups()
+                    scopeReminderPackages = newlyControlledPackages - verifiedHookPackages
+                    editingGroup = null
+                    usageRevision++
+                } else {
+                    Toast.makeText(context, "保存失败：应用可能已属于其他分组", Toast.LENGTH_LONG).show()
+                }
+            },
+            onDelete = {
+                if (repository.deleteGroup(group.id)) {
+                    groups = repository.getGroups()
+                    editingGroup = null
+                    usageRevision++
+                } else {
+                    Toast.makeText(context, "删除分组失败", Toast.LENGTH_LONG).show()
+                }
             },
         )
     }
@@ -489,7 +593,7 @@ private fun TimeLimiterScreen(
                         "INFO",
                         context.packageName,
                         "SETTINGS_SAVED",
-                        "warning=${settings.exitWarningEnabled}, extension=${settings.extensionSeconds}s, diagnostics=true, iconHidden=${settings.launcherIconHidden}, usageStats=${settings.usageStatsEnabled}",
+                        "warning=${settings.exitWarningEnabled}, fullScreen=${settings.fullScreenExitWarningEnabled}, extension=${settings.extensionSeconds}s, diagnostics=${settings.diagnosticsEnabled}, iconHidden=${settings.launcherIconHidden}, usageStats=${settings.usageStatsEnabled}",
                     )
                 }
                 if (settings.launcherIconHidden) {
@@ -544,6 +648,33 @@ private fun TimeLimiterScreen(
         )
     }
 
+    if (scopeReminderPackages.isNotEmpty()) {
+        val appByPackage = remember(apps) { apps.associateBy(InstalledApp::packageName) }
+        val labels = scopeReminderPackages.map { appByPackage[it]?.label ?: it }.sorted()
+        AlertDialog(
+            onDismissRequest = { scopeReminderPackages = emptySet() },
+            title = { Text("请确认 LSPosed 作用域") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(labels.joinToString("、"))
+                    Text(
+                        "规则已保存，但这些应用尚未回传当前版本的 Hook 验证。请确认已加入时停的 LSPosed 作用域，再强制停止并重新打开目标应用。",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = { scopeReminderPackages = emptySet() }) { Text("我已了解") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    scopeReminderPackages = emptySet()
+                    showSetupGuide = true
+                }) { Text("查看配置要求") }
+            },
+        )
+    }
+
     if (showSetupGuide) {
         SetupGuideDialog(
             onDismiss = {
@@ -560,6 +691,7 @@ private fun TimeLimiterScreen(
 private enum class MainSection(val label: String) {
     HOME("首页"),
     APPS("应用"),
+    GROUPS("分组"),
     STATS("统计"),
 }
 
@@ -568,7 +700,7 @@ private fun HomeDashboard(
     modifier: Modifier,
     enabledCount: Int,
     todayTotalMillis: Long,
-    latestHookHeartbeat: Long,
+    verifiedHookPackages: Set<String>,
     statsEnabled: Boolean,
     usageAccessGranted: Boolean,
     onRequestUsageAccess: () -> Unit,
@@ -577,18 +709,22 @@ private fun HomeDashboard(
     onOpenGuide: () -> Unit,
     onOpenLogs: () -> Unit,
 ) {
-    val hookRecentlyVerified = latestHookHeartbeat > 0L &&
-        System.currentTimeMillis() - latestHookHeartbeat <= HOOK_VERIFIED_WINDOW_MS
+    val verifiedCount = verifiedHookPackages.size.coerceAtMost(enabledCount)
+    val pendingCount = (enabledCount - verifiedCount).coerceAtLeast(0)
+    val allVerified = enabledCount > 0 && pendingCount == 0
     val statusTitle = when {
         enabledCount == 0 -> "未启用管控"
-        hookRecentlyVerified -> "管控运行中"
+        allVerified -> "Hook 已验证"
+        verifiedCount > 0 -> "已验证 $verifiedCount / $enabledCount 个应用"
         else -> "等待 Hook 验证"
     }
     val statusDescription = when {
         enabledCount == 0 -> "请先选择需要管控的应用"
-        hookRecentlyVerified -> "LSPosed Hook 已在目标应用中运行"
-        else -> "打开一次已管控应用以确认模块状态"
+        allVerified -> "$enabledCount 个管控应用均已回传当前版本 Hook 记录"
+        else -> "仍有 $pendingCount 个应用待验证；请确认作用域后强停并重开它们"
     }
+    val healthy = allVerified
+    val warning = enabledCount > 0 && !allVerified
     LazyColumn(
         modifier = modifier,
         contentPadding = androidx.compose.foundation.layout.PaddingValues(20.dp),
@@ -600,7 +736,11 @@ private fun HomeDashboard(
                     if (enabledCount == 0) onManageApps() else onOpenGuide()
                 },
                 colors = CardDefaults.cardColors(
-                    containerColor = if (hookRecentlyVerified) Color(0xFFE0F4E8) else Color(0xFFE9DDFB),
+                    containerColor = when {
+                        healthy -> Color(0xFFE0F4E8)
+                        warning -> Color(0xFFFFE9C7)
+                        else -> Color(0xFFE9DDFB)
+                    },
                 ),
                 shape = RoundedCornerShape(28.dp),
             ) {
@@ -609,11 +749,15 @@ private fun HomeDashboard(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Surface(
-                        color = if (hookRecentlyVerified) Color(0xFF19734A) else Color(0xFF351078),
+                        color = when {
+                            healthy -> Color(0xFF19734A)
+                            warning -> Color(0xFFB54708)
+                            else -> Color(0xFF351078)
+                        },
                         shape = CircleShape,
                     ) {
                         Text(
-                            if (hookRecentlyVerified) "✓" else "◆",
+                            if (healthy) "✓" else if (warning) "!" else "◆",
                             modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
                             color = Color.White,
                             style = MaterialTheme.typography.headlineMedium,
@@ -788,7 +932,7 @@ private fun UsageStatisticsScreen(
             item {
                 Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE9C7))) {
                     Text(
-                        "使用统计已在设置中关闭，以下数据不会继续更新。",
+                        "使用统计展示已关闭；应用分组仍会保留共享额度所需的内部时长。",
                         modifier = Modifier.padding(16.dp),
                     )
                 }
@@ -893,7 +1037,6 @@ private fun formatDashboardDuration(durationMillis: Long): String {
     }
 }
 
-private const val HOOK_VERIFIED_WINDOW_MS = 15L * 60L * 1000L
 private const val STATS_REFRESH_INTERVAL_MS = 15_000L
 
 @Composable
@@ -921,15 +1064,259 @@ private fun SetupCard(
 }
 
 @Composable
+private fun GroupManagementScreen(
+    modifier: Modifier,
+    groups: List<AppGroup>,
+    apps: List<InstalledApp>,
+    usageByGroupId: Map<String, Long>,
+    onAdd: () -> Unit,
+    onEdit: (AppGroup) -> Unit,
+) {
+    val appByPackage = remember(apps) { apps.associateBy(InstalledApp::packageName) }
+    LazyColumn(
+        modifier = modifier,
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item {
+            Surface(color = Color(0xFFE8F0FF), shape = RoundedCornerShape(20.dp)) {
+                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("共享每日额度", fontWeight = FontWeight.Bold, color = Color(0xFF154B99))
+                    Text(
+                        "组内应用共同消耗一个每日额度；应用自己的每日、单次和时段规则仍会同时生效。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color(0xFF294D7A),
+                    )
+                    Button(onClick = onAdd) { Text("新建分组") }
+                }
+            }
+        }
+        if (groups.isEmpty()) {
+            item {
+                Text(
+                    "暂无分组。可以把短视频、游戏等应用放入同一组共享额度。",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        items(groups, key = AppGroup::id) { group ->
+            val usedMillis = usageByGroupId[group.id] ?: 0L
+            val limitMillis = group.dailyLimitSeconds * 1000L
+            val remainingMillis = (limitMillis - usedMillis).coerceAtLeast(0L)
+            Surface(
+                modifier = Modifier.fillMaxWidth().clickable { onEdit(group) },
+                color = if (group.enabled) Color(0xFFF2F6FF) else Color.White,
+                shape = RoundedCornerShape(20.dp),
+                tonalElevation = 1.dp,
+            ) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(group.name, modifier = Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                        ManagedBadge(if (group.enabled) "共享中" else "已停用")
+                    }
+                    Text(
+                        "已用 ${formatDashboardDuration(usedMillis)} / ${formatDashboardDuration(limitMillis)} · 剩余 ${formatDashboardDuration(remainingMillis)}",
+                        color = if (remainingMillis == 0L && group.enabled) Color(0xFFB42318)
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        "${group.packageNames.size} 个应用：" + group.packageNames
+                            .map { appByPackage[it]?.label ?: it }
+                            .sorted()
+                            .take(5)
+                            .joinToString("、") +
+                            if (group.packageNames.size > 5) " 等" else "",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupEditorDialog(
+    initialGroup: AppGroup,
+    apps: List<InstalledApp>,
+    groups: List<AppGroup>,
+    onDismiss: () -> Unit,
+    onSave: (AppGroup) -> Unit,
+    onDelete: () -> Unit,
+) {
+    var name by remember(initialGroup.id, initialGroup.version) { mutableStateOf(initialGroup.name) }
+    var enabled by remember(initialGroup.id, initialGroup.version) {
+        mutableStateOf(initialGroup.enabled)
+    }
+    var minutesText by remember(initialGroup.id, initialGroup.version) {
+        mutableStateOf((initialGroup.dailyLimitSeconds / 60L).coerceAtLeast(1L).toString())
+    }
+    var selectedPackages by remember(initialGroup.id, initialGroup.version) {
+        mutableStateOf(initialGroup.packageNames)
+    }
+    var appSearch by remember(initialGroup.id) { mutableStateOf("") }
+    var confirmDelete by remember(initialGroup.id) { mutableStateOf(false) }
+    val occupiedByOtherGroup = remember(groups, initialGroup.id) {
+        groups.filterNot { it.id == initialGroup.id }
+            .flatMap { group -> group.packageNames.map { it to group.name } }
+            .toMap()
+    }
+    val parsedMinutes = minutesText.toLongOrNull()?.takeIf { it in 1L..1_440L }
+    val canSave = name.trim().isNotEmpty() && parsedMinutes != null && selectedPackages.isNotEmpty()
+    val existing = groups.any { it.id == initialGroup.id }
+    val matchingApps = remember(apps, appSearch) {
+        val keyword = appSearch.trim()
+        apps.filter { app ->
+            keyword.isEmpty() ||
+                app.label.contains(keyword, ignoreCase = true) ||
+                app.packageName.contains(keyword, ignoreCase = true)
+        }.sortedBy { it.label.lowercase() }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (existing) "编辑应用分组" else "新建应用分组") },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 620.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                TextField(
+                    value = name,
+                    onValueChange = { name = it.take(RuleRepository.MAX_GROUP_NAME_LENGTH) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("分组名称") },
+                    singleLine = true,
+                )
+                TextField(
+                    value = minutesText,
+                    onValueChange = { minutesText = it.filter(Char::isDigit).take(4) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("每日共享额度（分钟）") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    supportingText = { Text("范围 1–1440 分钟") },
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("启用共享额度", fontWeight = FontWeight.Medium)
+                        Text("耗尽后组内应用当天均不可继续使用", style = MaterialTheme.typography.bodySmall)
+                    }
+                    Switch(checked = enabled, onCheckedChange = { enabled = it })
+                }
+                Text("选择应用（${selectedPackages.size}）", fontWeight = FontWeight.Medium)
+                Text(
+                    "每个应用只能属于一个组；所有成员仍需在 LSPosed 作用域中勾选。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                TextField(
+                    value = appSearch,
+                    onValueChange = { appSearch = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text("搜索应用名或包名") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(14.dp),
+                )
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 260.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    if (matchingApps.isEmpty()) {
+                        item {
+                            Text(
+                                "没有匹配的应用",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(vertical = 8.dp),
+                            )
+                        }
+                    }
+                    items(matchingApps, key = InstalledApp::packageName) { app ->
+                        val occupiedBy = occupiedByOtherGroup[app.packageName]
+                        val selected = app.packageName in selectedPackages
+                        FilterChip(
+                            selected = selected,
+                            onClick = {
+                                selectedPackages = if (selected) {
+                                    selectedPackages - app.packageName
+                                } else {
+                                    selectedPackages + app.packageName
+                                }
+                            },
+                            enabled = occupiedBy == null,
+                            label = {
+                                Text(
+                                    if (occupiedBy == null) app.label else "${app.label}（已在 $occupiedBy）",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onSave(
+                        initialGroup.copy(
+                            name = name.trim(),
+                            enabled = enabled,
+                            dailyLimitSeconds = (parsedMinutes ?: 1L) * 60L,
+                            packageNames = selectedPackages,
+                        ),
+                    )
+                },
+                enabled = canSave,
+            ) { Text("保存") }
+        },
+        dismissButton = {
+            Row {
+                if (existing) TextButton(onClick = { confirmDelete = true }) { Text("删除分组") }
+                TextButton(onClick = onDismiss) { Text("取消") }
+            }
+        },
+    )
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("删除 ${initialGroup.name}？") },
+            text = { Text("只会解除分组和共享额度，不会删除应用原有的独立规则。") },
+            confirmButton = {
+                Button(onClick = onDelete) { Text("确认删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("取消") }
+            },
+        )
+    }
+}
+
+@Composable
 private fun AppRow(
     app: InstalledApp,
     rule: AppRule,
+    groupName: String?,
+    hookVerified: Boolean,
     onClick: () -> Unit,
     onToggle: (Boolean) -> Unit,
 ) {
+    val controlled = rule.enabled || groupName != null
     Surface(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
-        color = if (rule.enabled) Color(0xFFF2F6FF) else Color.White,
+        color = if (controlled) Color(0xFFF2F6FF) else Color.White,
         shape = RoundedCornerShape(18.dp),
         tonalElevation = 1.dp,
     ) {
@@ -941,7 +1328,7 @@ private fun AppRow(
             Surface(
                 modifier = Modifier.size(44.dp),
                 shape = CircleShape,
-                color = if (rule.enabled) Color(0xFF315EA8) else Color(0xFFE6E8EE),
+                color = if (controlled) Color(0xFF315EA8) else Color(0xFFE6E8EE),
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     AppIcon(app = app)
@@ -960,10 +1347,15 @@ private fun AppRow(
                         overflow = TextOverflow.Ellipsis,
                     )
                     if (rule.enabled) ManagedBadge()
+                    if (groupName != null) ManagedBadge("分组")
+                    if (controlled && !hookVerified) PendingHookBadge()
                 }
                 Text(
-                    if (rule.enabled) {
-                        ruleSummary(rule)
+                    if (controlled) {
+                        listOfNotNull(
+                            ruleSummary(rule).takeIf { rule.enabled },
+                            groupName?.let { "$it · 共享额度" },
+                        ).joinToString(" · ")
                     } else {
                         app.packageName
                     },
@@ -979,14 +1371,30 @@ private fun AppRow(
 }
 
 @Composable
-private fun ManagedBadge() {
+private fun PendingHookBadge() {
+    Surface(
+        color = Color(0xFFB54708),
+        contentColor = Color.White,
+        shape = RoundedCornerShape(999.dp),
+    ) {
+        Text(
+            "待 Hook 验证",
+            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
+        )
+    }
+}
+
+@Composable
+private fun ManagedBadge(label: String = "管控中") {
     Surface(
         color = Color(0xFF315EA8),
         contentColor = Color.White,
         shape = RoundedCornerShape(999.dp),
     ) {
         Text(
-            "管控中",
+            label,
             modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
             style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.Bold,
@@ -1062,6 +1470,9 @@ private fun SettingsDialog(
     onSave: (GlobalSettings) -> Unit,
 ) {
     var warningEnabled by remember { mutableStateOf(initialSettings.exitWarningEnabled) }
+    var fullScreenWarningEnabled by remember {
+        mutableStateOf(initialSettings.fullScreenExitWarningEnabled)
+    }
     var diagnosticsEnabled by remember { mutableStateOf(initialSettings.diagnosticsEnabled) }
     var launcherIconHidden by remember { mutableStateOf(initialSettings.launcherIconHidden) }
     var usageStatsEnabled by remember { mutableStateOf(initialSettings.usageStatsEnabled) }
@@ -1092,6 +1503,26 @@ private fun SettingsDialog(
                 }
                 }
                 item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("全屏退出提醒", fontWeight = FontWeight.Medium)
+                        Text(
+                            "开启后倒计时覆盖当前应用；关闭时显示顶部圆角提醒",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Switch(
+                        checked = fullScreenWarningEnabled,
+                        onCheckedChange = { fullScreenWarningEnabled = it },
+                        enabled = warningEnabled,
+                    )
+                }
+                }
+                item {
                 HorizontalDivider()
                 }
                 item {
@@ -1103,7 +1534,7 @@ private fun SettingsDialog(
                     Column(Modifier.weight(1f)) {
                         Text("使用时长统计", fontWeight = FontWeight.Medium)
                         Text(
-                            "系统按需读取时长和启动次数，Hook 记录限制触发事件",
+                            "统计页按需读取系统数据；共享额度会保留必要的内部计时",
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
@@ -1267,6 +1698,7 @@ private fun SettingsDialog(
                     onSave(
                         initialSettings.copy(
                             exitWarningEnabled = warningEnabled,
+                            fullScreenExitWarningEnabled = fullScreenWarningEnabled,
                             extensionSeconds = (parsedMinutes ?: 5L) * 60L,
                             diagnosticsEnabled = diagnosticsEnabled,
                             launcherIconHidden = launcherIconHidden,
@@ -1719,7 +2151,15 @@ private fun ScheduleEditor(
                     )
                 },
                 modifier = Modifier.fillMaxWidth(),
+                enabled = windows.size < ScheduleCodec.MAX_WINDOWS,
             ) { Text("添加时段") }
+            if (windows.size >= ScheduleCodec.MAX_WINDOWS) {
+                Text(
+                    "最多添加 ${ScheduleCodec.MAX_WINDOWS} 个时段。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             if (windows.isEmpty()) {
                 Text(
                     "请至少添加一个时段。",

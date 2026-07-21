@@ -49,8 +49,18 @@ data class InstalledApp(
     val isSystemApp: Boolean,
 )
 
+data class AppGroup(
+    val id: String,
+    val name: String,
+    val enabled: Boolean = true,
+    val dailyLimitSeconds: Long = 60L * 60L,
+    val packageNames: Set<String> = emptySet(),
+    val version: Long = 0L,
+)
+
 data class GlobalSettings(
     val exitWarningEnabled: Boolean = true,
+    val fullScreenExitWarningEnabled: Boolean = false,
     val extensionSeconds: Long = 5 * 60L,
     val diagnosticsEnabled: Boolean = true,
     val launcherIconHidden: Boolean = false,

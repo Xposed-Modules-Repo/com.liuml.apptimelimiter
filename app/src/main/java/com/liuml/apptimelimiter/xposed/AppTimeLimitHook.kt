@@ -109,12 +109,18 @@ private class RuntimeLimiter(
     private var statsSuccessLogged = false
     private var statsFailureLogged = false
     private var statsOutboxLoaded = false
+    private var groupSegmentBaselineUsedMs = 0L
+    private var groupSegmentBaselineDay = ""
+    private var groupSegmentIdentity = ""
+    private var loadedGroupIdentity = ""
+    private var lastLoadedRule: HookRule? = null
 
     private val deadline = Runnable { checkDeadline() }
     private val warningDeadline = Runnable { showExitWarning() }
     private val scheduleDeadline = Runnable { checkScheduleBoundary() }
     private val scheduleWarningDeadline = Runnable { showScheduleWarning() }
     private val midnightDeadline = Runnable { checkMidnightRollover() }
+    private val groupUsageSync = Runnable { syncGroupUsage() }
     private val statsRetry = Runnable {
         statsContext?.let(::flushUsageEvents)
     }
@@ -131,13 +137,13 @@ private class RuntimeLimiter(
             )
         }
 
-        val ruleSummary = "${rule.enabled}/${rule.dailyEnabled}/${rule.dailyLimitMillis}/${rule.systemTodayUsedMillis}/${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis}/${rule.scheduleEnabled}/${rule.scheduleMode}/${ScheduleCodec.encode(rule.scheduleWindows)}/${rule.cooldownEnabled}/${rule.cooldownMillis}/${rule.version}/${rule.exitWarningEnabled}/${rule.extensionMillis}/${rule.diagnosticsEnabled}/${rule.source}"
+        val ruleSummary = "${rule.enabled}/${rule.dailyEnabled}/${rule.dailyLimitMillis}/${rule.systemTodayUsedMillis}/${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis}/${rule.groupEnabled}/${rule.groupId}/${rule.groupDailyLimitMillis}/${rule.groupTodayUsedMillis}/${rule.groupVersion}/${rule.scheduleEnabled}/${rule.scheduleMode}/${ScheduleCodec.encode(rule.scheduleWindows)}/${rule.cooldownEnabled}/${rule.cooldownMillis}/${rule.version}/${rule.exitWarningEnabled}/${rule.fullScreenExitWarningEnabled}/${rule.extensionMillis}/${rule.diagnosticsEnabled}/${rule.source}"
         if (lastRuleSummary != ruleSummary) {
             lastRuleSummary = ruleSummary
             diagnostic(
                 activity,
                 event = "RULE_READ",
-                message = "enabled=${rule.enabled}, daily=${rule.dailyEnabled}/${rule.dailyLimitMillis / 1000}s, systemToday=${rule.systemTodayUsedMillis / 1000.0}s, perLaunch=${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis / 1000}s, schedule=${rule.scheduleEnabled}/${rule.scheduleMode}/${rule.scheduleWindows.size}, cooldown=${rule.cooldownEnabled}/${rule.cooldownMillis / 1000}s, warning=${rule.exitWarningEnabled}, extension=${rule.extensionMillis / 1000}s, source=${rule.source}",
+                message = "enabled=${rule.enabled}, daily=${rule.dailyEnabled}/${rule.dailyLimitMillis / 1000}s, systemToday=${rule.systemTodayUsedMillis / 1000.0}s, perLaunch=${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis / 1000}s, group=${rule.groupEnabled}/${rule.groupName}/${rule.groupTodayUsedMillis / 1000.0}s/${rule.groupDailyLimitMillis / 1000}s, schedule=${rule.scheduleEnabled}/${rule.scheduleMode}/${rule.scheduleWindows.size}, cooldown=${rule.cooldownEnabled}/${rule.cooldownMillis / 1000}s, warning=${rule.exitWarningEnabled}/${rule.fullScreenExitWarningEnabled}, extension=${rule.extensionMillis / 1000}s, source=${rule.source}",
             )
         }
 
@@ -187,13 +193,17 @@ private class RuntimeLimiter(
             foregroundStartedAt = SystemClock.elapsedRealtime()
             foregroundDayToken = dayToken()
         }
-        val remainingMs = if (rule.dailyEnabled || rule.perLaunchEnabled) {
+        if (startedNow || groupSegmentIdentity != rule.groupIdentity()) {
+            updateGroupSegmentBaseline(rule)
+        }
+        val remainingMs = if (rule.dailyEnabled || rule.perLaunchEnabled || rule.groupEnabled) {
             scheduleDeadline(activity, rule)
         } else {
             null
         }
         val scheduleRemainingMs = if (!exitScheduled) scheduleScheduleBoundary(activity, rule) else null
         if (!exitScheduled) scheduleMidnightRollover(rule)
+        if (!exitScheduled) scheduleGroupUsageSync(rule)
         if (startedNow && !exitScheduled) {
             diagnostic(
                 activity,
@@ -218,6 +228,7 @@ private class RuntimeLimiter(
         mainHandler.removeCallbacks(scheduleDeadline)
         mainHandler.removeCallbacks(scheduleWarningDeadline)
         mainHandler.removeCallbacks(midnightDeadline)
+        mainHandler.removeCallbacks(groupUsageSync)
         foregroundDayToken = -1
         dismissWarning(resetForCurrentLimit = true)
         dismissScheduleWarning()
@@ -238,7 +249,7 @@ private class RuntimeLimiter(
         if (status.reached) {
             forceExit(activity, rule, status)
         } else {
-            mainHandler.postDelayed(deadline, remainingMs)
+            mainHandler.postDelayed(deadline, minOf(remainingMs, RULE_RECHECK_MAX_MS))
             if (rule.exitWarningEnabled && warningShownForExtensionMs != grantedExtensionMs) {
                 mainHandler.postDelayed(
                     warningDeadline,
@@ -268,7 +279,7 @@ private class RuntimeLimiter(
 
     private fun scheduleMidnightRollover(rule: HookRule) {
         mainHandler.removeCallbacks(midnightDeadline)
-        if (exitScheduled || !rule.dailyEnabled || foregroundStartedAt == NOT_RUNNING) return
+        if (exitScheduled || (!rule.dailyEnabled && !rule.groupEnabled) || foregroundStartedAt == NOT_RUNNING) return
         val now = ZonedDateTime.now()
         val nextMidnight = now.toLocalDate().plusDays(1).atStartOfDay(now.zone)
         val delayMs = Duration.between(now, nextMidnight).toMillis().coerceAtLeast(1L)
@@ -279,7 +290,7 @@ private class RuntimeLimiter(
         val activity = activeActivity.get() ?: return
         if (activity.isFinishing || activity.isDestroyed || foregroundStartedAt == NOT_RUNNING) return
         val rule = readRule(activity, reloadFallback = true)
-        if (!rule.enabled || !rule.dailyEnabled) {
+        if (!rule.enabled || (!rule.dailyEnabled && !rule.groupEnabled)) {
             mainHandler.removeCallbacks(midnightDeadline)
             return
         }
@@ -287,25 +298,82 @@ private class RuntimeLimiter(
         if (foregroundDayToken != currentDay) {
             val fullSegmentMillis = activeSegmentMillis()
             val todaySegmentMillis = activeSegmentMillisForToday()
+            if (rule.groupEnabled) {
+                val previousDaySegmentMillis = (fullSegmentMillis - todaySegmentMillis)
+                    .coerceAtLeast(0L)
+                if (previousDaySegmentMillis > 0L) {
+                    recordUsageEvent(
+                        activity = activity,
+                        durationMillis = previousDaySegmentMillis,
+                        launchIncrement = 0,
+                        limitHitIncrement = 0,
+                        eventDayToken = LocalDate.now().minusDays(1L).toString(),
+                    )
+                }
+                if (todaySegmentMillis > 0L) {
+                    recordUsageEvent(
+                        activity = activity,
+                        durationMillis = todaySegmentMillis,
+                        launchIncrement = 0,
+                        limitHitIncrement = 0,
+                    )
+                }
+            }
             if (rule.perLaunchEnabled) perLaunchCommittedMs += fullSegmentMillis
             foregroundStartedAt = SystemClock.elapsedRealtime()
             foregroundDayToken = currentDay
-            writeDailyState(
-                activity,
-                rule,
-                UsageMath.authoritativeDailyUsedMillis(
-                    todaySegmentMillis,
-                    rule.systemTodayUsedMillis,
-                ),
-            )
+            val refreshedRule = readRule(activity, reloadFallback = true)
+            if (refreshedRule.dailyEnabled) {
+                writeDailyState(
+                    activity,
+                    refreshedRule,
+                    UsageMath.authoritativeDailyUsedMillis(
+                        todaySegmentMillis,
+                        refreshedRule.systemTodayUsedMillis,
+                    ),
+                )
+            }
+            updateGroupSegmentBaseline(refreshedRule)
             diagnostic(
                 activity,
                 event = "DAILY_RESET",
                 message = "跨午夜后每日累计已重置；今日当前段=${todaySegmentMillis / 1000.0}s",
             )
-            scheduleDeadline(activity, rule)
+            scheduleDeadline(activity, refreshedRule)
         }
-        scheduleMidnightRollover(rule)
+        scheduleMidnightRollover(lastLoadedRule ?: rule)
+    }
+
+    private fun scheduleGroupUsageSync(rule: HookRule) {
+        mainHandler.removeCallbacks(groupUsageSync)
+        if (!exitScheduled && rule.groupEnabled && foregroundStartedAt != NOT_RUNNING) {
+            mainHandler.postDelayed(groupUsageSync, GROUP_USAGE_SYNC_INTERVAL_MS)
+        }
+    }
+
+    private fun syncGroupUsage() {
+        val activity = activeActivity.get() ?: return
+        if (activity.isFinishing || activity.isDestroyed || foregroundStartedAt == NOT_RUNNING) return
+        val currentRule = lastLoadedRule ?: readRule(activity, reloadFallback = true)
+        if (!currentRule.enabled || !currentRule.groupEnabled) return
+        commitActiveSegment(activity, currentRule)
+        foregroundStartedAt = SystemClock.elapsedRealtime()
+        foregroundDayToken = dayToken()
+        val refreshedRule = readRule(activity, reloadFallback = true)
+        if (!refreshedRule.enabled) {
+            stopTiming()
+            return
+        }
+        if (!refreshedRule.groupEnabled) {
+            if (refreshedRule.dailyEnabled || refreshedRule.perLaunchEnabled) {
+                scheduleDeadline(activity, refreshedRule)
+            }
+            scheduleMidnightRollover(refreshedRule)
+            return
+        }
+        updateGroupSegmentBaseline(refreshedRule)
+        scheduleDeadline(activity, refreshedRule)
+        if (!exitScheduled) scheduleGroupUsageSync(refreshedRule)
     }
 
     private fun scheduleScheduleBoundary(activity: Activity, rule: HookRule): Long? {
@@ -366,6 +434,7 @@ private class RuntimeLimiter(
         mainHandler.removeCallbacks(scheduleDeadline)
         mainHandler.removeCallbacks(scheduleWarningDeadline)
         mainHandler.removeCallbacks(midnightDeadline)
+        mainHandler.removeCallbacks(groupUsageSync)
         dismissWarning(resetForCurrentLimit = false)
         dismissScheduleWarning()
         val nextAllowed = formatNextTransition(decision)
@@ -376,7 +445,7 @@ private class RuntimeLimiter(
             message = "当前时段不可使用；mode=${rule.scheduleMode}, nextAllowed=$nextAllowed, pid=${Process.myPid()}",
         )
         val message = if (nextAllowed == null) {
-            "当前处于不可用时段，应用即将退出"
+            "当前处于不可用时段"
         } else {
             "当前处于不可用时段，下次可用：$nextAllowed"
         }
@@ -387,9 +456,14 @@ private class RuntimeLimiter(
         if (exitScheduled) return
         exitScheduled = true
         startCooldown(activity, rule)
-        val statsPersisted = reportLimitHit(activity, rule)
         dismissWarning(resetForCurrentLimit = false)
         val segmentMs = activeSegmentMillis()
+        val statsPersisted = recordUsageEvent(
+            activity = activity,
+            durationMillis = if (rule.groupEnabled) segmentMs else 0L,
+            launchIncrement = 0,
+            limitHitIncrement = if (rule.usageStatsEnabled) 1 else 0,
+        )
         if (rule.dailyEnabled) {
             val finalDailyUsed = authoritativeDailyTotalMillis(
                 activity,
@@ -407,15 +481,24 @@ private class RuntimeLimiter(
         mainHandler.removeCallbacks(scheduleDeadline)
         mainHandler.removeCallbacks(scheduleWarningDeadline)
         mainHandler.removeCallbacks(midnightDeadline)
+        mainHandler.removeCallbacks(groupUsageSync)
         dismissScheduleWarning()
 
         diagnostic(
             activity,
             level = "WARN",
             event = "LIMIT_REACHED",
-            message = "达到${status.reachedLabels}阈值（本次已延时 ${grantedExtensionMs / 1000}s），准备结束 pid=${Process.myPid()}",
+            message = "达到${status.reachedLabels}阈值（本次已延时 ${grantedExtensionMs / 1000}s），执行限制退出 pid=${Process.myPid()}",
         )
-        finishTarget(activity, "已达到使用时长，应用即将退出", statsPersisted)
+        finishTarget(
+            activity,
+            if (status.groupOnlyReached) {
+                "${rule.groupName.ifBlank { "分组" }}共享额度已用尽"
+            } else {
+                "已达到使用时长限制"
+            },
+            statsPersisted,
+        )
     }
 
     private fun forceCooldownExit(
@@ -444,12 +527,26 @@ private class RuntimeLimiter(
 
     private fun finishTarget(activity: Activity, message: String, statsPersisted: Boolean) {
         runCatching {
-            Toast.makeText(activity, message, Toast.LENGTH_LONG).show()
+            // The task can disappear before the system Toast does. Keep this message short and
+            // state-based; future-tense countdown copy belongs only in the pre-exit banner.
+            Toast.makeText(activity, message, Toast.LENGTH_SHORT).show()
+        }.onFailure {
+            diagnostic(activity, level = "WARN", event = "EXIT_NOTICE_FAILED", message = it.toString())
+        }
+        runCatching {
             activity.finishAndRemoveTask()
+        }.onFailure {
+            diagnostic(activity, level = "ERROR", event = "FINISH_TASK_FAILED", message = it.toString())
+        }
+        runCatching {
             activity.finishAffinity()
+        }.onFailure {
+            diagnostic(activity, level = "ERROR", event = "FINISH_AFFINITY_FAILED", message = it.toString())
+        }
+        runCatching {
             activity.moveTaskToBack(true)
         }.onFailure {
-            diagnostic(activity, level = "ERROR", event = "FINISH_FAILED", message = it.toString())
+            diagnostic(activity, level = "ERROR", event = "MOVE_TASK_FAILED", message = it.toString())
         }
         if (!isSafeToTerminateProcess(activity)) {
             diagnostic(
@@ -528,6 +625,7 @@ private class RuntimeLimiter(
         mainHandler.removeCallbacks(scheduleDeadline)
         mainHandler.removeCallbacks(scheduleWarningDeadline)
         mainHandler.removeCallbacks(midnightDeadline)
+        mainHandler.removeCallbacks(groupUsageSync)
     }
 
     private fun commitActiveSegment(activity: Activity, rule: HookRule) {
@@ -545,6 +643,14 @@ private class RuntimeLimiter(
             )
         }
         if (rule.perLaunchEnabled) perLaunchCommittedMs += segmentMs
+        if (rule.groupEnabled) {
+            recordUsageEvent(
+                activity = activity,
+                durationMillis = segmentMs,
+                launchIncrement = 0,
+                limitHitIncrement = 0,
+            )
+        }
         foregroundStartedAt = NOT_RUNNING
         foregroundDayToken = -1
     }
@@ -562,12 +668,12 @@ private class RuntimeLimiter(
         durationMillis: Long,
         launchIncrement: Int,
         limitHitIncrement: Int,
+        eventDayToken: String = LocalDate.now().toString(),
     ): Boolean {
         val context = activity.applicationContext
         statsContext = context
         loadStatsOutbox(context)
-        val today = LocalDate.now().toString()
-        val pending = pendingStatsByDay.getOrPut(today) { PendingUsageBatch() }
+        val pending = pendingStatsByDay.getOrPut(eventDayToken) { PendingUsageBatch() }
         pending.durationMillis = safeAdd(
             pending.durationMillis,
             durationMillis.coerceAtLeast(0L),
@@ -700,6 +806,10 @@ private class RuntimeLimiter(
         mainHandler.removeCallbacks(scheduleDeadline)
         mainHandler.removeCallbacks(scheduleWarningDeadline)
         mainHandler.removeCallbacks(midnightDeadline)
+        mainHandler.removeCallbacks(groupUsageSync)
+        groupSegmentIdentity = ""
+        groupSegmentBaselineDay = ""
+        groupSegmentBaselineUsedMs = 0L
         dismissWarning(resetForCurrentLimit = true)
         dismissScheduleWarning()
     }
@@ -735,6 +845,7 @@ private class RuntimeLimiter(
                 message = exitWarningMessage(remainingMs, rule.extensionMillis),
                 remainingMillis = remainingMs,
                 maxProgressMillis = WARNING_LEAD_MS,
+                fullScreen = rule.fullScreenExitWarningEnabled,
                 actionLabel = "延时 ${formatDuration(rule.extensionMillis)}",
                 onAction = {
                     if (!activity.isFinishing && !activity.isDestroyed && !exitScheduled) {
@@ -781,6 +892,7 @@ private class RuntimeLimiter(
                 message = scheduleWarningMessage(remainingMs),
                 remainingMillis = remainingMs,
                 maxProgressMillis = WARNING_LEAD_MS,
+                fullScreen = rule.fullScreenExitWarningEnabled,
             )
             diagnostic(
                 activity,
@@ -963,12 +1075,20 @@ private class RuntimeLimiter(
     }
 
     private fun thresholdStatus(context: Context, rule: HookRule): ThresholdStatus {
+        val currentGroupIdentity = rule.groupIdentity()
+        if (loadedGroupIdentity != currentGroupIdentity) {
+            loadedGroupIdentity = currentGroupIdentity
+            grantedExtensionMs = 0L
+            warningShownForExtensionMs = Long.MIN_VALUE
+            updateGroupSegmentBaseline(rule)
+        }
         val activeMs = activeSegmentMillis()
         val thresholds = buildList {
             if (rule.dailyEnabled) {
                 add(
                     ThresholdRemaining(
                         label = "每日累计",
+                        isGroup = false,
                         remainingMillis = UsageMath.remainingMillis(
                             effectiveLimitMillis(rule.dailyLimitMillis),
                             authoritativeDailyTotalMillis(
@@ -985,6 +1105,7 @@ private class RuntimeLimiter(
                 add(
                     ThresholdRemaining(
                         label = "单次打开",
+                        isGroup = false,
                         remainingMillis = UsageMath.remainingMillis(
                             effectiveLimitMillis(rule.perLaunchLimitMillis),
                             perLaunchCommittedMs,
@@ -993,23 +1114,72 @@ private class RuntimeLimiter(
                     ),
                 )
             }
+            if (rule.groupEnabled) {
+                add(
+                    ThresholdRemaining(
+                        label = "${rule.groupName.ifBlank { "应用分组" }}共享额度",
+                        isGroup = true,
+                        remainingMillis = UsageMath.remainingMillis(
+                            effectiveLimitMillis(rule.groupDailyLimitMillis),
+                            authoritativeGroupTodayUsedMillis(rule),
+                            0L,
+                        ),
+                    ),
+                )
+            }
         }
         if (thresholds.isEmpty()) {
-            return ThresholdStatus(Long.MAX_VALUE / 2L, false, "未启用", "未启用")
+            return ThresholdStatus(Long.MAX_VALUE / 2L, false, "未启用", "未启用", false)
         }
         val earliestRemaining = UsageMath.earliestRemainingMillis(
             thresholds.map { it.remainingMillis },
         ) ?: Long.MAX_VALUE / 2L
         val earliest = thresholds.first { it.remainingMillis == earliestRemaining }
-        val reachedLabels = thresholds.filter { it.remainingMillis == 0L }
-            .joinToString("、") { it.label }
+        val reached = thresholds.filter { it.remainingMillis == 0L }
+        val reachedLabels = reached.joinToString("、") { it.label }
         return ThresholdStatus(
             remainingMillis = earliest.remainingMillis,
             reached = earliest.remainingMillis == 0L,
             reachedLabels = reachedLabels,
             nextThresholdLabel = earliest.label,
+            groupOnlyReached = reached.isNotEmpty() && reached.all(ThresholdRemaining::isGroup),
         )
     }
+
+    private fun authoritativeGroupTodayUsedMillis(rule: HookRule): Long {
+        if (!rule.groupEnabled) return 0L
+        val today = LocalDate.now().toString()
+        val providerBase = rule.groupTodayUsedMillis
+            .takeIf { rule.groupDayToken == today }
+            ?.coerceAtLeast(0L)
+            ?: 0L
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val providerAdvanceStart = maxOf(
+            rule.groupMeasuredAtElapsedMillis,
+            foregroundStartedAt.takeIf { it != NOT_RUNNING } ?: nowElapsed,
+        )
+        val providerEstimate = safeAdd(
+            providerBase,
+            (nowElapsed - providerAdvanceStart).coerceAtLeast(0L),
+        )
+        val segmentEstimate = if (
+            groupSegmentIdentity == rule.groupIdentity() &&
+            groupSegmentBaselineDay == today
+        ) {
+            safeAdd(groupSegmentBaselineUsedMs, activeSegmentMillisForToday())
+        } else {
+            providerEstimate
+        }
+        return maxOf(providerEstimate, segmentEstimate)
+    }
+
+    private fun updateGroupSegmentBaseline(rule: HookRule) {
+        groupSegmentIdentity = rule.groupIdentity()
+        groupSegmentBaselineDay = rule.groupDayToken
+        groupSegmentBaselineUsedMs = rule.groupTodayUsedMillis.coerceAtLeast(0L)
+    }
+
+    private fun HookRule.groupIdentity(): String = "$groupId/$groupVersion"
 
     private fun usageSummary(context: Context, rule: HookRule): String = buildList {
         if (rule.dailyEnabled) {
@@ -1018,6 +1188,9 @@ private class RuntimeLimiter(
             )
         }
         if (rule.perLaunchEnabled) add("单次累计=${perLaunchCommittedMs / 1000.0}s")
+        if (rule.groupEnabled) {
+            add("${rule.groupName}共享=${authoritativeGroupTodayUsedMillis(rule) / 1000.0}s")
+        }
     }.joinToString("，")
 
     private fun writeDailyState(context: Context, rule: HookRule, usedMillis: Long) {
@@ -1052,6 +1225,26 @@ private class RuntimeLimiter(
                     RuleContract.KEY_SYSTEM_TODAY_USED_MS,
                     -1L,
                 ),
+                groupEnabled = result.getBoolean(RuleContract.KEY_GROUP_ENABLED, false),
+                groupId = result.getString(RuleContract.KEY_GROUP_ID).orEmpty(),
+                groupName = result.getString(RuleContract.KEY_GROUP_NAME).orEmpty(),
+                groupDailyLimitMillis = result.getLong(
+                    RuleContract.KEY_GROUP_DAILY_LIMIT_SECONDS,
+                    RuleRepository.DEFAULT_GROUP_LIMIT_SECONDS,
+                ).coerceIn(
+                    RuleRepository.MIN_LIMIT_SECONDS,
+                    RuleRepository.MAX_LIMIT_SECONDS,
+                ) * 1000L,
+                groupTodayUsedMillis = result.getLong(
+                    RuleContract.KEY_GROUP_TODAY_USED_MS,
+                    -1L,
+                ),
+                groupVersion = result.getLong(RuleContract.KEY_GROUP_VERSION, 0L),
+                groupDayToken = result.getString(RuleContract.KEY_GROUP_DAY_TOKEN).orEmpty(),
+                groupMeasuredAtElapsedMillis = result.getLong(
+                    RuleContract.KEY_GROUP_MEASURED_AT_ELAPSED_MS,
+                    SystemClock.elapsedRealtime(),
+                ),
                 perLaunchEnabled = result.getBoolean(RuleContract.KEY_PER_LAUNCH_ENABLED, false),
                 perLaunchLimitMillis = result.getLong(
                     RuleContract.KEY_PER_LAUNCH_LIMIT_SECONDS,
@@ -1077,6 +1270,10 @@ private class RuntimeLimiter(
                 ) * 1000L,
                 version = result.getLong(RuleContract.KEY_VERSION, 0L),
                 exitWarningEnabled = result.getBoolean(RuleContract.KEY_EXIT_WARNING_ENABLED, true),
+                fullScreenExitWarningEnabled = result.getBoolean(
+                    RuleContract.KEY_FULL_SCREEN_EXIT_WARNING_ENABLED,
+                    false,
+                ),
                 extensionMillis = result.getLong(
                     RuleContract.KEY_EXTENSION_SECONDS,
                     RuleRepository.DEFAULT_EXTENSION_SECONDS,
@@ -1090,6 +1287,7 @@ private class RuntimeLimiter(
             )
             diagnosticsEnabled = rule.diagnosticsEnabled
             cacheRule(context, rule)
+            lastLoadedRule = rule
             return rule
         }
 
@@ -1098,8 +1296,21 @@ private class RuntimeLimiter(
             XposedBridge.log("AppTimeLimiter: PROVIDER_UNAVAILABLE package=$packageName, fallback=XSharedPreferences/local_cache")
         }
         if (reloadFallback) preferences.reload()
-        val sharedRule = readXSharedRule()
+        val rawSharedRule = readXSharedRule()
         val cachedRule = readCachedRule(context)
+        val sharedRule = if (
+            rawSharedRule?.groupEnabled == true &&
+            cachedRule?.groupEnabled == true &&
+            rawSharedRule.groupIdentity() == cachedRule.groupIdentity()
+        ) {
+            rawSharedRule.copy(
+                groupTodayUsedMillis = cachedRule.groupTodayUsedMillis,
+                groupDayToken = cachedRule.groupDayToken,
+                groupMeasuredAtElapsedMillis = cachedRule.groupMeasuredAtElapsedMillis,
+            )
+        } else {
+            rawSharedRule
+        }
         val rule = when {
             sharedRule != null && (cachedRule == null || sharedRule.version >= cachedRule.version) -> {
                 cacheRule(context, sharedRule)
@@ -1109,13 +1320,34 @@ private class RuntimeLimiter(
             else -> unavailableRule()
         }
         diagnosticsEnabled = rule.diagnosticsEnabled
+        lastLoadedRule = rule
         return rule
     }
 
     private fun readXSharedRule(): HookRule? {
         val prefix = "rule.$packageName."
-        val version = preferences.getLong("${prefix}version", Long.MIN_VALUE)
-        if (version == Long.MIN_VALUE) return null
+        val storedVersion = preferences.getLong("${prefix}version", Long.MIN_VALUE)
+        val membershipVersion = preferences.getLong(
+            "${RuleRepository.KEY_PACKAGE_GROUP_VERSION_PREFIX}$packageName",
+            Long.MIN_VALUE,
+        )
+        val groupId = preferences.getString(
+            "${RuleRepository.KEY_PACKAGE_GROUP_PREFIX}$packageName",
+            "",
+        ).orEmpty()
+        val groupPrefix = "group.$groupId."
+        val groupMembers = if (groupId.isBlank()) {
+            emptySet()
+        } else {
+            preferences.getStringSet("${groupPrefix}packages", emptySet()).orEmpty()
+        }
+        val groupEnabled = groupId.isNotBlank() &&
+            packageName in groupMembers &&
+            preferences.getBoolean("${groupPrefix}enabled", false)
+        if (storedVersion == Long.MIN_VALUE && membershipVersion == Long.MIN_VALUE && !groupEnabled) {
+            return null
+        }
+        val version = storedVersion.takeIf { it != Long.MIN_VALUE } ?: 0L
         val legacyEnabled = preferences.getBoolean("${prefix}enabled", false)
         val legacyLimitSeconds = preferences.getLong(
             "${prefix}limit_seconds",
@@ -1137,7 +1369,8 @@ private class RuntimeLimiter(
         }
         val scheduleEnabled = preferences.getBoolean("${prefix}schedule_enabled", false)
         return HookRule(
-            enabled = legacyEnabled && (dailyEnabled || perLaunchEnabled || scheduleEnabled),
+            enabled = (legacyEnabled && (dailyEnabled || perLaunchEnabled || scheduleEnabled)) ||
+                groupEnabled,
             dailyEnabled = dailyEnabled,
             dailyLimitMillis = (if (dailyLimitSeconds >= 0L) dailyLimitSeconds else legacyLimitSeconds)
                 .coerceIn(
@@ -1145,6 +1378,24 @@ private class RuntimeLimiter(
                     RuleRepository.MAX_LIMIT_SECONDS,
                 ) * 1000L,
             systemTodayUsedMillis = -1L,
+            groupEnabled = groupEnabled,
+            groupId = groupId,
+            groupName = preferences.getString("${groupPrefix}name", "").orEmpty(),
+            groupDailyLimitMillis = preferences.getLong(
+                "${groupPrefix}daily_limit_seconds",
+                RuleRepository.DEFAULT_GROUP_LIMIT_SECONDS,
+            ).coerceIn(
+                RuleRepository.MIN_LIMIT_SECONDS,
+                RuleRepository.MAX_LIMIT_SECONDS,
+            ) * 1000L,
+            groupTodayUsedMillis = -1L,
+            groupVersion = if (groupEnabled) {
+                preferences.getLong("${groupPrefix}version", membershipVersion.coerceAtLeast(0L))
+            } else {
+                membershipVersion.coerceAtLeast(0L)
+            },
+            groupDayToken = LocalDate.now().toString(),
+            groupMeasuredAtElapsedMillis = SystemClock.elapsedRealtime(),
             perLaunchEnabled = perLaunchEnabled,
             perLaunchLimitMillis = (if (perLaunchLimitSeconds >= 0L) {
                 perLaunchLimitSeconds
@@ -1173,6 +1424,10 @@ private class RuntimeLimiter(
             ) * 1000L,
             version = version,
             exitWarningEnabled = preferences.getBoolean(RuleRepository.KEY_EXIT_WARNING_ENABLED, true),
+            fullScreenExitWarningEnabled = preferences.getBoolean(
+                RuleRepository.KEY_FULL_SCREEN_EXIT_WARNING_ENABLED,
+                false,
+            ),
             extensionMillis = preferences.getLong(
                 RuleRepository.KEY_EXTENSION_SECONDS,
                 RuleRepository.DEFAULT_EXTENSION_SECONDS,
@@ -1191,6 +1446,14 @@ private class RuntimeLimiter(
             rule.enabled,
             rule.dailyEnabled,
             rule.dailyLimitMillis,
+            rule.groupEnabled,
+            rule.groupId,
+            rule.groupName,
+            rule.groupDailyLimitMillis,
+            rule.groupTodayUsedMillis,
+            rule.groupVersion,
+            rule.groupDayToken,
+            rule.groupMeasuredAtElapsedMillis,
             rule.perLaunchEnabled,
             rule.perLaunchLimitMillis,
             rule.scheduleEnabled,
@@ -1200,6 +1463,7 @@ private class RuntimeLimiter(
             rule.cooldownMillis,
             rule.version,
             rule.exitWarningEnabled,
+            rule.fullScreenExitWarningEnabled,
             rule.extensionMillis,
             rule.diagnosticsEnabled,
             rule.usageStatsEnabled,
@@ -1211,6 +1475,14 @@ private class RuntimeLimiter(
             .putBoolean(CACHE_ENABLED, rule.enabled)
             .putBoolean(CACHE_DAILY_ENABLED, rule.dailyEnabled)
             .putLong(CACHE_DAILY_LIMIT_MS, rule.dailyLimitMillis)
+            .putBoolean(CACHE_GROUP_ENABLED, rule.groupEnabled)
+            .putString(CACHE_GROUP_ID, rule.groupId)
+            .putString(CACHE_GROUP_NAME, rule.groupName)
+            .putLong(CACHE_GROUP_DAILY_LIMIT_MS, rule.groupDailyLimitMillis)
+            .putLong(CACHE_GROUP_TODAY_USED_MS, rule.groupTodayUsedMillis)
+            .putLong(CACHE_GROUP_VERSION, rule.groupVersion)
+            .putString(CACHE_GROUP_DAY_TOKEN, rule.groupDayToken)
+            .putLong(CACHE_GROUP_MEASURED_AT_ELAPSED_MS, rule.groupMeasuredAtElapsedMillis)
             .putBoolean(CACHE_PER_LAUNCH_ENABLED, rule.perLaunchEnabled)
             .putLong(CACHE_PER_LAUNCH_LIMIT_MS, rule.perLaunchLimitMillis)
             .putBoolean(CACHE_SCHEDULE_ENABLED, rule.scheduleEnabled)
@@ -1220,6 +1492,10 @@ private class RuntimeLimiter(
             .putLong(CACHE_COOLDOWN_MS, rule.cooldownMillis)
             .putLong(CACHE_RULE_VERSION, rule.version)
             .putBoolean(CACHE_EXIT_WARNING_ENABLED, rule.exitWarningEnabled)
+            .putBoolean(
+                CACHE_FULL_SCREEN_EXIT_WARNING_ENABLED,
+                rule.fullScreenExitWarningEnabled,
+            )
             .putLong(CACHE_EXTENSION_MS, rule.extensionMillis)
             .putBoolean(CACHE_DIAGNOSTICS_ENABLED, rule.diagnosticsEnabled)
             .putBoolean(CACHE_USAGE_STATS_ENABLED, rule.usageStatsEnabled)
@@ -1241,6 +1517,23 @@ private class RuntimeLimiter(
                 RuleRepository.MAX_LIMIT_SECONDS * 1000L,
             ),
             systemTodayUsedMillis = -1L,
+            groupEnabled = prefs.getBoolean(CACHE_GROUP_ENABLED, false),
+            groupId = prefs.getString(CACHE_GROUP_ID, "").orEmpty(),
+            groupName = prefs.getString(CACHE_GROUP_NAME, "").orEmpty(),
+            groupDailyLimitMillis = prefs.getLong(
+                CACHE_GROUP_DAILY_LIMIT_MS,
+                RuleRepository.DEFAULT_GROUP_LIMIT_SECONDS * 1000L,
+            ).coerceIn(
+                RuleRepository.MIN_LIMIT_SECONDS * 1000L,
+                RuleRepository.MAX_LIMIT_SECONDS * 1000L,
+            ),
+            groupTodayUsedMillis = prefs.getLong(CACHE_GROUP_TODAY_USED_MS, -1L),
+            groupVersion = prefs.getLong(CACHE_GROUP_VERSION, 0L),
+            groupDayToken = prefs.getString(CACHE_GROUP_DAY_TOKEN, "").orEmpty(),
+            groupMeasuredAtElapsedMillis = prefs.getLong(
+                CACHE_GROUP_MEASURED_AT_ELAPSED_MS,
+                SystemClock.elapsedRealtime(),
+            ),
             perLaunchEnabled = prefs.getBoolean(CACHE_PER_LAUNCH_ENABLED, false),
             perLaunchLimitMillis = prefs.getLong(
                 CACHE_PER_LAUNCH_LIMIT_MS,
@@ -1264,6 +1557,10 @@ private class RuntimeLimiter(
             ),
             version = prefs.getLong(CACHE_RULE_VERSION, 0L),
             exitWarningEnabled = prefs.getBoolean(CACHE_EXIT_WARNING_ENABLED, true),
+            fullScreenExitWarningEnabled = prefs.getBoolean(
+                CACHE_FULL_SCREEN_EXIT_WARNING_ENABLED,
+                false,
+            ),
             extensionMillis = prefs.getLong(
                 CACHE_EXTENSION_MS,
                 RuleRepository.DEFAULT_EXTENSION_SECONDS * 1000L,
@@ -1282,6 +1579,14 @@ private class RuntimeLimiter(
         dailyEnabled = false,
         dailyLimitMillis = RuleRepository.DEFAULT_LIMIT_SECONDS * 1000L,
         systemTodayUsedMillis = -1L,
+        groupEnabled = false,
+        groupId = "",
+        groupName = "",
+        groupDailyLimitMillis = RuleRepository.DEFAULT_GROUP_LIMIT_SECONDS * 1000L,
+        groupTodayUsedMillis = -1L,
+        groupVersion = 0L,
+        groupDayToken = "",
+        groupMeasuredAtElapsedMillis = SystemClock.elapsedRealtime(),
         perLaunchEnabled = false,
         perLaunchLimitMillis = RuleRepository.DEFAULT_LIMIT_SECONDS * 1000L,
         scheduleEnabled = false,
@@ -1291,6 +1596,7 @@ private class RuntimeLimiter(
         cooldownMillis = RuleRepository.DEFAULT_COOLDOWN_SECONDS * 1000L,
         version = Long.MIN_VALUE,
         exitWarningEnabled = true,
+        fullScreenExitWarningEnabled = false,
         extensionMillis = RuleRepository.DEFAULT_EXTENSION_SECONDS * 1000L,
         diagnosticsEnabled = true,
         usageStatsEnabled = true,
@@ -1334,6 +1640,14 @@ private class RuntimeLimiter(
         val dailyEnabled: Boolean,
         val dailyLimitMillis: Long,
         val systemTodayUsedMillis: Long,
+        val groupEnabled: Boolean,
+        val groupId: String,
+        val groupName: String,
+        val groupDailyLimitMillis: Long,
+        val groupTodayUsedMillis: Long,
+        val groupVersion: Long,
+        val groupDayToken: String,
+        val groupMeasuredAtElapsedMillis: Long,
         val perLaunchEnabled: Boolean,
         val perLaunchLimitMillis: Long,
         val scheduleEnabled: Boolean,
@@ -1343,6 +1657,7 @@ private class RuntimeLimiter(
         val cooldownMillis: Long,
         val version: Long,
         val exitWarningEnabled: Boolean,
+        val fullScreenExitWarningEnabled: Boolean,
         val extensionMillis: Long,
         val diagnosticsEnabled: Boolean,
         val usageStatsEnabled: Boolean,
@@ -1351,6 +1666,7 @@ private class RuntimeLimiter(
 
     private data class ThresholdRemaining(
         val label: String,
+        val isGroup: Boolean,
         val remainingMillis: Long,
     )
 
@@ -1359,6 +1675,7 @@ private class RuntimeLimiter(
         val reached: Boolean,
         val reachedLabels: String,
         val nextThresholdLabel: String,
+        val groupOnlyReached: Boolean,
     )
 
     private data class PendingUsageBatch(
@@ -1382,6 +1699,14 @@ private class RuntimeLimiter(
         const val CACHE_ENABLED = "enabled"
         const val CACHE_DAILY_ENABLED = "daily_enabled"
         const val CACHE_DAILY_LIMIT_MS = "daily_limit_ms"
+        const val CACHE_GROUP_ENABLED = "group_enabled"
+        const val CACHE_GROUP_ID = "group_id"
+        const val CACHE_GROUP_NAME = "group_name"
+        const val CACHE_GROUP_DAILY_LIMIT_MS = "group_daily_limit_ms"
+        const val CACHE_GROUP_TODAY_USED_MS = "group_today_used_ms"
+        const val CACHE_GROUP_VERSION = "group_version"
+        const val CACHE_GROUP_DAY_TOKEN = "group_day_token"
+        const val CACHE_GROUP_MEASURED_AT_ELAPSED_MS = "group_measured_at_elapsed_ms"
         const val CACHE_PER_LAUNCH_ENABLED = "per_launch_enabled"
         const val CACHE_PER_LAUNCH_LIMIT_MS = "per_launch_limit_ms"
         const val CACHE_SCHEDULE_ENABLED = "schedule_enabled"
@@ -1391,6 +1716,7 @@ private class RuntimeLimiter(
         const val CACHE_COOLDOWN_MS = "cooldown_ms"
         const val CACHE_RULE_VERSION = "rule_version"
         const val CACHE_EXIT_WARNING_ENABLED = "exit_warning_enabled"
+        const val CACHE_FULL_SCREEN_EXIT_WARNING_ENABLED = "full_screen_exit_warning_enabled"
         const val CACHE_EXTENSION_MS = "extension_ms"
         const val CACHE_DIAGNOSTICS_ENABLED = "diagnostics_enabled"
         const val CACHE_USAGE_STATS_ENABLED = "usage_stats_enabled"
@@ -1407,6 +1733,8 @@ private class RuntimeLimiter(
         const val WARNING_LEAD_MS = 5_000L
         const val COUNTDOWN_REFRESH_MS = 1_000L
         const val SCHEDULE_RECHECK_MAX_MS = 60_000L
+        const val RULE_RECHECK_MAX_MS = 60_000L
+        const val GROUP_USAGE_SYNC_INTERVAL_MS = 15_000L
         const val MAX_STATS_RETRIES = 3
         const val MAX_STATS_DURATION_PER_DAY_MS = 24L * 60L * 60L * 1000L
         val STATS_RETRY_DELAYS_MS = longArrayOf(1_000L, 5_000L, 15_000L)
