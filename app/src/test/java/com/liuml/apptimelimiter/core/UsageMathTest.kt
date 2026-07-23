@@ -45,4 +45,27 @@ class UsageMathTest {
         assertEquals(90_000L, UsageMath.authoritativeDailyUsedMillis(60_000L, 90_000L))
         assertEquals(60_000L, UsageMath.authoritativeDailyUsedMillis(60_000L, -1L))
     }
+
+    @Test
+    fun `system snapshot does not double count the active foreground segment`() {
+        assertEquals(
+            2_000L,
+            UsageMath.activeIncludedAtMeasurementMillis(10_000L, 12_000L, 3_000L),
+        )
+        assertEquals(88_000L, UsageMath.committedSystemUsageMillis(90_000L, 2_000L))
+        assertEquals(
+            3_000L,
+            UsageMath.activeAfterMeasurementMillis(15_000L, 10_000L, 12_000L),
+        )
+        assertEquals(93_000L, UsageMath.projectedSystemUsageMillis(90_000L, 3_000L))
+    }
+
+    @Test
+    fun `projected system usage handles unavailable and overflow values`() {
+        assertEquals(-1L, UsageMath.projectedSystemUsageMillis(-1L, 3_000L))
+        assertEquals(
+            Long.MAX_VALUE,
+            UsageMath.projectedSystemUsageMillis(Long.MAX_VALUE - 1L, 3_000L),
+        )
+    }
 }

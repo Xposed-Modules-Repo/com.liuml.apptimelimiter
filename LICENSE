@@ -1,0 +1,52 @@
+时停软件许可与版权声明
+Time Stop Software License and Copyright Notice
+
+Copyright (c) 2026 时停项目作者（TACPR）. All rights reserved.
+
+一、允许的使用
+
+允许个人用户从项目作者认可的官方发布渠道下载、安装并以非商业目的使用未经修改的官方编译版本。
+
+二、未经书面授权禁止的行为
+
+除法律明确允许的情形外，任何个人或组织不得：
+
+1. 复制、修改、翻译、改名、演绎或将本项目原创代码、界面、图标、文档及编译产物用于其他项目；
+2. 删除、隐藏或替换作者、项目名称、版权信息及其他权利标识；
+3. 重新打包、镜像分发、收费分发、捆绑分发、出售、出租或以其他方式倒卖本软件；
+4. 冒充原作者、官方版本或以本项目名义提供未经授权的商业服务；
+5. 将本项目全部或实质性部分并入商业产品，或向第三方提供复制品、修改版或衍生版本。
+
+如需复制、修改、再发布或商业使用，必须事先取得项目作者的书面授权。授权联系邮箱：
+liuml.yx@139.com
+
+三、第三方组件
+
+本声明仅适用于本项目作者拥有权利的原创内容。项目引用的 AndroidX、Kotlin、LSPosed/Xposed
+接口及其他第三方组件，仍分别适用其原有许可证、版权声明和法定权利。本声明不限制第三方权利人
+授予的权利，也不排除法律规定的合理使用及其他不可被合同排除的权利。
+
+四、免责声明
+
+本软件按“现状”提供，不作任何明示或默示保证。在法律允许的最大范围内，项目作者不对因安装、
+使用、无法使用或错误配置本软件造成的设备故障、数据损失、系统异常或其他直接、间接损失承担责任。
+
+公开展示源代码不代表授予开源许可，也不代表放弃上述权利。
+
+---
+
+Permission is granted to individual users to download, install, and use unmodified official
+binaries obtained from release channels approved by the project author, solely for personal,
+non-commercial purposes.
+
+Except where expressly permitted by applicable law, no permission is granted to copy, modify,
+translate, rename, create derivative works from, repackage, redistribute, sell, rent, bundle,
+commercialize, remove attribution from, or impersonate the official origin of any original
+source code, UI, icons, documentation, or binaries in this project.
+
+Written authorization is required for redistribution, modification, derivative works, or any
+commercial use. Contact: liuml.yx@139.com
+
+Third-party components remain subject to their respective licenses and copyright notices.
+This software is provided "as is", without warranty of any kind, to the maximum extent
+permitted by applicable law.

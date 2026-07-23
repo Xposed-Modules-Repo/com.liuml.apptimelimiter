@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">时停</string>
-    <string name="module_description">按应用限制前台使用时长，达到限制后退出应用</string>
+    <string name="app_name">Time Stop</string>
+    <string name="module_description">Limit foreground app usage and exit when a limit is reached</string>
 </resources>

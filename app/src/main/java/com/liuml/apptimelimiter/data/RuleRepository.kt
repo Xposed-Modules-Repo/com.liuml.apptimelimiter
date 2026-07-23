@@ -51,6 +51,10 @@ class RuleRepository(context: Context) {
         return AppRule(
             packageName = packageName,
             enabled = legacyEnabled && (dailyEnabled || perLaunchEnabled || scheduleEnabled),
+            sessionPlanningEnabled = prefs.getBoolean(
+                "${prefix}session_planning_enabled",
+                false,
+            ),
             dailyEnabled = dailyEnabled,
             dailyLimitSeconds = prefs.getLong(
                 "${prefix}daily_limit_seconds",
@@ -77,7 +81,7 @@ class RuleRepository(context: Context) {
         )
     }
 
-    fun save(rule: AppRule) {
+    fun save(rule: AppRule): Boolean {
         val scheduleWindows = rule.scheduleWindows
             .filter(ScheduleWindow::isValid)
             .take(ScheduleCodec.MAX_WINDOWS)
@@ -87,11 +91,15 @@ class RuleRepository(context: Context) {
         val prefix = prefix(rule.packageName)
         val previousVersion = prefs.getLong("${prefix}version", 0L)
         val nextVersion = maxOf(System.currentTimeMillis(), previousVersion + 1L)
-        prefs.edit()
+        val persisted = prefs.edit()
             .putStringSet(KEY_PACKAGES, packages)
             .putBoolean(
                 "${prefix}enabled",
                 rule.enabled && (rule.dailyEnabled || rule.perLaunchEnabled || scheduleEnabled),
+            )
+            .putBoolean(
+                "${prefix}session_planning_enabled",
+                rule.sessionPlanningEnabled,
             )
             .putBoolean("${prefix}daily_enabled", rule.dailyEnabled)
             .putLong(
@@ -123,8 +131,11 @@ class RuleRepository(context: Context) {
             )
             .putLong("${prefix}version", nextVersion)
             .commit()
-        grantRuleAccess(rule.packageName)
-        makePreferencesReadable()
+        if (persisted) {
+            grantRuleAccess(rule.packageName)
+            makePreferencesReadable()
+        }
+        return persisted
     }
 
     fun configuredPackages(): Set<String> =
@@ -139,6 +150,9 @@ class RuleRepository(context: Context) {
         if (groupId.isBlank()) return null
         val prefix = groupPrefix(groupId)
         if (!prefs.contains("${prefix}name")) return null
+        val scheduleWindows = ScheduleCodec.decode(
+            prefs.getString("${prefix}schedule_windows", null),
+        )
         return AppGroup(
             id = groupId,
             name = prefs.getString("${prefix}name", null)
@@ -146,10 +160,30 @@ class RuleRepository(context: Context) {
                 .ifBlank { DEFAULT_GROUP_NAME }
                 .take(MAX_GROUP_NAME_LENGTH),
             enabled = prefs.getBoolean("${prefix}enabled", true),
+            // Groups created before multi-rule support only had a shared daily quota.
+            dailyEnabled = prefs.getBoolean("${prefix}daily_enabled", true),
             dailyLimitSeconds = prefs.getLong(
                 "${prefix}daily_limit_seconds",
                 DEFAULT_GROUP_LIMIT_SECONDS,
             ).coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS),
+            perLaunchEnabled = prefs.getBoolean("${prefix}per_launch_enabled", false),
+            perLaunchLimitSeconds = prefs.getLong(
+                "${prefix}per_launch_limit_seconds",
+                DEFAULT_LIMIT_SECONDS,
+            ).coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS),
+            scheduleEnabled = prefs.getBoolean("${prefix}schedule_enabled", false) &&
+                scheduleWindows.isNotEmpty(),
+            scheduleMode = prefs.getString(
+                "${prefix}schedule_mode",
+                ScheduleMode.BLOCK_DURING.name,
+            )?.let { runCatching { ScheduleMode.valueOf(it) }.getOrNull() }
+                ?: ScheduleMode.BLOCK_DURING,
+            scheduleWindows = scheduleWindows,
+            cooldownEnabled = prefs.getBoolean("${prefix}cooldown_enabled", false),
+            cooldownSeconds = prefs.getLong(
+                "${prefix}cooldown_seconds",
+                DEFAULT_COOLDOWN_SECONDS,
+            ).coerceIn(MIN_COOLDOWN_SECONDS, MAX_COOLDOWN_SECONDS),
             packageNames = prefs.getStringSet("${prefix}packages", emptySet())
                 .orEmpty()
                 .filter(String::isNotBlank)
@@ -187,6 +221,12 @@ class RuleRepository(context: Context) {
             },
         )
         if (hasConflict) return false
+        val scheduleWindows = group.scheduleWindows
+            .filter(ScheduleWindow::isValid)
+            .take(ScheduleCodec.MAX_WINDOWS)
+        val scheduleEnabled = group.scheduleEnabled && scheduleWindows.isNotEmpty()
+        val hasActiveRule = group.dailyEnabled || group.perLaunchEnabled ||
+            scheduleEnabled || group.cooldownEnabled
 
         val prefix = groupPrefix(groupId)
         val previousMembers = prefs.getStringSet("${prefix}packages", emptySet()).orEmpty()
@@ -200,10 +240,27 @@ class RuleRepository(context: Context) {
             .putStringSet(KEY_GROUP_IDS, groupIds)
             .putStringSet(KEY_PACKAGES, configuredPackages)
             .putString("${prefix}name", group.name.trim().ifBlank { DEFAULT_GROUP_NAME }.take(MAX_GROUP_NAME_LENGTH))
-            .putBoolean("${prefix}enabled", group.enabled && members.isNotEmpty())
+            .putBoolean(
+                "${prefix}enabled",
+                group.enabled && members.isNotEmpty() && hasActiveRule,
+            )
+            .putBoolean("${prefix}daily_enabled", group.dailyEnabled)
             .putLong(
                 "${prefix}daily_limit_seconds",
                 group.dailyLimitSeconds.coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS),
+            )
+            .putBoolean("${prefix}per_launch_enabled", group.perLaunchEnabled)
+            .putLong(
+                "${prefix}per_launch_limit_seconds",
+                group.perLaunchLimitSeconds.coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS),
+            )
+            .putBoolean("${prefix}schedule_enabled", scheduleEnabled)
+            .putString("${prefix}schedule_mode", group.scheduleMode.name)
+            .putString("${prefix}schedule_windows", ScheduleCodec.encode(scheduleWindows))
+            .putBoolean("${prefix}cooldown_enabled", group.cooldownEnabled)
+            .putLong(
+                "${prefix}cooldown_seconds",
+                group.cooldownSeconds.coerceIn(MIN_COOLDOWN_SECONDS, MAX_COOLDOWN_SECONDS),
             )
             .putStringSet("${prefix}packages", members)
             .putLong("${prefix}version", nextVersion)
@@ -252,6 +309,13 @@ class RuleRepository(context: Context) {
             KEY_FULL_SCREEN_EXIT_WARNING_ENABLED,
             false,
         ),
+        exitWarningVibrationEnabled = prefs.getBoolean(
+            KEY_EXIT_WARNING_VIBRATION_ENABLED,
+            false,
+        ),
+        languageMode = prefs.getString(KEY_LANGUAGE_MODE, AppLanguageMode.SYSTEM.name)
+            ?.let { runCatching { AppLanguageMode.valueOf(it) }.getOrNull() }
+            ?: AppLanguageMode.SYSTEM,
         extensionSeconds = prefs.getLong(KEY_EXTENSION_SECONDS, DEFAULT_EXTENSION_SECONDS)
             .coerceIn(MIN_EXTENSION_SECONDS, MAX_EXTENSION_SECONDS),
         diagnosticsEnabled = prefs.getBoolean(KEY_DIAGNOSTICS_ENABLED, true),
@@ -259,13 +323,18 @@ class RuleRepository(context: Context) {
         usageStatsEnabled = prefs.getBoolean(KEY_USAGE_STATS_ENABLED, true),
     )
 
-    fun saveGlobalSettings(settings: GlobalSettings) {
-        prefs.edit()
+    fun saveGlobalSettings(settings: GlobalSettings): Boolean {
+        val persisted = prefs.edit()
             .putBoolean(KEY_EXIT_WARNING_ENABLED, settings.exitWarningEnabled)
             .putBoolean(
                 KEY_FULL_SCREEN_EXIT_WARNING_ENABLED,
                 settings.fullScreenExitWarningEnabled,
             )
+            .putBoolean(
+                KEY_EXIT_WARNING_VIBRATION_ENABLED,
+                settings.exitWarningVibrationEnabled,
+            )
+            .putString(KEY_LANGUAGE_MODE, settings.languageMode.name)
             .putLong(
                 KEY_EXTENSION_SECONDS,
                 settings.extensionSeconds.coerceIn(MIN_EXTENSION_SECONDS, MAX_EXTENSION_SECONDS),
@@ -274,7 +343,8 @@ class RuleRepository(context: Context) {
             .putBoolean(KEY_LAUNCHER_ICON_HIDDEN, settings.launcherIconHidden)
             .putBoolean(KEY_USAGE_STATS_ENABLED, settings.usageStatsEnabled)
             .commit()
-        makePreferencesReadable()
+        if (persisted) makePreferencesReadable()
+        return persisted
     }
 
     fun grantRuleAccess(packageName: String) {
@@ -320,6 +390,9 @@ class RuleRepository(context: Context) {
         const val KEY_EXIT_WARNING_ENABLED = "global.exit_warning_enabled"
         const val KEY_FULL_SCREEN_EXIT_WARNING_ENABLED =
             "global.full_screen_exit_warning_enabled"
+        const val KEY_EXIT_WARNING_VIBRATION_ENABLED =
+            "global.exit_warning_vibration_enabled"
+        const val KEY_LANGUAGE_MODE = "global.language_mode"
         const val KEY_EXTENSION_SECONDS = "global.extension_seconds"
         const val KEY_DIAGNOSTICS_ENABLED = "global.diagnostics_enabled"
         const val KEY_LAUNCHER_ICON_HIDDEN = "global.launcher_icon_hidden"

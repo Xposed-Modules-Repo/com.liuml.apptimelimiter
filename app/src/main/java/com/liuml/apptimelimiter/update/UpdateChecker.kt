@@ -7,6 +7,9 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import com.liuml.apptimelimiter.BuildConfig
+import com.liuml.apptimelimiter.data.RuleRepository
+import com.liuml.apptimelimiter.localization.AppLocaleController
+import com.liuml.apptimelimiter.localization.SupportedLanguage
 import org.json.JSONArray
 import java.io.File
 import java.net.HttpURLConnection
@@ -28,34 +31,40 @@ sealed interface UpdateCheckResult {
 }
 
 object UpdateChecker {
-    fun check(callback: (UpdateCheckResult) -> Unit) {
+    fun check(context: Context, callback: (UpdateCheckResult) -> Unit) {
+        val english = isEnglish(context)
         thread(name = "github-update-check", isDaemon = true) {
-            val result = runCatching { requestLatestRelease() }
-                .getOrElse { UpdateCheckResult.Error(it.message ?: "无法连接 GitHub") }
+            val result = runCatching { requestLatestRelease(english) }
+                .getOrElse {
+                    UpdateCheckResult.Error(
+                        it.message ?: if (english) "Unable to connect to GitHub" else "无法连接 GitHub",
+                    )
+                }
             Handler(Looper.getMainLooper()).post { callback(result) }
         }
     }
 
     fun download(context: Context, release: ReleaseInfo): Long {
+        val english = isEnglish(context)
         val safeName = release.apkName.replace(Regex("[^A-Za-z0-9._-]"), "_")
         context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
             ?.let { File(it, safeName) }
             ?.takeIf(File::exists)
             ?.delete()
         val request = DownloadManager.Request(Uri.parse(release.apkDownloadUrl))
-            .setTitle("时停 ${release.version}")
-            .setDescription("正在从 GitHub 下载更新")
+            .setTitle("${if (english) "Time Stop" else "时停"} ${release.version}")
+            .setDescription(if (english) "Downloading update from GitHub" else "正在从 GitHub 下载更新")
             .setMimeType(APK_MIME_TYPE)
             .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
             .setAllowedOverMetered(true)
             .setAllowedOverRoaming(false)
             .setDestinationInExternalFilesDir(context, Environment.DIRECTORY_DOWNLOADS, safeName)
         val manager = context.getSystemService(DownloadManager::class.java)
-            ?: error("系统下载管理器不可用")
+            ?: error(if (english) "System download manager is unavailable" else "系统下载管理器不可用")
         return manager.enqueue(request)
     }
 
-    private fun requestLatestRelease(): UpdateCheckResult {
+    private fun requestLatestRelease(english: Boolean): UpdateCheckResult {
         val connection = (URL(RELEASES_API).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 10_000
@@ -66,7 +75,9 @@ object UpdateChecker {
         }
         return try {
             val responseCode = connection.responseCode
-            if (responseCode !in 200..299) error("GitHub 返回 HTTP $responseCode")
+            if (responseCode !in 200..299) error(
+                if (english) "GitHub returned HTTP $responseCode" else "GitHub 返回 HTTP $responseCode",
+            )
             val releases = JSONArray(connection.inputStream.bufferedReader().use { it.readText() })
             val release = (0 until releases.length())
                 .asSequence()
@@ -77,13 +88,17 @@ object UpdateChecker {
                         prerelease = it.optBoolean("prerelease", false),
                     )
                 }
-                ?: return UpdateCheckResult.Error("GitHub 中暂时没有可用版本")
+                ?: return UpdateCheckResult.Error(
+                    if (english) "No GitHub release is currently available" else "GitHub 中暂时没有可用版本",
+                )
             val assets = release.optJSONArray("assets") ?: JSONArray()
             val apkAsset = (0 until assets.length())
                 .asSequence()
                 .map(assets::getJSONObject)
                 .firstOrNull { isPublishableApkAsset(it.optString("name")) }
-                ?: return UpdateCheckResult.Error("最新版本没有附带 APK")
+                ?: return UpdateCheckResult.Error(
+                    if (english) "The latest release does not include an APK" else "最新版本没有附带 APK",
+                )
             val info = ReleaseInfo(
                 version = release.optString("tag_name").ifBlank { release.optString("name") },
                 pageUrl = release.optString("html_url", REPOSITORY_URL),
@@ -106,6 +121,11 @@ object UpdateChecker {
     private const val RELEASES_API =
         "https://api.github.com/repos/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases?per_page=10"
     private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
+
+    private fun isEnglish(context: Context): Boolean = AppLocaleController.resolvedLanguage(
+        context,
+        RuleRepository(context).getGlobalSettings().languageMode,
+    ) == SupportedLanguage.ENGLISH
 }
 
 internal fun isStableRelease(draft: Boolean, prerelease: Boolean): Boolean = !draft && !prerelease

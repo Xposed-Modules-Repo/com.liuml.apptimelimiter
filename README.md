@@ -4,13 +4,13 @@
 
 ![Android 8.1+](https://img.shields.io/badge/Android-8.1%2B-3DDC84?logo=android&logoColor=white)
 ![LSPosed API 93+](https://img.shields.io/badge/LSPosed-API%2093%2B-5C6BC0)
-![Version 0.9.2](https://img.shields.io/badge/version-0.9.2-8E44AD)
+![Version 0.9.3](https://img.shields.io/badge/version-0.9.3-8E44AD)
 
 Stock screen-time tools are usually built for reports, daily caps, and focus modes. **Time Stop** is built for people who want sharper controls: per-app quotas, per-launch timers, weekly allow/block windows, shared group budgets, cooldowns after forced exits, Hook verification, and diagnostics that show what is actually happening inside the target process.
 
 [Latest release](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed module page](https://modules.lsposed.org/module/com.liuml.apptimelimiter/) · [中文说明](#中文说明)
 
-Current version: `0.9.2`
+Current version: `0.9.3`
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -36,16 +36,18 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | App groups and shared allowance | Put multiple apps into one group with a shared 1-1,440 minute daily budget. App-level daily, per-launch, and schedule rules still run in parallel; the first threshold wins. |
 | Daily cumulative mode | Uses the stronger source for each app: Android system usage when available, or Hook-local foreground accounting, then resets at local midnight. |
 | Per-launch mode | Starts a fresh timer when the target app's main process begins a foreground session. |
+| Session planning | Optionally asks for a 5, 10, 15, 30, or custom 1-1,440 minute plan when the target process first opens. It counts foreground time only and may be skipped or replanned. A plan longer than the earliest remaining timed quota is rejected with the available balance. |
 | Weekly schedules | Supports allow-only and block-during windows across multiple weekdays, including overnight ranges. Schedule blocks cannot be bypassed with the delay action. |
 | Foreground-only accounting | Counts only the `onResume` to `onPause` phase. Background residency does not burn the quota. |
-| Warning UI | Shows a five-second top banner or opt-in full-screen warning, with layout handling for portrait, landscape, display cutouts, and immersive apps. |
+| Warning UI | Shows a five-second top banner or opt-in full-screen warning, with an optional one-shot long vibration and layout handling for portrait, landscape, display cutouts, and immersive apps. |
+| Language | Supports system-default, Simplified Chinese, and English UI; Hook warnings use the same preference. |
 | Delay action | Lets the user add 1-60 minutes for normal time limits while keeping schedule blocks strict. |
-| Post-exit cooldown | Blocks reopening for 1-1,440 minutes after a forced exit. Repeated attempts do not refresh the cooldown or inflate limit-hit counts. |
+| Post-exit cooldown | Blocks reopening for 1-1,440 minutes after a daily, per-launch, or shared-group quota exit. Schedule denials keep showing their stable next-available time and do not start cooldown. Repeated attempts do not refresh cooldown or inflate limit-hit counts. |
 | Group sync loop | Grouped foreground apps synchronize usage every 15 seconds without keeping the manager app alive. |
 | Hook verification | Persists current-version Hook verification per controlled app and warns immediately when a newly controlled app or group member has not reported back. |
 | Diagnostics | Logs Hook setup, rule reads, timer starts, sync events, stats writes, and limit exits so configuration problems are traceable. |
 | System-app guardrails | Third-party apps can have their target process terminated; system apps only have their UI closed. |
-| Updates and feedback | Checks GitHub Releases, uses Android's download manager for APK updates, and can attach diagnostics to a feedback email. |
+| Updates and feedback | Checks GitHub Releases, uses Android's download manager for APK updates, and offers email diagnostics or the QQ group for feedback and beta participation. |
 
 Changing a rule resets the Hook-local accumulator for that app, but Android's system usage for the current day remains part of the daily baseline when usage access is granted. That makes rule tweaking visible, not a loophole.
 
@@ -62,6 +64,8 @@ flowchart LR
     Prefs -->|"XSharedPreferences fallback"| Hook
     Hook --> Lifecycle["Activity resume/pause events"]
     Lifecycle --> Timer["Foreground timer"]
+    Hook --> SessionPlan["Process-local session plan"]
+    SessionPlan -->|"expires"| Exit
     Timer -->|"limit reached"| Exit["Close task stack + exit target process"]
     Timer --> State["Target-local usage state"]
     UI -->|"on-demand query"| UsageStats["Android UsageStatsManager"]
@@ -116,15 +120,24 @@ Open **Diagnostic Logs** from the home screen and check:
 - `RULE_READ ... source=provider`: the primary rule channel is working.
 - `RULE_READ ... source=xsharedpreferences`: the compatibility fallback is being used.
 - `TIMER_START`: foreground timing has started.
+- `SESSION_PLAN_PROMPT/STARTED/REPLANNED/SKIPPED/EXPIRED`: lifecycle of the process-local session plan.
+- `SESSION_PLAN_WAITING_USAGE`, `SESSION_PLAN_REJECTED_OVER_QUOTA`, and `SESSION_PLAN_UNAVAILABLE`: authoritative usage wait, over-quota rejection, or plan unavailability.
 - `LIMIT_REACHED`: a configured boundary was reached and exit execution started.
 
 If `HOOK_READY` never appears in the in-app log, search LSPosed logs for `AppTimeLimiter: HOOK_INSTALLED` or `HOOK_FAILED`.
+
+`HOOK_INSTALLED` and `HOOK_READY` include the target process bitness and ABI. If neither appears for only a few apps, first check whether those apps are excluded by the Magisk denylist/Zygisk configuration. The Hook uses both the normal Instrumentation lifecycle path and an Activity lifecycle fallback for protected or legacy apps.
 
 The legacy entry point and lifecycle Hook use the [Xposed Framework API](https://api.xposed.info/reference/de/robv/android/xposed/IXposedHookLoadPackage.html). New LSPosed projects may migrate to the [Modern Xposed API](https://github.com/LSPosed/LSPosed/wiki/Develop-Xposed-Modules-Using-Modern-Xposed-API) and Remote Preferences later.
 
 ## Known Limitations
 
-- Android 15 compatibility hooks `Instrumentation.callActivityOnResume/Pause` across all processes in the target package; diagnostics show the process that hosts the UI.
+- Session planning is process-local: it is offered once per target process, survives Activity changes in that process, and is cleared when the process ends.
+- A session plan counts only resumed foreground Activity time. Background and screen-off time is paused by design; this feature does not provide background media playback or a wall-clock sleep timer.
+- Session-plan expiry does not add a limit hit or start cooldown. System apps only have their UI closed.
+- A session plan must fit within the earliest remaining app or group timed quota. Longer choices are rejected with the available balance, and exhausted quotas, cooldowns, or blocked schedules can never be bypassed.
+
+- Lifecycle tracking uses `Instrumentation.callActivityOnResume/Pause` with a deduplicated `Activity.onResume/onPause` fallback across target processes; diagnostics show the process and bitness that host the UI.
 - Already running target apps keep the old Hook after install or upgrade. Force-stop and reopen them to load the new module code.
 - Activities that remain resumed in picture-in-picture or split-screen mode continue to count toward the limit.
 - Multiple resumed apps in the same group synchronize increments every 15 seconds, so concurrent multi-window use can exceed the shared allowance by up to one sync interval.
@@ -147,7 +160,7 @@ This tool should be used only by the device owner or on explicitly authorized ma
 
 [下载最新版本](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed 模块页面](https://modules.lsposed.org/module/com.liuml.apptimelimiter/)
 
-当前版本：`0.9.2`
+当前版本：`0.9.3`
 
 ## 它和系统屏幕时间有什么不同？
 
@@ -172,21 +185,24 @@ This tool should be used only by the device owner or on explicitly authorized ma
 | 能力 | 说明 |
 | --- | --- |
 | 独立应用规则 | 每个应用分别保存启用状态、时间额度和时段计划，互不影响。 |
-| 应用分组与共享额度 | 可将多个应用加入同一分组，共同消耗 1-1440 分钟的每日额度；应用独立的每日、单次和时段规则仍同时生效，任一阈值先到即退出。 |
+| 应用分组与统一规则 | 可为一组应用独立开启共享每日额度、单次打开、可用时段和退出后冷却。共享每日额度按成员总量计算；单次按各成员进程分别计算；应用与分组时段取交集；冷却只锁定本次被退出的成员。应用独立规则仍并行生效，任一条件先触发即退出。 |
 | 应用列表过滤 | 应用管理默认只显示第三方应用；需要管理系统应用时可手动开启“显示系统应用”。 |
 | 每日累计限制 | 为每个应用设置 1-1440 分钟的每日额度；有“使用情况访问权限”时，以 Android 系统时长和 Hook 本地计时的较大值判定，跨零点自动重置。 |
 | 单次打开限制 | 每次目标应用主进程启动后重新计时，适合控制一次连续使用的时长。 |
+| 本次使用计划 | 可为单个应用开启“打开时制定计划”；目标进程首次打开界面时可选 5、10、15、30 或自定义 1-1440 分钟，也可跳过。计划仅计算前台时间，可在退出前重新制定；选择时长不得超过应用或分组中最早到期的剩余额度。 |
 | 每周时段规则 | 支持“仅指定时段允许”和“指定时段禁止”，可组合多个星期并覆盖跨午夜时段。 |
 | 精确前台计时 | 仅统计 Activity 处于前台的时间，应用切到后台后暂停计时。 |
-| 到期提醒与延时 | 到期前 5 秒可显示顶部非模态圆角倒计时，或在设置中改为全屏提醒；两种样式均适配横竖屏与安全区域，可临时延长 1-60 分钟，时段禁用规则不能被延时绕过。 |
-| 退出后冷却 | 被时停强制退出后，可在 1-1440 分钟内禁止再次打开；反复尝试不会刷新冷却起点或重复统计触发。 |
-| 使用统计 | 首页和统计页按需读取 Android `UsageStatsManager`，统一计算今日时长并估算启动次数；Hook 可靠回传限制触发次数，并提示尚未重启的旧 Hook 进程。 |
+| 到期提醒与延时 | 到期前 5 秒可显示顶部非模态圆角倒计时，或在设置中改为全屏提醒；可选触发一次 1.2 秒长震动，震动由模块 Provider 安全执行，不依赖目标应用自身权限；两种样式均适配横竖屏与安全区域，可临时延长 1-60 分钟，时段禁用规则不能被延时绕过。 |
+| 语言 | 支持跟随系统、简体中文和 English，管理界面与目标应用内 Hook 提醒使用同一设置。 |
+| 退出后冷却 | 每日、单次或共享分组额度触发退出后，可在 1-1440 分钟内禁止再次打开；应用和分组同时配置时采用较长冷却时长。冷却按成员应用保存，不会锁死整组；禁止时段拒绝不会启动冷却，反复尝试也不会刷新起点或重复统计触发。 |
+| 使用统计 | 首页和统计页按需读取 Android `UsageStatsManager`，统一计算今日时长并估算启动次数；管控判定在模块进程后台刷新并复用短时快照，避免在目标应用主线程扫描整天的 `UsageEvents`；Hook 可靠回传限制触发次数，并提示尚未重启的旧 Hook 进程。 |
 | Hook 状态验证 | 管理端按应用持久保存当前版本 Hook 回传，不再因 15 分钟未运行而失效；新增管控应用和分组成员会立即提示核对 LSPosed 作用域。 |
 | 多级规则回退 | 优先通过受控 Provider 读取规则，并提供 `XSharedPreferences` 与本地缓存回退，增强不同 ROM 下的可用性。 |
 | 诊断日志 | 记录 Hook 安装、规则来源、计时开始与暂停、统计写入和限制触发，方便快速定位配置问题。 |
 | 系统安全保护 | 第三方应用到期后结束自身进程；系统应用只关闭界面，不结束系统进程，并记录开机诊断锚点。 |
-| 个性化设置 | 可选择顶部或全屏退出提醒，并控制诊断记录和默认延时时长；修改规则后会重置 Hook 本地累计，系统当日时长仍保留。 |
+| 个性化设置 | 可选择顶部或全屏退出提醒、长震动，并控制语言、诊断记录和默认延时时长；修改规则后会重置 Hook 本地累计，系统当日时长仍保留。 |
 | 隐藏桌面入口 | 可隐藏启动图标，并通过 LSPosed 模块页或 `apptimelimiter://settings` 恢复进入设置。 |
+| 功能导览与联系 | 每次打开管理应用时可左右滑动查看主要功能，勾选“不再显示”后停止提示；设置与“关于”页支持邮件或 QQ 群反馈，并提供加入内测和软件声明入口。 |
 | 更新与反馈 | 可检查 GitHub Releases、调用系统下载管理器更新，并通过邮件附带诊断日志反馈问题。 |
 
 Hook 计时仅覆盖 `Activity.onResume` 到 `Activity.onPause` 的前台阶段，切到后台会暂停。修改规则时会重置该应用的 Hook 本地累计；如果已授权系统使用统计，Android 记录的当日时长仍会参与每日限制，不能通过修改规则清零。
@@ -204,6 +220,8 @@ flowchart LR
     Prefs -->|"XSharedPreferences 兜底"| Hook
     Hook --> Lifecycle["Activity 前后台事件"]
     Lifecycle --> Timer["前台计时器"]
+    Hook --> SessionPlan["进程内本次使用计划"]
+    SessionPlan -->|"到期"| Exit
     Timer -->|"达到限制"| Exit["关闭任务栈 + 结束进程"]
     Timer --> State["目标应用本地累计状态"]
     UI -->|"打开页面时按需查询"| UsageStats["Android UsageStatsManager"]
@@ -258,19 +276,29 @@ subst T: /d
 - `RULE_READ ... source=provider`：新版规则通道工作正常。
 - `RULE_READ ... source=xsharedpreferences`：Provider 不可用，正在走旧兼容通道；这通常是系统包可见性或 ROM 限制。
 - `TIMER_START`：前台计时已开始，日志会显示剩余秒数。
+- `SESSION_PLAN_PROMPT/STARTED/REPLANNED/SKIPPED/EXPIRED`：本次使用计划从询问、开始、重新制定到跳过或到期的完整链路。
+- `SESSION_PLAN_WAITING_USAGE`、`SESSION_PLAN_REJECTED_OVER_QUOTA` 与 `SESSION_PLAN_UNAVAILABLE`：等待权威用量、超过剩余额度被拒绝，或因规则变化、额度耗尽而不可制定计划的链路。
 - `LIMIT_REACHED`：限制已达到，代码已发出关闭任务栈和结束进程操作。
 
 如果应用内日志完全没有 `HOOK_READY`，还可以在 LSPosed 日志中搜索 `AppTimeLimiter: HOOK_INSTALLED` 或 `HOOK_FAILED`。
+
+`HOOK_INSTALLED` 与 `HOOK_READY` 会记录目标进程位数和 ABI。若只有少数应用完全没有这两类日志，应先检查它们是否被 Magisk 排除列表或 Zygisk 配置排除。模块同时保留常规 Instrumentation 生命周期入口和面向旧版、加固应用的 Activity 生命周期兜底。
 
 传统入口与生命周期 Hook 使用 [Xposed Framework API](https://api.xposed.info/reference/de/robv/android/xposed/IXposedHookLoadPackage.html)。LSPosed 的新项目可进一步迁移到 [Modern Xposed API](https://github.com/LSPosed/LSPosed/wiki/Develop-Xposed-Modules-Using-Modern-Xposed-API)，以 Remote Preferences 替代当前兼容层。
 
 ## 已知限制
 
-- Android 15 兼容路径使用 `Instrumentation.callActivityOnResume/Pause`，并覆盖目标包的所有进程；日志会显示实际承载界面的进程名。
+- 本次使用计划只保存在目标进程内：每个目标进程首次打开时询问一次，应用内页面切换或短暂切后台不会重复询问，进程结束后自动清除。
+- 计划只计算 Activity 处于 Resume 的前台时间；切后台和息屏会暂停，不提供后台媒体播放或真实时间睡眠定时能力。
+- 计划到期不增加限制触发次数，也不启动冷却；系统应用到期时只关闭界面。
+- 本次计划只能在现有自由额度内制定；所选时长超过应用或分组中最早到期的剩余额度时会被拒绝并提示选择更短时长。额度已耗尽、处于冷却或禁止时段时也不能通过计划绕过。
+
+- 生命周期计时使用 `Instrumentation.callActivityOnResume/Pause` 主入口和去重后的 `Activity.onResume/onPause` 兜底，并覆盖目标包的各进程；日志会显示实际承载界面的进程名与位数。
 - 安装或升级模块后，已经运行的目标应用仍保留旧版 Hook；必须强制停止目标应用再打开。统计页会提示未收到当前版本 Hook 回传。
 - 画中画、分屏状态下，只要 Activity 保持 Resume 就会继续计时。
 - 同一分组的多个应用在分屏中同时 Resume 时，目标进程每 15 秒同步一次分组增量；共享额度可能有不超过一个同步周期的并发误差。
 - 分组成员仍需由用户手动加入 LSPosed 作用域；未 Hook 的成员会被系统统计计入共享额度，但自身无法执行强制退出。
+
 - 每日累计的本地兜底状态保存在目标应用数据区；清除目标应用数据后，如已授予“使用情况访问权限”，系统当日时长仍会重新参与限制判定。
 - 目标应用或系统崩溃时，最后一个尚未触发 `onPause` 的短时间片可能没有持久化。
 - 应用列表只查询带 Launcher 入口的软件；没有桌面入口的包暂不显示，需要在后续版本增加手动包名配置。
@@ -278,3 +306,7 @@ subst T: /d
 - 未连接真实 Root/LSPosed 设备时，只能完成编译、单元测试和 APK 结构校验，不能验证不同 ROM 的 Hook 行为。
 
 本工具应仅用于设备所有者本人或已明确授权的受管设备，不应隐蔽安装或用于未经同意的监控。
+
+## 软件许可与版权
+
+本仓库没有授予通用开源许可。个人用户可以从作者认可的官方发布渠道下载、安装并非商业使用未经修改的官方版本；未经书面授权，不得抄袭、改名冒充、重新打包、收费分发、倒卖或用于其他商业产品。完整条款见 [LICENSE](LICENSE)，第三方组件仍分别遵循其原有许可证。

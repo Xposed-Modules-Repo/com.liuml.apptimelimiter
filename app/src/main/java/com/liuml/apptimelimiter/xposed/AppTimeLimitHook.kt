@@ -4,22 +4,33 @@ import android.app.Activity
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.os.Bundle
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.widget.Toast
 import com.liuml.apptimelimiter.BuildConfig
 import com.liuml.apptimelimiter.core.CooldownPolicy
+import com.liuml.apptimelimiter.core.GroupRulePolicy
 import com.liuml.apptimelimiter.core.UsageMath
 import com.liuml.apptimelimiter.core.ProcessTerminationPolicy
 import com.liuml.apptimelimiter.core.ScheduleDecision
+import com.liuml.apptimelimiter.core.ScheduleBlockPolicy
+import com.liuml.apptimelimiter.core.ScheduleConstraint
 import com.liuml.apptimelimiter.core.ScheduleEvaluator
+import com.liuml.apptimelimiter.core.SessionPlanPolicy
 import com.liuml.apptimelimiter.data.RuleRepository
+import com.liuml.apptimelimiter.data.AppLanguageMode
 import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.data.ScheduleMode
 import com.liuml.apptimelimiter.data.ScheduleWindow
 import com.liuml.apptimelimiter.ipc.RuleContract
+import com.liuml.apptimelimiter.localization.AppLocaleController
+import com.liuml.apptimelimiter.localization.SupportedLanguage
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XSharedPreferences
@@ -43,7 +54,9 @@ class AppTimeLimitHook : IXposedHookLoadPackage {
         val preferences = XSharedPreferences(MODULE_PACKAGE, RuleRepository.PREFS_NAME)
         preferences.makeWorldReadable()
         val limiter = RuntimeLimiter(lpparam.packageName, lpparam.processName, preferences)
-        try {
+        val installedEntries = mutableListOf<String>()
+        val installErrors = mutableListOf<String>()
+        runCatching {
             XposedHelpers.findAndHookMethod(
                 "android.app.Instrumentation",
                 null,
@@ -66,14 +79,56 @@ class AppTimeLimitHook : IXposedHookLoadPackage {
                     }
                 },
             )
+            installedEntries += "Instrumentation"
+        }.onFailure { error ->
+            installErrors += "Instrumentation:${error.javaClass.simpleName}"
             XposedBridge.log(
-                "AppTimeLimiter: HOOK_INSTALLED package=${lpparam.packageName} process=${lpparam.processName} version=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE}) entry=Instrumentation",
-            )
-        } catch (error: Throwable) {
-            XposedBridge.log(
-                "AppTimeLimiter: HOOK_FAILED package=${lpparam.packageName} process=${lpparam.processName}",
+                "AppTimeLimiter: HOOK_ENTRY_FAILED package=${lpparam.packageName} process=${lpparam.processName} entry=Instrumentation",
             )
             XposedBridge.log(error)
+        }
+        runCatching {
+            // Some protected or legacy apps replace Instrumentation and do not dispatch through
+            // the base callActivityOnResume/Pause methods. Activity methods are a stable fallback;
+            // callbacks are posted so the Instrumentation path wins normally and RuntimeLimiter
+            // can deduplicate the second delivery without changing foreground accounting.
+            XposedHelpers.findAndHookMethod(
+                "android.app.Activity",
+                null,
+                "onResume",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        (param.thisObject as? Activity)?.let(limiter::onActivityResumedFallback)
+                    }
+                },
+            )
+            XposedHelpers.findAndHookMethod(
+                "android.app.Activity",
+                null,
+                "onPause",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        (param.thisObject as? Activity)?.let(limiter::onActivityPausedFallback)
+                    }
+                },
+            )
+            installedEntries += "ActivityFallback"
+        }.onFailure { error ->
+            installErrors += "ActivityFallback:${error.javaClass.simpleName}"
+            XposedBridge.log(
+                "AppTimeLimiter: HOOK_ENTRY_FAILED package=${lpparam.packageName} process=${lpparam.processName} entry=ActivityFallback",
+            )
+            XposedBridge.log(error)
+        }
+        val processBits = if (Process.is64Bit()) 64 else 32
+        if (installedEntries.isNotEmpty()) {
+            XposedBridge.log(
+                "AppTimeLimiter: HOOK_INSTALLED package=${lpparam.packageName} process=${lpparam.processName} bits=$processBits abi=${Build.SUPPORTED_ABIS.firstOrNull().orEmpty()} version=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE}) entries=${installedEntries.joinToString("+")} errors=${installErrors.joinToString(",").ifBlank { "none" }}",
+            )
+        } else {
+            XposedBridge.log(
+                "AppTimeLimiter: HOOK_FAILED package=${lpparam.packageName} process=${lpparam.processName} bits=$processBits errors=${installErrors.joinToString(",")}",
+            )
         }
     }
 
@@ -93,6 +148,7 @@ private class RuntimeLimiter(
     private var foregroundDayToken = -1
     private var perLaunchCommittedMs = 0L
     private var loadedRuleVersion = Long.MIN_VALUE
+    private var loadedGroupVersion = Long.MIN_VALUE
     private var exitScheduled = false
     private var hookReadyLogged = false
     private var lastRuleSummary = ""
@@ -114,6 +170,15 @@ private class RuntimeLimiter(
     private var groupSegmentIdentity = ""
     private var loadedGroupIdentity = ""
     private var lastLoadedRule: HookRule? = null
+    private var sessionPlanPromptHandled = false
+    private var sessionPlanRemainingMs = NOT_RUNNING
+    private var sessionPlanForegroundStartedAt = NOT_RUNNING
+    private var sessionPlanWarningShown = false
+    private var sessionPlanWarningVibrated = false
+    private var sessionPlanDialog: SessionPlanDialog? = null
+    private var activeSessionPlanDialogMode: SessionPlanDialogMode? = null
+    private var pendingSessionPlanDialog: SessionPlanDialogMode? = null
+    private var sessionPlanWaitingForUsage = false
 
     private val deadline = Runnable { checkDeadline() }
     private val warningDeadline = Runnable { showExitWarning() }
@@ -124,36 +189,49 @@ private class RuntimeLimiter(
     private val statsRetry = Runnable {
         statsContext?.let(::flushUsageEvents)
     }
+    private val sessionPlanDeadline = Runnable { checkSessionPlanDeadline() }
+    private val sessionPlanWarningDeadline = Runnable { showSessionPlanWarning() }
+
+    fun onActivityResumedFallback(activity: Activity) {
+        mainHandler.post { onActivityResumed(activity) }
+    }
+
+    fun onActivityPausedFallback(activity: Activity) {
+        mainHandler.post { onActivityPaused(activity) }
+    }
 
     fun onActivityResumed(activity: Activity) {
         if (exitScheduled) return
+        if (activeActivity.get() === activity) return
         val rule = readRule(activity, reloadFallback = true)
         if (!hookReadyLogged) {
             hookReadyLogged = true
             diagnostic(
                 activity,
                 event = "HOOK_READY",
-                message = "Instrumentation Hook 已运行；version=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE})；process=$processName；规则来源=${rule.source}",
+                message = "生命周期 Hook 已运行；version=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE})；process=$processName；bits=${if (Process.is64Bit()) 64 else 32}；abi=${Build.SUPPORTED_ABIS.firstOrNull().orEmpty()}；规则来源=${rule.source}",
             )
         }
 
-        val ruleSummary = "${rule.enabled}/${rule.dailyEnabled}/${rule.dailyLimitMillis}/${rule.systemTodayUsedMillis}/${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis}/${rule.groupEnabled}/${rule.groupId}/${rule.groupDailyLimitMillis}/${rule.groupTodayUsedMillis}/${rule.groupVersion}/${rule.scheduleEnabled}/${rule.scheduleMode}/${ScheduleCodec.encode(rule.scheduleWindows)}/${rule.cooldownEnabled}/${rule.cooldownMillis}/${rule.version}/${rule.exitWarningEnabled}/${rule.fullScreenExitWarningEnabled}/${rule.extensionMillis}/${rule.diagnosticsEnabled}/${rule.source}"
+        val ruleSummary = "${rule.enabled}/${rule.sessionPlanningEnabled}/${rule.dailyEnabled}/${rule.dailyLimitMillis}/${rule.systemTodayUsedMillis}/${rule.systemUsageMeasuredAtElapsedMillis}/${rule.systemUsagePending}/${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis}/${rule.groupEnabled}/${rule.groupId}/${rule.groupDailyEnabled}/${rule.groupDailyLimitMillis}/${rule.groupTodayUsedMillis}/${rule.groupPerLaunchEnabled}/${rule.groupPerLaunchLimitMillis}/${rule.groupScheduleEnabled}/${rule.groupScheduleMode}/${ScheduleCodec.encode(rule.groupScheduleWindows)}/${rule.groupCooldownEnabled}/${rule.groupCooldownMillis}/${rule.groupVersion}/${rule.scheduleEnabled}/${rule.scheduleMode}/${ScheduleCodec.encode(rule.scheduleWindows)}/${rule.cooldownEnabled}/${rule.cooldownMillis}/${rule.version}/${rule.exitWarningEnabled}/${rule.fullScreenExitWarningEnabled}/${rule.exitWarningVibrationEnabled}/${rule.languageMode}/${rule.extensionMillis}/${rule.diagnosticsEnabled}/${rule.source}"
         if (lastRuleSummary != ruleSummary) {
             lastRuleSummary = ruleSummary
             diagnostic(
                 activity,
                 event = "RULE_READ",
-                message = "enabled=${rule.enabled}, daily=${rule.dailyEnabled}/${rule.dailyLimitMillis / 1000}s, systemToday=${rule.systemTodayUsedMillis / 1000.0}s, perLaunch=${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis / 1000}s, group=${rule.groupEnabled}/${rule.groupName}/${rule.groupTodayUsedMillis / 1000.0}s/${rule.groupDailyLimitMillis / 1000}s, schedule=${rule.scheduleEnabled}/${rule.scheduleMode}/${rule.scheduleWindows.size}, cooldown=${rule.cooldownEnabled}/${rule.cooldownMillis / 1000}s, warning=${rule.exitWarningEnabled}/${rule.fullScreenExitWarningEnabled}, extension=${rule.extensionMillis / 1000}s, source=${rule.source}",
+                message = "enabled=${rule.enabled}, sessionPlanning=${rule.sessionPlanningEnabled}, daily=${rule.dailyEnabled}/${rule.dailyLimitMillis / 1000}s, systemToday=${rule.systemTodayUsedMillis / 1000.0}s/pending=${rule.systemUsagePending}, perLaunch=${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis / 1000}s, group=${rule.groupEnabled}/${rule.groupName}/daily=${rule.groupDailyEnabled}/${rule.groupTodayUsedMillis / 1000.0}s/${rule.groupDailyLimitMillis / 1000}s/perLaunch=${rule.groupPerLaunchEnabled}/${rule.groupPerLaunchLimitMillis / 1000}s/schedule=${rule.groupScheduleEnabled}/${rule.groupScheduleMode}/${rule.groupScheduleWindows.size}/cooldown=${rule.groupCooldownEnabled}/${rule.groupCooldownMillis / 1000}s, schedule=${rule.scheduleEnabled}/${rule.scheduleMode}/${rule.scheduleWindows.size}, cooldown=${rule.cooldownEnabled}/${rule.cooldownMillis / 1000}s, warning=${rule.exitWarningEnabled}/${rule.fullScreenExitWarningEnabled}/${rule.exitWarningVibrationEnabled}, language=${rule.languageMode}, extension=${rule.extensionMillis / 1000}s, source=${rule.source}",
             )
         }
 
-        if (!rule.enabled) {
+        if (!rule.enabled && !rule.sessionPlanningEnabled) {
+            cancelSessionPlan(dismissDialog = true, resetPrompt = true)
             stopTiming()
             return
         }
 
-        if (loadedRuleVersion != rule.version) {
+        if (loadedRuleVersion != rule.version || loadedGroupVersion != rule.groupVersion) {
             loadedRuleVersion = rule.version
+            loadedGroupVersion = rule.groupVersion
             perLaunchCommittedMs = 0L
             grantedExtensionMs = 0L
             warningShownForExtensionMs = Long.MIN_VALUE
@@ -171,39 +249,58 @@ private class RuntimeLimiter(
             sessionLaunchReported = true
         }
 
-        val cooldownRemainingMillis = cooldownRemainingMillis(activity, rule)
-        if (cooldownRemainingMillis > 0L) {
-            forceCooldownExit(activity, rule, cooldownRemainingMillis, launchStatsPersisted)
-            return
-        }
+        if (rule.enabled) {
+            if (rule.hasSchedule()) {
+                val scheduleDecision = evaluateSchedule(rule)
+                if (!scheduleDecision.allowed) {
+                    forceScheduleExit(activity, rule, scheduleDecision, openedDuringBlockedTime = true)
+                    return
+                }
+            }
 
-        if (rule.scheduleEnabled) {
-            val scheduleDecision = evaluateSchedule(rule)
-            if (!scheduleDecision.allowed) {
-                forceScheduleExit(activity, rule, scheduleDecision, openedDuringBlockedTime = true)
+            val cooldownRemainingMillis = cooldownRemainingMillis(activity, rule)
+            if (cooldownRemainingMillis > 0L) {
+                forceCooldownExit(activity, rule, cooldownRemainingMillis, launchStatsPersisted)
                 return
             }
         }
 
-        if (rule.dailyEnabled) syncSystemDailyBaseline(activity, rule)
-
         activeActivity = WeakReference(activity)
-        val startedNow = foregroundStartedAt == NOT_RUNNING
+        if (!rule.enabled) {
+            stopTimingCallbacks()
+            dismissWarning(resetForCurrentLimit = true)
+            dismissScheduleWarning()
+            groupSegmentIdentity = ""
+            groupSegmentBaselineDay = ""
+            groupSegmentBaselineUsedMs = 0L
+        }
+        val startedNow = rule.enabled && foregroundStartedAt == NOT_RUNNING
         if (startedNow) {
             foregroundStartedAt = SystemClock.elapsedRealtime()
             foregroundDayToken = dayToken()
         }
-        if (startedNow || groupSegmentIdentity != rule.groupIdentity()) {
-            updateGroupSegmentBaseline(rule)
+        val remainingMs = if (rule.enabled) {
+            if (rule.dailyEnabled) syncSystemDailyBaseline(activity, rule)
+            if (startedNow || groupSegmentIdentity != rule.groupIdentity()) {
+                updateGroupSegmentBaseline(rule)
+            }
+            if (rule.hasTimedQuota()) {
+                scheduleDeadline(activity, rule)
+            } else {
+                null
+            }
+        } else {
+            foregroundStartedAt = NOT_RUNNING
+            foregroundDayToken = -1
+            null
         }
-        val remainingMs = if (rule.dailyEnabled || rule.perLaunchEnabled || rule.groupEnabled) {
-            scheduleDeadline(activity, rule)
+        val scheduleRemainingMs = if (rule.enabled && !exitScheduled) {
+            scheduleScheduleBoundary(activity, rule)
         } else {
             null
         }
-        val scheduleRemainingMs = if (!exitScheduled) scheduleScheduleBoundary(activity, rule) else null
-        if (!exitScheduled) scheduleMidnightRollover(rule)
-        if (!exitScheduled) scheduleGroupUsageSync(rule)
+        if (rule.enabled && !exitScheduled) scheduleMidnightRollover(rule)
+        if (rule.enabled && !exitScheduled) scheduleGroupUsageSync(rule)
         if (startedNow && !exitScheduled) {
             diagnostic(
                 activity,
@@ -215,13 +312,15 @@ private class RuntimeLimiter(
                 },
             )
         }
+        if (!exitScheduled) resumeSessionPlan(activity, rule)
     }
 
     fun onActivityPaused(activity: Activity) {
-        if (activeActivity.get() !== activity || foregroundStartedAt == NOT_RUNNING) return
+        if (activeActivity.get() !== activity) return
+        pauseSessionPlan(activity)
         val rule = readRule(activity, reloadFallback = true)
-        val segmentMs = activeSegmentMillis()
-        commitActiveSegment(activity, rule)
+        val segmentMs = if (foregroundStartedAt == NOT_RUNNING) 0L else activeSegmentMillis()
+        if (foregroundStartedAt != NOT_RUNNING) commitActiveSegment(activity, rule)
         activeActivity.clear()
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
@@ -241,6 +340,458 @@ private class RuntimeLimiter(
         }
     }
 
+    private fun resumeSessionPlan(activity: Activity, rule: HookRule) {
+        if (!rule.sessionPlanningEnabled) {
+            cancelSessionPlan(dismissDialog = true, resetPrompt = true)
+            return
+        }
+        val pendingMode = pendingSessionPlanDialog
+        if (pendingMode != null) {
+            showSessionPlanPrompt(activity, rule, pendingMode)
+            return
+        }
+        if (sessionPlanRemainingMs != NOT_RUNNING) {
+            if (sessionPlanRemainingMillis() <= 0L) {
+                expireSessionPlan(activity, rule)
+                return
+            }
+            sessionPlanForegroundStartedAt = SystemClock.elapsedRealtime()
+            scheduleSessionPlan(activity, rule)
+            return
+        }
+        if (
+            !sessionPlanPromptHandled &&
+            rule.systemUsagePending &&
+            (rule.dailyEnabled || rule.groupDailyEnabled)
+        ) {
+            if (!sessionPlanWaitingForUsage) {
+                sessionPlanWaitingForUsage = true
+                diagnostic(
+                    activity,
+                    event = "SESSION_PLAN_WAITING_USAGE",
+                    message = "等待系统用量快照完成后再判断是否可制定计划",
+                )
+            }
+            return
+        }
+        sessionPlanWaitingForUsage = false
+        if (!sessionPlanPromptHandled) {
+            sessionPlanPromptHandled = true
+            showSessionPlanPrompt(activity, rule, SessionPlanDialogMode.INITIAL)
+        }
+    }
+
+    private fun pauseSessionPlan(activity: Activity) {
+        if (sessionPlanDialog?.isShowing == true) {
+            pendingSessionPlanDialog = activeSessionPlanDialogMode
+            sessionPlanDialog?.dismiss()
+            sessionPlanDialog = null
+            activeSessionPlanDialogMode = null
+        }
+        if (sessionPlanRemainingMs == NOT_RUNNING || sessionPlanForegroundStartedAt == NOT_RUNNING) {
+            return
+        }
+        sessionPlanRemainingMs = sessionPlanRemainingMillis()
+        sessionPlanForegroundStartedAt = NOT_RUNNING
+        mainHandler.removeCallbacks(sessionPlanDeadline)
+        mainHandler.removeCallbacks(sessionPlanWarningDeadline)
+        dismissSessionPlanWarning()
+        diagnostic(
+            activity,
+            event = "SESSION_PLAN_PAUSED",
+            message = "进入后台，计划暂停；remaining=${sessionPlanRemainingMs / 1000.0}s",
+        )
+    }
+
+    private fun showSessionPlanPrompt(
+        activity: Activity,
+        rule: HookRule,
+        mode: SessionPlanDialogMode,
+    ) {
+        if (exitScheduled || sessionPlanDialog?.isShowing == true) return
+        pendingSessionPlanDialog = null
+        activeSessionPlanDialogMode = mode
+        diagnostic(
+            activity,
+            event = "SESSION_PLAN_PROMPT",
+            message = "mode=$mode",
+        )
+        sessionPlanDialog = SessionPlanDialog.show(
+            activity = activity,
+            mode = mode,
+            english = isEnglish(activity, rule),
+            includeDebugChoice = BuildConfig.DEBUG,
+            onStart = { durationMillis ->
+                sessionPlanDialog = null
+                activeSessionPlanDialogMode = null
+                requestSessionPlan(activity, durationMillis, mode)
+            },
+            onWithoutPlan = {
+                sessionPlanDialog = null
+                activeSessionPlanDialogMode = null
+                cancelSessionPlan(dismissDialog = false)
+                resumePermanentQuotaEnforcement(activity)
+                diagnostic(
+                    activity,
+                    event = "SESSION_PLAN_SKIPPED",
+                    message = if (mode == SessionPlanDialogMode.REPLAN) "用户取消本次计划" else "用户选择本次不计划",
+                )
+            },
+        )
+        if (sessionPlanDialog == null) {
+            activeSessionPlanDialogMode = null
+            pendingSessionPlanDialog = mode
+            if (mode == SessionPlanDialogMode.REPLAN && sessionPlanRemainingMs != NOT_RUNNING) {
+                sessionPlanForegroundStartedAt = SystemClock.elapsedRealtime()
+                scheduleSessionPlan(activity, rule)
+            }
+            diagnostic(
+                activity,
+                level = "ERROR",
+                event = "SESSION_PLAN_PROMPT_FAILED",
+                message = "无法显示计划弹窗；mode=$mode",
+            )
+        }
+    }
+
+    private fun requestSessionPlan(
+        activity: Activity,
+        requestedDurationMillis: Long,
+        mode: SessionPlanDialogMode,
+    ) {
+        val durationMillis = SessionPlanPolicy.selectedDurationMillis(
+            requestedDurationMillis = requestedDurationMillis,
+            allowDebugShortChoice = BuildConfig.DEBUG,
+        ) ?: return
+        val rule = readRule(activity, reloadFallback = true)
+        if (!rule.sessionPlanningEnabled || exitScheduled) {
+            cancelSessionPlan(dismissDialog = true)
+            return
+        }
+        val quotaStatus = thresholdStatus(activity, rule)
+        val quotaRemainingMillis = quotaStatus.remainingMillis.takeIf { quotaStatus.hasThreshold }
+        if (!SessionPlanPolicy.canOfferPlan(quotaRemainingMillis)) {
+            diagnostic(
+                activity,
+                event = "SESSION_PLAN_UNAVAILABLE",
+                message = "额度已经耗尽，不提供本次计划；reached=${quotaStatus.reachedLabels}",
+            )
+            forceExit(activity, rule, quotaStatus)
+            return
+        }
+        if (
+            quotaRemainingMillis != null &&
+            !SessionPlanPolicy.fitsWithinQuota(durationMillis, quotaRemainingMillis)
+        ) {
+            val remainingText = formatDuration(activity, rule, quotaRemainingMillis)
+            diagnostic(
+                activity,
+                event = "SESSION_PLAN_REJECTED_OVER_QUOTA",
+                message = "rule=${quotaStatus.nextThresholdLabel}, remaining=${quotaRemainingMillis / 1000.0}s, requested=${durationMillis / 1000.0}s",
+            )
+            Toast.makeText(
+                activity,
+                hookText(
+                    activity,
+                    rule,
+                    "${quotaStatus.nextThresholdLabel}仅剩 $remainingText，请选择更短的计划",
+                    "${quotaStatus.nextThresholdLabel} has $remainingText left. Choose a shorter plan.",
+                ),
+                Toast.LENGTH_LONG,
+            ).show()
+            pendingSessionPlanDialog = mode
+            mainHandler.post {
+                if (!activity.isFinishing && !activity.isDestroyed && !exitScheduled) {
+                    showSessionPlanPrompt(
+                        activity,
+                        readRule(activity, reloadFallback = true),
+                        mode,
+                    )
+                }
+            }
+            return
+        }
+        startSessionPlan(
+            activity = activity,
+            durationMillis = durationMillis,
+            replanned = mode == SessionPlanDialogMode.REPLAN,
+            rule = rule,
+        )
+    }
+
+    private fun startSessionPlan(
+        activity: Activity,
+        durationMillis: Long,
+        replanned: Boolean,
+        rule: HookRule,
+    ): Boolean {
+        sessionPlanRemainingMs = durationMillis
+        sessionPlanForegroundStartedAt = SystemClock.elapsedRealtime()
+        sessionPlanWarningShown = false
+        sessionPlanWarningVibrated = false
+        pendingSessionPlanDialog = null
+        if (!rule.sessionPlanningEnabled || exitScheduled) {
+            cancelSessionPlan(dismissDialog = true)
+            return false
+        }
+        resumePermanentQuotaEnforcement(activity)
+        scheduleSessionPlan(activity, rule)
+        diagnostic(
+            activity,
+            event = if (replanned) "SESSION_PLAN_REPLANNED" else "SESSION_PLAN_STARTED",
+            message = "duration=${durationMillis / 1000.0}s",
+        )
+        return true
+    }
+
+    private fun beginSessionReplan(activity: Activity, rule: HookRule) {
+        if (sessionPlanRemainingMs == NOT_RUNNING || exitScheduled) return
+        if (sessionPlanForegroundStartedAt != NOT_RUNNING) {
+            sessionPlanRemainingMs = sessionPlanRemainingMillis()
+            sessionPlanForegroundStartedAt = NOT_RUNNING
+        }
+        mainHandler.removeCallbacks(sessionPlanDeadline)
+        mainHandler.removeCallbacks(sessionPlanWarningDeadline)
+        dismissSessionPlanWarning()
+        showSessionPlanPrompt(activity, rule, SessionPlanDialogMode.REPLAN)
+    }
+
+    private fun cancelSessionPlan(dismissDialog: Boolean, resetPrompt: Boolean = false) {
+        sessionPlanRemainingMs = NOT_RUNNING
+        sessionPlanForegroundStartedAt = NOT_RUNNING
+        sessionPlanWarningShown = false
+        sessionPlanWarningVibrated = false
+        pendingSessionPlanDialog = null
+        sessionPlanWaitingForUsage = false
+        mainHandler.removeCallbacks(sessionPlanDeadline)
+        mainHandler.removeCallbacks(sessionPlanWarningDeadline)
+        dismissSessionPlanWarning()
+        if (dismissDialog) {
+            sessionPlanDialog?.dismiss()
+            sessionPlanDialog = null
+            activeSessionPlanDialogMode = null
+        }
+        if (resetPrompt) sessionPlanPromptHandled = false
+    }
+
+    private fun resumePermanentQuotaEnforcement(activity: Activity) {
+        val rule = readRule(activity, reloadFallback = true)
+        if (
+            !exitScheduled &&
+            rule.enabled &&
+            foregroundStartedAt != NOT_RUNNING &&
+            rule.hasTimedQuota()
+        ) {
+            scheduleDeadline(activity, rule)
+        }
+    }
+
+    private fun sessionPlanRemainingMillis(): Long {
+        if (sessionPlanRemainingMs == NOT_RUNNING) return NOT_RUNNING
+        return SessionPlanPolicy.remainingMillis(
+            committedRemainingMillis = sessionPlanRemainingMs,
+            foregroundStartedAtElapsedMillis = sessionPlanForegroundStartedAt
+                .takeUnless { it == NOT_RUNNING },
+            nowElapsedMillis = SystemClock.elapsedRealtime(),
+        )
+    }
+
+    private fun scheduleSessionPlan(activity: Activity, rule: HookRule) {
+        mainHandler.removeCallbacks(sessionPlanDeadline)
+        mainHandler.removeCallbacks(sessionPlanWarningDeadline)
+        if (
+            exitScheduled ||
+            sessionPlanRemainingMs == NOT_RUNNING ||
+            sessionPlanForegroundStartedAt == NOT_RUNNING
+        ) return
+        val remainingMs = sessionPlanRemainingMillis()
+        if (remainingMs <= 0L) {
+            mainHandler.post(sessionPlanDeadline)
+            return
+        }
+        mainHandler.postDelayed(sessionPlanDeadline, remainingMs.coerceAtLeast(1L))
+        if (
+            rule.exitWarningEnabled &&
+            SessionPlanPolicy.isEarliest(remainingMs, earliestPermanentRemainingMillis(activity, rule))
+        ) {
+            mainHandler.postDelayed(
+                sessionPlanWarningDeadline,
+                UsageMath.warningDelayMillis(remainingMs, SessionPlanPolicy.WARNING_LEAD_MILLIS),
+            )
+        }
+    }
+
+    private fun checkSessionPlanDeadline() {
+        val activity = activeActivity.get() ?: return
+        if (activity.isFinishing || activity.isDestroyed || exitScheduled) return
+        if (sessionPlanRemainingMs == NOT_RUNNING || sessionPlanForegroundStartedAt == NOT_RUNNING) return
+        val remainingMs = sessionPlanRemainingMillis()
+        if (remainingMs > 0L) {
+            scheduleSessionPlan(activity, readRule(activity, reloadFallback = true))
+            return
+        }
+        val rule = readRule(activity, reloadFallback = true)
+        if (rule.enabled && rule.hasSchedule()) {
+            val decision = evaluateSchedule(rule)
+            if (!decision.allowed) {
+                forceScheduleExit(activity, rule, decision, openedDuringBlockedTime = false)
+                return
+            }
+        }
+        if (rule.enabled && rule.hasTimedQuota()) {
+            val status = thresholdStatus(activity, rule)
+            if (status.reached) {
+                forceExit(activity, rule, status)
+                return
+            }
+        }
+        expireSessionPlan(activity, rule)
+    }
+
+    private fun expireSessionPlan(activity: Activity, rule: HookRule) {
+        if (exitScheduled) return
+        exitScheduled = true
+        if (foregroundStartedAt != NOT_RUNNING) commitActiveSegment(activity, rule)
+        cancelSessionPlan(dismissDialog = true)
+        stopTimingCallbacks()
+        dismissWarning(resetForCurrentLimit = false)
+        dismissScheduleWarning()
+        diagnostic(
+            activity,
+            level = "WARN",
+            event = "SESSION_PLAN_EXPIRED",
+            message = "本次计划到期，退出应用；不计限制触发且不启动冷却；pid=${Process.myPid()}",
+        )
+        finishTarget(
+            activity,
+            hookText(activity, rule, "本次计划时间已结束", "This session plan has ended"),
+            statsPersisted = true,
+        )
+    }
+
+    private fun earliestPermanentRemainingMillis(activity: Activity, rule: HookRule): Long? {
+        if (!rule.enabled) return null
+        val candidates = mutableListOf<Long>()
+        if (rule.hasTimedQuota()) {
+            candidates += thresholdStatus(activity, rule).remainingMillis
+        }
+        if (rule.hasSchedule()) {
+            val decision = evaluateSchedule(rule)
+            candidates += if (decision.allowed) {
+                decision.millisUntilTransition(ZonedDateTime.now()) ?: Long.MAX_VALUE
+            } else {
+                0L
+            }
+        }
+        return candidates.minOrNull()
+    }
+
+    private fun showSessionPlanWarning() {
+        val activity = activeActivity.get() ?: return
+        if (activity.isFinishing || activity.isDestroyed || exitScheduled) return
+        if (isBannerShowing(WarningBannerKind.SCHEDULE)) return
+        val rule = readRule(activity, reloadFallback = true)
+        if (!rule.sessionPlanningEnabled || !rule.exitWarningEnabled) return
+        val remainingMs = sessionPlanRemainingMillis()
+        if (remainingMs == NOT_RUNNING) return
+        if (remainingMs <= 0L) {
+            checkSessionPlanDeadline()
+            return
+        }
+        if (!SessionPlanPolicy.isEarliest(remainingMs, earliestPermanentRemainingMillis(activity, rule))) {
+            scheduleSessionPlan(activity, rule)
+            return
+        }
+        if (remainingMs > SessionPlanPolicy.WARNING_LEAD_MILLIS) {
+            scheduleSessionPlan(activity, rule)
+            return
+        }
+        if (sessionPlanWarningShown || isBannerShowing(WarningBannerKind.SESSION_PLAN)) return
+        dismissWarning(resetForCurrentLimit = false)
+        sessionPlanWarningShown = true
+        runCatching {
+            warningBanner = TopWarningBanner.attach(
+                activity = activity,
+                kind = WarningBannerKind.SESSION_PLAN,
+                title = hookText(
+                    activity,
+                    rule,
+                    "本次计划时间即将结束",
+                    "This session plan is ending soon",
+                ),
+                message = sessionPlanWarningMessage(activity, rule, remainingMs),
+                remainingMillis = remainingMs,
+                maxProgressMillis = SessionPlanPolicy.WARNING_LEAD_MILLIS,
+                fullScreen = rule.fullScreenExitWarningEnabled,
+                actionLabel = hookText(activity, rule, "重新计划", "Replan"),
+                onAction = {
+                    if (!activity.isFinishing && !activity.isDestroyed && !exitScheduled) {
+                        beginSessionReplan(activity, rule)
+                    }
+                },
+            )
+            if (!sessionPlanWarningVibrated) {
+                sessionPlanWarningVibrated = true
+                vibrateExitWarning(activity, rule)
+            }
+            startSessionPlanWarningCountdown(activity, rule)
+        }.onFailure {
+            sessionPlanWarningShown = false
+            dismissSessionPlanWarning()
+            diagnostic(activity, level = "ERROR", event = "SESSION_PLAN_WARNING_FAILED", message = it.toString())
+        }
+    }
+
+    private fun startSessionPlanWarningCountdown(activity: Activity, rule: HookRule) {
+        val countdown = object : Runnable {
+            override fun run() {
+                val banner = warningBanner
+                    ?.takeIf { it.kind == WarningBannerKind.SESSION_PLAN && it.isAttached }
+                    ?: return
+                if (exitScheduled) return
+                val remainingMs = sessionPlanRemainingMillis()
+                if (remainingMs <= 0L) {
+                    checkSessionPlanDeadline()
+                    return
+                }
+                banner.update(
+                    title = hookText(
+                        activity,
+                        rule,
+                        "本次计划时间即将结束",
+                        "This session plan is ending soon",
+                    ),
+                    message = sessionPlanWarningMessage(activity, rule, remainingMs),
+                    remainingMillis = remainingMs,
+                )
+                mainHandler.postDelayed(this, COUNTDOWN_REFRESH_MS)
+            }
+        }
+        warningCountdown?.let(mainHandler::removeCallbacks)
+        warningCountdown = countdown
+        mainHandler.post(countdown)
+    }
+
+    private fun sessionPlanWarningMessage(context: Context, rule: HookRule, remainingMs: Long): String {
+        val seconds = ((remainingMs + 999L) / 1_000L).coerceAtLeast(0L)
+        return hookText(
+            context,
+            rule,
+            "$seconds 秒后退出 · 可重新制定本次计划",
+            "Exit in $seconds sec · you can replan this session",
+        )
+    }
+
+    private fun dismissSessionPlanWarning() {
+        if (warningBanner?.kind == WarningBannerKind.SESSION_PLAN) {
+            warningBanner?.remove()
+            warningBanner = null
+            warningCountdown?.let(mainHandler::removeCallbacks)
+            warningCountdown = null
+        }
+        sessionPlanWarningShown = false
+    }
+
     private fun scheduleDeadline(activity: Activity, rule: HookRule): Long {
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
@@ -249,7 +800,12 @@ private class RuntimeLimiter(
         if (status.reached) {
             forceExit(activity, rule, status)
         } else {
-            mainHandler.postDelayed(deadline, minOf(remainingMs, RULE_RECHECK_MAX_MS))
+            val recheckMaxMillis = if (rule.systemUsagePending) {
+                SYSTEM_USAGE_PENDING_RECHECK_MS
+            } else {
+                RULE_RECHECK_MAX_MS
+            }
+            mainHandler.postDelayed(deadline, minOf(remainingMs, recheckMaxMillis))
             if (rule.exitWarningEnabled && warningShownForExtensionMs != grantedExtensionMs) {
                 mainHandler.postDelayed(
                     warningDeadline,
@@ -274,12 +830,24 @@ private class RuntimeLimiter(
             forceExit(activity, rule, status)
         } else {
             scheduleDeadline(activity, rule)
+            if (
+                !exitScheduled &&
+                rule.sessionPlanningEnabled &&
+                !sessionPlanPromptHandled &&
+                !rule.systemUsagePending
+            ) {
+                resumeSessionPlan(activity, rule)
+            }
         }
     }
 
     private fun scheduleMidnightRollover(rule: HookRule) {
         mainHandler.removeCallbacks(midnightDeadline)
-        if (exitScheduled || (!rule.dailyEnabled && !rule.groupEnabled) || foregroundStartedAt == NOT_RUNNING) return
+        if (
+            exitScheduled ||
+            (!rule.dailyEnabled && !rule.groupDailyEnabled) ||
+            foregroundStartedAt == NOT_RUNNING
+        ) return
         val now = ZonedDateTime.now()
         val nextMidnight = now.toLocalDate().plusDays(1).atStartOfDay(now.zone)
         val delayMs = Duration.between(now, nextMidnight).toMillis().coerceAtLeast(1L)
@@ -290,7 +858,7 @@ private class RuntimeLimiter(
         val activity = activeActivity.get() ?: return
         if (activity.isFinishing || activity.isDestroyed || foregroundStartedAt == NOT_RUNNING) return
         val rule = readRule(activity, reloadFallback = true)
-        if (!rule.enabled || (!rule.dailyEnabled && !rule.groupEnabled)) {
+        if (!rule.enabled || (!rule.dailyEnabled && !rule.groupDailyEnabled)) {
             mainHandler.removeCallbacks(midnightDeadline)
             return
         }
@@ -298,7 +866,7 @@ private class RuntimeLimiter(
         if (foregroundDayToken != currentDay) {
             val fullSegmentMillis = activeSegmentMillis()
             val todaySegmentMillis = activeSegmentMillisForToday()
-            if (rule.groupEnabled) {
+            if (rule.groupDailyEnabled) {
                 val previousDaySegmentMillis = (fullSegmentMillis - todaySegmentMillis)
                     .coerceAtLeast(0L)
                 if (previousDaySegmentMillis > 0L) {
@@ -319,7 +887,9 @@ private class RuntimeLimiter(
                     )
                 }
             }
-            if (rule.perLaunchEnabled) perLaunchCommittedMs += fullSegmentMillis
+            if (rule.perLaunchEnabled || rule.groupPerLaunchEnabled) {
+                perLaunchCommittedMs += fullSegmentMillis
+            }
             foregroundStartedAt = SystemClock.elapsedRealtime()
             foregroundDayToken = currentDay
             val refreshedRule = readRule(activity, reloadFallback = true)
@@ -346,7 +916,7 @@ private class RuntimeLimiter(
 
     private fun scheduleGroupUsageSync(rule: HookRule) {
         mainHandler.removeCallbacks(groupUsageSync)
-        if (!exitScheduled && rule.groupEnabled && foregroundStartedAt != NOT_RUNNING) {
+        if (!exitScheduled && rule.groupDailyEnabled && foregroundStartedAt != NOT_RUNNING) {
             mainHandler.postDelayed(groupUsageSync, GROUP_USAGE_SYNC_INTERVAL_MS)
         }
     }
@@ -355,7 +925,7 @@ private class RuntimeLimiter(
         val activity = activeActivity.get() ?: return
         if (activity.isFinishing || activity.isDestroyed || foregroundStartedAt == NOT_RUNNING) return
         val currentRule = lastLoadedRule ?: readRule(activity, reloadFallback = true)
-        if (!currentRule.enabled || !currentRule.groupEnabled) return
+        if (!currentRule.enabled || !currentRule.groupDailyEnabled) return
         commitActiveSegment(activity, currentRule)
         foregroundStartedAt = SystemClock.elapsedRealtime()
         foregroundDayToken = dayToken()
@@ -364,8 +934,8 @@ private class RuntimeLimiter(
             stopTiming()
             return
         }
-        if (!refreshedRule.groupEnabled) {
-            if (refreshedRule.dailyEnabled || refreshedRule.perLaunchEnabled) {
+        if (!refreshedRule.groupDailyEnabled) {
+            if (refreshedRule.hasTimedQuota()) {
                 scheduleDeadline(activity, refreshedRule)
             }
             scheduleMidnightRollover(refreshedRule)
@@ -380,7 +950,7 @@ private class RuntimeLimiter(
         if (exitScheduled) return null
         mainHandler.removeCallbacks(scheduleDeadline)
         mainHandler.removeCallbacks(scheduleWarningDeadline)
-        if (!rule.scheduleEnabled) return null
+        if (!rule.hasSchedule()) return null
         val decision = evaluateSchedule(rule)
         if (!decision.allowed) {
             forceScheduleExit(activity, rule, decision, openedDuringBlockedTime = false)
@@ -405,7 +975,7 @@ private class RuntimeLimiter(
             stopTiming()
             return
         }
-        if (!rule.scheduleEnabled) {
+        if (!rule.hasSchedule()) {
             mainHandler.removeCallbacks(scheduleWarningDeadline)
             dismissScheduleWarning()
             return
@@ -426,8 +996,9 @@ private class RuntimeLimiter(
     ) {
         if (exitScheduled) return
         exitScheduled = true
-        startCooldown(activity, rule)
-        val statsPersisted = reportLimitHit(activity, rule)
+        cancelSessionPlan(dismissDialog = true)
+        val scheduleHit = reportScheduleLimitHit(activity, rule, decision)
+        val statsPersisted = scheduleHit.statsPersisted
         if (foregroundStartedAt != NOT_RUNNING) commitActiveSegment(activity, rule)
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
@@ -437,17 +1008,22 @@ private class RuntimeLimiter(
         mainHandler.removeCallbacks(groupUsageSync)
         dismissWarning(resetForCurrentLimit = false)
         dismissScheduleWarning()
-        val nextAllowed = formatNextTransition(decision)
+        val nextAllowed = formatNextTransition(activity, rule, decision)
         diagnostic(
             activity,
             level = "WARN",
             event = if (openedDuringBlockedTime) "SCHEDULE_DENIED" else "SCHEDULE_BOUNDARY_REACHED",
-            message = "当前时段不可使用；mode=${rule.scheduleMode}, nextAllowed=$nextAllowed, pid=${Process.myPid()}",
+            message = "当前时段不可使用；app=${rule.scheduleEnabled}/${rule.scheduleMode}/${ScheduleCodec.encode(rule.scheduleWindows)}, group=${rule.groupScheduleEnabled}/${rule.groupScheduleMode}/${ScheduleCodec.encode(rule.groupScheduleWindows)}, nextAllowed=$nextAllowed, cooldownStarted=false, hitRecorded=${scheduleHit.recorded}, source=${rule.source}, pid=${Process.myPid()}",
         )
         val message = if (nextAllowed == null) {
-            "当前处于不可用时段"
+            hookText(activity, rule, "当前处于不可用时段", "This time is unavailable")
         } else {
-            "当前处于不可用时段，下次可用：$nextAllowed"
+            hookText(
+                activity,
+                rule,
+                "当前处于不可用时段，下次可用：$nextAllowed",
+                "This time is unavailable. Next available: $nextAllowed",
+            )
         }
         finishTarget(activity, message, statsPersisted)
     }
@@ -455,6 +1031,7 @@ private class RuntimeLimiter(
     private fun forceExit(activity: Activity, rule: HookRule, status: ThresholdStatus) {
         if (exitScheduled) return
         exitScheduled = true
+        cancelSessionPlan(dismissDialog = true)
         startCooldown(activity, rule)
         dismissWarning(resetForCurrentLimit = false)
         val segmentMs = activeSegmentMillis()
@@ -473,7 +1050,9 @@ private class RuntimeLimiter(
                 .coerceAtMost(effectiveLimitMillis(rule.dailyLimitMillis))
             writeDailyState(activity, rule, finalDailyUsed)
         }
-        if (rule.perLaunchEnabled) perLaunchCommittedMs += segmentMs
+        if (rule.perLaunchEnabled || rule.groupPerLaunchEnabled) {
+            perLaunchCommittedMs += segmentMs
+        }
         foregroundStartedAt = NOT_RUNNING
         foregroundDayToken = -1
         mainHandler.removeCallbacks(deadline)
@@ -492,11 +1071,12 @@ private class RuntimeLimiter(
         )
         finishTarget(
             activity,
-            if (status.groupOnlyReached) {
-                "${rule.groupName.ifBlank { "分组" }}共享额度已用尽"
-            } else {
-                "已达到使用时长限制"
-            },
+            hookText(
+                activity,
+                rule,
+                "已达到${status.reachedLabels}限制",
+                "${status.reachedLabels} limit reached",
+            ),
             statsPersisted,
         )
     }
@@ -509,20 +1089,30 @@ private class RuntimeLimiter(
     ) {
         if (exitScheduled) return
         exitScheduled = true
+        cancelSessionPlan(dismissDialog = true)
         foregroundStartedAt = NOT_RUNNING
         foregroundDayToken = -1
         activeActivity.clear()
         stopTimingCallbacks()
         dismissWarning(resetForCurrentLimit = false)
         dismissScheduleWarning()
-        val remainingText = formatCooldownRemaining(remainingMillis)
+        val remainingText = formatCooldownRemaining(activity, rule, remainingMillis)
         diagnostic(
             activity,
             level = "WARN",
             event = "COOLDOWN_BLOCKED",
-            message = "冷却期间拒绝打开；remaining=${remainingMillis / 1000.0}s, configured=${rule.cooldownMillis / 1000}s",
+            message = "冷却期间拒绝打开；remaining=${remainingMillis / 1000.0}s, configured=${rule.effectiveCooldownMillis() / 1000}s",
         )
-        finishTarget(activity, "冷却中，$remainingText 后可再次打开", statsPersisted)
+        finishTarget(
+            activity,
+            hookText(
+                activity,
+                rule,
+                "冷却中，$remainingText 后可再次打开",
+                "Cooldown active. Reopen in $remainingText",
+            ),
+            statsPersisted,
+        )
     }
 
     private fun finishTarget(activity: Activity, message: String, statsPersisted: Boolean) {
@@ -584,38 +1174,63 @@ private class RuntimeLimiter(
         )
 
     private fun startCooldown(context: Context, rule: HookRule) {
-        if (!rule.cooldownEnabled || rule.cooldownMillis <= 0L) return
+        val durationMillis = rule.effectiveCooldownMillis()
+        if (durationMillis <= 0L) return
         context.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE)
             .edit()
             .putLong(KEY_COOLDOWN_STARTED_AT, System.currentTimeMillis())
-            .putLong(KEY_COOLDOWN_RULE_VERSION, rule.version)
+            .putString(KEY_COOLDOWN_RULE_IDENTITY, rule.cooldownIdentity())
+            .remove(KEY_COOLDOWN_RULE_VERSION)
             .commit()
         diagnostic(
             context,
             event = "COOLDOWN_STARTED",
-            message = "强制退出后开始冷却；duration=${rule.cooldownMillis / 1000}s",
+            message = "强制退出后开始冷却；duration=${durationMillis / 1000}s, app=${rule.cooldownEnabled}/${rule.cooldownMillis / 1000}s, group=${rule.groupCooldownEnabled}/${rule.groupCooldownMillis / 1000}s",
         )
     }
 
     private fun cooldownRemainingMillis(context: Context, rule: HookRule): Long {
-        if (!rule.cooldownEnabled || rule.cooldownMillis <= 0L) return 0L
+        val durationMillis = rule.effectiveCooldownMillis()
+        if (durationMillis <= 0L) return 0L
         val prefs = context.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE)
-        if (prefs.getLong(KEY_COOLDOWN_RULE_VERSION, Long.MIN_VALUE) != rule.version) return 0L
+        if (prefs.getString(KEY_COOLDOWN_RULE_IDENTITY, null) != rule.cooldownIdentity()) return 0L
         return CooldownPolicy.remainingMillis(
             startedAtMillis = prefs.getLong(KEY_COOLDOWN_STARTED_AT, 0L),
-            durationMillis = rule.cooldownMillis,
+            durationMillis = durationMillis,
             nowMillis = System.currentTimeMillis(),
         )
     }
 
-    private fun formatCooldownRemaining(remainingMillis: Long): String {
+    private fun HookRule.effectiveCooldownMillis(): Long = GroupRulePolicy.effectiveCooldownMillis(
+        appEnabled = cooldownEnabled,
+        appDurationMillis = cooldownMillis,
+        groupEnabled = groupCooldownEnabled,
+        groupDurationMillis = groupCooldownMillis,
+    )
+
+    private fun HookRule.cooldownIdentity(): String =
+        "$version:$groupVersion:${effectiveCooldownMillis()}"
+
+    private fun formatCooldownRemaining(
+        context: Context,
+        rule: HookRule,
+        remainingMillis: Long,
+    ): String {
         val totalSeconds = ((remainingMillis + 999L) / 1000L).coerceAtLeast(1L)
         val minutes = totalSeconds / 60L
         val seconds = totalSeconds % 60L
-        return when {
-            minutes == 0L -> "$seconds 秒"
-            seconds == 0L -> "$minutes 分钟"
-            else -> "$minutes 分 $seconds 秒"
+        return if (isEnglish(context, rule)) {
+            when {
+                minutes == 0L -> "$seconds sec"
+                seconds == 0L -> "$minutes min"
+                else -> "$minutes min $seconds sec"
+            }
+        } else {
+            when {
+                minutes == 0L -> "$seconds 秒"
+                seconds == 0L -> "$minutes 分钟"
+                else -> "$minutes 分 $seconds 秒"
+            }
         }
     }
 
@@ -642,7 +1257,9 @@ private class RuntimeLimiter(
                 authoritativeDailyTotalMillis(activity, rule, activeSegmentMillisForToday()),
             )
         }
-        if (rule.perLaunchEnabled) perLaunchCommittedMs += segmentMs
+        if (rule.perLaunchEnabled || rule.groupPerLaunchEnabled) {
+            perLaunchCommittedMs += segmentMs
+        }
         if (rule.groupEnabled) {
             recordUsageEvent(
                 activity = activity,
@@ -662,6 +1279,35 @@ private class RuntimeLimiter(
             launchIncrement = 0,
             limitHitIncrement = if (rule.usageStatsEnabled) 1 else 0,
         )
+
+    private fun reportScheduleLimitHit(
+        activity: Activity,
+        rule: HookRule,
+        decision: ScheduleDecision,
+    ): ScheduleHitResult {
+        val blockToken = ScheduleBlockPolicy.token(
+            ruleVersion = rule.scheduleTokenVersion(),
+            mode = rule.scheduleModeForToken(),
+            nextTransitionEpochMillis = decision.nextTransition?.toInstant()?.toEpochMilli(),
+        )
+        val prefs = activity.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE)
+        if (!ScheduleBlockPolicy.shouldRecord(prefs.getString(KEY_SCHEDULE_BLOCK_TOKEN, null), blockToken)) {
+            return ScheduleHitResult(recorded = false, statsPersisted = true)
+        }
+        val markerPersisted = prefs.edit()
+            .putString(KEY_SCHEDULE_BLOCK_TOKEN, blockToken)
+            .commit()
+        val statsPersisted = reportLimitHit(activity, rule)
+        if (!markerPersisted) {
+            diagnostic(
+                activity,
+                level = "WARN",
+                event = "SCHEDULE_BLOCK_MARKER_FAILED",
+                message = "时段阻止标记写入失败，后续重复打开可能重复计数；token=$blockToken",
+            )
+        }
+        return ScheduleHitResult(recorded = true, statsPersisted = statsPersisted)
+    }
 
     private fun recordUsageEvent(
         activity: Activity,
@@ -827,6 +1473,14 @@ private class RuntimeLimiter(
             forceExit(activity, rule, status)
             return
         }
+        val planRemainingMs = sessionPlanRemainingMillis()
+        if (
+            planRemainingMs != NOT_RUNNING &&
+            SessionPlanPolicy.isEarliest(planRemainingMs, remainingMs)
+        ) {
+            scheduleSessionPlan(activity, rule)
+            return
+        }
         if (remainingMs > WARNING_LEAD_MS) {
             scheduleDeadline(activity, rule)
             return
@@ -841,12 +1495,22 @@ private class RuntimeLimiter(
             warningBanner = TopWarningBanner.attach(
                 activity = activity,
                 kind = WarningBannerKind.TIME_LIMIT,
-                title = "${status.nextThresholdLabel}即将到期",
-                message = exitWarningMessage(remainingMs, rule.extensionMillis),
+                title = hookText(
+                    activity,
+                    rule,
+                    "${status.nextThresholdLabel}即将到期",
+                    "${status.nextThresholdLabel} ending soon",
+                ),
+                message = exitWarningMessage(activity, rule, remainingMs, rule.extensionMillis),
                 remainingMillis = remainingMs,
                 maxProgressMillis = WARNING_LEAD_MS,
                 fullScreen = rule.fullScreenExitWarningEnabled,
-                actionLabel = "延时 ${formatDuration(rule.extensionMillis)}",
+                actionLabel = hookText(
+                    activity,
+                    rule,
+                    "延时 ${formatDuration(activity, rule, rule.extensionMillis)}",
+                    "Extend ${formatDuration(activity, rule, rule.extensionMillis)}",
+                ),
                 onAction = {
                     if (!activity.isFinishing && !activity.isDestroyed && !exitScheduled) {
                         dismissWarning(resetForCurrentLimit = false)
@@ -854,6 +1518,7 @@ private class RuntimeLimiter(
                     }
                 },
             )
+            vibrateExitWarning(activity, rule)
             diagnostic(
                 activity,
                 event = "WARNING_SHOWN",
@@ -871,7 +1536,7 @@ private class RuntimeLimiter(
         val activity = activeActivity.get() ?: return
         if (activity.isFinishing || activity.isDestroyed || exitScheduled) return
         val rule = readRule(activity, reloadFallback = true)
-        if (!rule.enabled || !rule.scheduleEnabled || !rule.exitWarningEnabled) return
+        if (!rule.enabled || !rule.hasSchedule() || !rule.exitWarningEnabled) return
         val decision = evaluateSchedule(rule)
         if (!decision.allowed) {
             forceScheduleExit(activity, rule, decision, openedDuringBlockedTime = false)
@@ -883,30 +1548,37 @@ private class RuntimeLimiter(
             return
         }
         if (isBannerShowing(WarningBannerKind.SCHEDULE)) return
+        dismissSessionPlanWarning()
         dismissWarning(resetForCurrentLimit = false)
         runCatching {
             warningBanner = TopWarningBanner.attach(
                 activity = activity,
                 kind = WarningBannerKind.SCHEDULE,
-                title = "即将进入不可用时段",
-                message = scheduleWarningMessage(remainingMs),
+                title = hookText(
+                    activity,
+                    rule,
+                    "即将进入不可用时段",
+                    "Unavailable time approaching",
+                ),
+                message = scheduleWarningMessage(activity, rule, remainingMs),
                 remainingMillis = remainingMs,
                 maxProgressMillis = WARNING_LEAD_MS,
                 fullScreen = rule.fullScreenExitWarningEnabled,
             )
+            vibrateExitWarning(activity, rule)
             diagnostic(
                 activity,
                 event = "SCHEDULE_WARNING_SHOWN",
                 message = "顶部时段提醒已显示",
             )
-            startScheduleWarningCountdown(rule)
+            startScheduleWarningCountdown(activity, rule)
         }.onFailure {
             dismissScheduleWarning()
             diagnostic(activity, level = "ERROR", event = "SCHEDULE_WARNING_FAILED", message = it.toString())
         }
     }
 
-    private fun startScheduleWarningCountdown(rule: HookRule) {
+    private fun startScheduleWarningCountdown(activity: Activity, rule: HookRule) {
         val countdown = object : Runnable {
             override fun run() {
                 val banner = warningBanner
@@ -920,8 +1592,13 @@ private class RuntimeLimiter(
                 }
                 val remainingMs = decision.millisUntilTransition(ZonedDateTime.now()) ?: return
                 banner.update(
-                    title = "即将进入不可用时段",
-                    message = scheduleWarningMessage(remainingMs),
+                    title = hookText(
+                        activity,
+                        rule,
+                        "即将进入不可用时段",
+                        "Unavailable time approaching",
+                    ),
+                    message = scheduleWarningMessage(activity, rule, remainingMs),
                     remainingMillis = remainingMs,
                 )
                 if (remainingMs > 0L) mainHandler.postDelayed(this, COUNTDOWN_REFRESH_MS)
@@ -932,9 +1609,18 @@ private class RuntimeLimiter(
         mainHandler.post(countdown)
     }
 
-    private fun scheduleWarningMessage(remainingMs: Long): String {
+    private fun scheduleWarningMessage(
+        context: Context,
+        rule: HookRule,
+        remainingMs: Long,
+    ): String {
         val seconds = ((remainingMs + 999L) / 1000L).coerceAtLeast(0L)
-        return "$seconds 秒后退出 · 时段限制不可延时"
+        return hookText(
+            context,
+            rule,
+            "$seconds 秒后退出 · 时段限制不可延时",
+            "Exit in $seconds sec · schedule limits cannot be extended",
+        )
     }
 
     private fun startWarningCountdown(activity: Activity, rule: HookRule) {
@@ -950,9 +1636,28 @@ private class RuntimeLimiter(
                     forceExit(activity, rule, status)
                     return
                 }
+                val planRemainingMs = sessionPlanRemainingMillis()
+                if (
+                    planRemainingMs != NOT_RUNNING &&
+                    SessionPlanPolicy.isEarliest(planRemainingMs, remainingMs)
+                ) {
+                    dismissWarning(resetForCurrentLimit = false)
+                    showSessionPlanWarning()
+                    return
+                }
                 banner.update(
-                    title = "${status.nextThresholdLabel}即将到期",
-                    message = exitWarningMessage(remainingMs, rule.extensionMillis),
+                    title = hookText(
+                        activity,
+                        rule,
+                        "${status.nextThresholdLabel}即将到期",
+                        "${status.nextThresholdLabel} ending soon",
+                    ),
+                    message = exitWarningMessage(
+                        activity,
+                        rule,
+                        remainingMs,
+                        rule.extensionMillis,
+                    ),
                     remainingMillis = remainingMs,
                 )
                 if (remainingMs > 0L) mainHandler.postDelayed(this, COUNTDOWN_REFRESH_MS)
@@ -978,11 +1683,80 @@ private class RuntimeLimiter(
         )
         val latestRule = readRule(activity, reloadFallback = true)
         scheduleDeadline(activity, latestRule)
+        scheduleSessionPlan(activity, latestRule)
     }
 
     private fun dismissWarning(resetForCurrentLimit: Boolean) {
         dismissBanner(WarningBannerKind.TIME_LIMIT)
         if (resetForCurrentLimit) warningShownForExtensionMs = Long.MIN_VALUE
+    }
+
+    private fun vibrateExitWarning(context: Context, rule: HookRule) {
+        if (!rule.exitWarningVibrationEnabled) return
+        val appContext = context.applicationContext
+        runCatching {
+            Thread(
+                { performExitWarningVibration(appContext) },
+                "time-stop-warning-vibration",
+            ).apply { isDaemon = true }.start()
+        }.onFailure {
+            diagnostic(
+                context,
+                level = "WARN",
+                event = "WARNING_VIBRATION_THREAD_FAILED",
+                message = it.toString(),
+            )
+        }
+    }
+
+    private fun performExitWarningVibration(context: Context) {
+        val providerResult = runCatching {
+            context.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_VIBRATE_WARNING,
+                packageName,
+                null,
+            )
+        }.getOrNull()
+        if (providerResult != null) {
+            if (providerResult.getBoolean(RuleContract.KEY_OK, false)) {
+                diagnostic(
+                    context,
+                    event = "WARNING_VIBRATION_SENT",
+                    message = "模块进程已执行退出提醒震动",
+                )
+            } else {
+                diagnostic(
+                    context,
+                    level = "WARN",
+                    event = "WARNING_VIBRATION_REJECTED",
+                    message = "模块进程拒绝或无法执行退出提醒震动",
+                )
+            }
+            return
+        }
+        runCatching {
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                context.getSystemService(VibratorManager::class.java)?.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                context.getSystemService(Vibrator::class.java)
+            } ?: return
+            if (!vibrator.hasVibrator()) return
+            vibrator.vibrate(
+                VibrationEffect.createOneShot(
+                    EXIT_WARNING_VIBRATION_MS,
+                    VibrationEffect.DEFAULT_AMPLITUDE,
+                ),
+            )
+            diagnostic(
+                context,
+                event = "WARNING_VIBRATION_FALLBACK",
+                message = "Provider 不可用，已由目标应用进程执行震动",
+            )
+        }.onFailure {
+            diagnostic(context, level = "WARN", event = "WARNING_VIBRATION_FAILED", message = it.toString())
+        }
     }
 
     private fun dismissScheduleWarning() {
@@ -1009,30 +1783,96 @@ private class RuntimeLimiter(
         return banner.kind == kind
     }
 
-    private fun evaluateSchedule(rule: HookRule): ScheduleDecision = ScheduleEvaluator.evaluate(
-        mode = rule.scheduleMode,
-        windows = rule.scheduleWindows,
-        now = ZonedDateTime.now(),
-    )
+    /**
+     * App and group schedules form an intersection: the target is usable only when every enabled
+     * schedule allows it. Skip intermediate boundaries that do not change the combined result so
+     * "next available" remains stable when two blocked windows overlap.
+     */
+    private fun evaluateSchedule(rule: HookRule): ScheduleDecision {
+        val constraints = buildList {
+            if (rule.scheduleEnabled && rule.scheduleWindows.any(ScheduleWindow::isValid)) {
+                add(ScheduleConstraint(rule.scheduleMode, rule.scheduleWindows))
+            }
+            if (
+                rule.groupScheduleEnabled &&
+                rule.groupScheduleWindows.any(ScheduleWindow::isValid)
+            ) {
+                add(ScheduleConstraint(rule.groupScheduleMode, rule.groupScheduleWindows))
+            }
+        }
+        return ScheduleEvaluator.evaluateAll(constraints, ZonedDateTime.now())
+    }
 
-    private fun formatNextTransition(decision: ScheduleDecision): String? = decision.nextTransition
-        ?.format(DateTimeFormatter.ofPattern("M月d日 E HH:mm", Locale.CHINA))
+    private fun HookRule.hasTimedQuota(): Boolean =
+        GroupRulePolicy.hasTimedQuota(
+            appDailyEnabled = dailyEnabled,
+            appPerLaunchEnabled = perLaunchEnabled,
+            groupDailyEnabled = groupDailyEnabled,
+            groupPerLaunchEnabled = groupPerLaunchEnabled,
+        )
+
+    private fun HookRule.hasSchedule(): Boolean =
+        (scheduleEnabled && scheduleWindows.any(ScheduleWindow::isValid)) ||
+            (groupScheduleEnabled && groupScheduleWindows.any(ScheduleWindow::isValid))
+
+    private fun HookRule.scheduleModeForToken(): ScheduleMode =
+        when {
+            scheduleEnabled -> scheduleMode
+            groupScheduleEnabled -> groupScheduleMode
+            else -> ScheduleMode.BLOCK_DURING
+        }
+
+    private fun HookRule.scheduleTokenVersion(): Long =
+        31L * version + groupVersion
+
+    private fun formatNextTransition(
+        context: Context,
+        rule: HookRule,
+        decision: ScheduleDecision,
+    ): String? = decision.nextTransition?.format(
+        if (isEnglish(context, rule)) {
+            DateTimeFormatter.ofPattern("MMM d, E HH:mm", Locale.ENGLISH)
+        } else {
+            DateTimeFormatter.ofPattern("M月d日 E HH:mm", Locale.CHINA)
+        },
+    )
 
     private fun effectiveLimitMillis(baseLimitMillis: Long): Long =
         (baseLimitMillis + grantedExtensionMs).coerceAtMost(Long.MAX_VALUE / 2L)
 
     private fun exitWarningMessage(
+        context: Context,
+        rule: HookRule,
         remainingMs: Long,
         extensionMillis: Long,
     ): String {
         val seconds = ((remainingMs + 999L) / 1000L).coerceAtLeast(0L)
-        return "$seconds 秒后退出 · 延时将同步延长已开启阈值 ${formatDuration(extensionMillis)}"
+        return hookText(
+            context,
+            rule,
+            "$seconds 秒后退出 · 延时将同步延长已开启阈值 ${formatDuration(context, rule, extensionMillis)}",
+            "Exit in $seconds sec · extension adds ${formatDuration(context, rule, extensionMillis)} to active limits",
+        )
     }
 
-    private fun formatDuration(durationMs: Long): String {
+    private fun formatDuration(context: Context, rule: HookRule, durationMs: Long): String {
         val seconds = durationMs / 1000L
-        return if (seconds < 60L) "$seconds 秒" else "${seconds / 60L} 分钟"
+        return if (isEnglish(context, rule)) {
+            if (seconds < 60L) "$seconds sec" else "${seconds / 60L} min"
+        } else {
+            if (seconds < 60L) "$seconds 秒" else "${seconds / 60L} 分钟"
+        }
     }
+
+    private fun hookText(
+        context: Context,
+        rule: HookRule,
+        chinese: String,
+        english: String,
+    ): String = if (isEnglish(context, rule)) english else chinese
+
+    private fun isEnglish(context: Context, rule: HookRule): Boolean =
+        AppLocaleController.resolvedLanguage(context, rule.languageMode) == SupportedLanguage.ENGLISH
 
     private fun localDailyUsedMillis(context: Context, rule: HookRule): Long {
         val statePrefs = context.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE)
@@ -1049,8 +1889,24 @@ private class RuntimeLimiter(
     private fun syncSystemDailyBaseline(context: Context, rule: HookRule) {
         if (rule.systemTodayUsedMillis < 0L) return
         val localUsedMillis = localDailyUsedMillis(context, rule)
-        if (rule.systemTodayUsedMillis > localUsedMillis) {
-            writeDailyState(context, rule, rule.systemTodayUsedMillis)
+        val activeIncludedInSnapshot = if (
+            foregroundStartedAt != NOT_RUNNING &&
+            rule.systemUsageMeasuredAtElapsedMillis >= foregroundStartedAt
+        ) {
+            UsageMath.activeIncludedAtMeasurementMillis(
+                foregroundStartedAtElapsedMillis = foregroundStartedAt,
+                measuredAtElapsedMillis = rule.systemUsageMeasuredAtElapsedMillis,
+                activeTodayMillis = activeSegmentMillisForToday(),
+            )
+        } else {
+            0L
+        }
+        val committedSystemEquivalent = UsageMath.committedSystemUsageMillis(
+            rule.systemTodayUsedMillis,
+            activeIncludedInSnapshot,
+        )
+        if (committedSystemEquivalent > localUsedMillis) {
+            writeDailyState(context, rule, committedSystemEquivalent)
         }
     }
 
@@ -1058,10 +1914,27 @@ private class RuntimeLimiter(
         context: Context,
         rule: HookRule,
         activeTodayMillis: Long,
-    ): Long = UsageMath.authoritativeDailyUsedMillis(
-        localDailyUsedMillis(context, rule) + activeTodayMillis.coerceAtLeast(0L),
-        rule.systemTodayUsedMillis,
-    )
+    ): Long {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val activeAfterSystemMeasurement = if (
+            rule.systemTodayUsedMillis >= 0L && foregroundStartedAt != NOT_RUNNING
+        ) {
+            UsageMath.activeAfterMeasurementMillis(
+                nowElapsedMillis = nowElapsed,
+                foregroundStartedAtElapsedMillis = foregroundStartedAt,
+                measuredAtElapsedMillis = rule.systemUsageMeasuredAtElapsedMillis,
+            )
+        } else {
+            0L
+        }
+        return UsageMath.authoritativeDailyUsedMillis(
+            localDailyUsedMillis(context, rule) + activeTodayMillis.coerceAtLeast(0L),
+            UsageMath.projectedSystemUsageMillis(
+                rule.systemTodayUsedMillis,
+                activeAfterSystemMeasurement,
+            ),
+        )
+    }
 
     private fun activeSegmentMillisForToday(): Long {
         val activeMillis = activeSegmentMillis()
@@ -1074,7 +1947,10 @@ private class RuntimeLimiter(
         return minOf(activeMillis, millisSinceStartOfDay)
     }
 
-    private fun thresholdStatus(context: Context, rule: HookRule): ThresholdStatus {
+    private fun thresholdStatus(
+        context: Context,
+        rule: HookRule,
+    ): ThresholdStatus {
         val currentGroupIdentity = rule.groupIdentity()
         if (loadedGroupIdentity != currentGroupIdentity) {
             loadedGroupIdentity = currentGroupIdentity
@@ -1087,7 +1963,7 @@ private class RuntimeLimiter(
             if (rule.dailyEnabled) {
                 add(
                     ThresholdRemaining(
-                        label = "每日累计",
+                        label = hookText(context, rule, "每日累计", "Daily cumulative"),
                         isGroup = false,
                         remainingMillis = UsageMath.remainingMillis(
                             effectiveLimitMillis(rule.dailyLimitMillis),
@@ -1104,7 +1980,7 @@ private class RuntimeLimiter(
             if (rule.perLaunchEnabled) {
                 add(
                     ThresholdRemaining(
-                        label = "单次打开",
+                        label = hookText(context, rule, "单次打开", "Per launch"),
                         isGroup = false,
                         remainingMillis = UsageMath.remainingMillis(
                             effectiveLimitMillis(rule.perLaunchLimitMillis),
@@ -1114,10 +1990,15 @@ private class RuntimeLimiter(
                     ),
                 )
             }
-            if (rule.groupEnabled) {
+            if (rule.groupDailyEnabled) {
                 add(
                     ThresholdRemaining(
-                        label = "${rule.groupName.ifBlank { "应用分组" }}共享额度",
+                        label = hookText(
+                            context,
+                            rule,
+                            "${rule.groupName.ifBlank { "应用分组" }}共享额度",
+                            "${rule.groupName.ifBlank { "App group" }} shared allowance",
+                        ),
                         isGroup = true,
                         remainingMillis = UsageMath.remainingMillis(
                             effectiveLimitMillis(rule.groupDailyLimitMillis),
@@ -1127,9 +2008,28 @@ private class RuntimeLimiter(
                     ),
                 )
             }
+            if (rule.groupPerLaunchEnabled) {
+                add(
+                    ThresholdRemaining(
+                        label = hookText(
+                            context,
+                            rule,
+                            "${rule.groupName.ifBlank { "应用分组" }}单次打开",
+                            "${rule.groupName.ifBlank { "App group" }} per launch",
+                        ),
+                        isGroup = true,
+                        remainingMillis = UsageMath.remainingMillis(
+                            effectiveLimitMillis(rule.groupPerLaunchLimitMillis),
+                            perLaunchCommittedMs,
+                            activeMs,
+                        ),
+                    ),
+                )
+            }
         }
         if (thresholds.isEmpty()) {
-            return ThresholdStatus(Long.MAX_VALUE / 2L, false, "未启用", "未启用", false)
+            val disabled = hookText(context, rule, "未启用", "Disabled")
+            return ThresholdStatus(Long.MAX_VALUE / 2L, false, disabled, disabled, false, false)
         }
         val earliestRemaining = UsageMath.earliestRemainingMillis(
             thresholds.map { it.remainingMillis },
@@ -1143,11 +2043,12 @@ private class RuntimeLimiter(
             reachedLabels = reachedLabels,
             nextThresholdLabel = earliest.label,
             groupOnlyReached = reached.isNotEmpty() && reached.all(ThresholdRemaining::isGroup),
+            hasThreshold = true,
         )
     }
 
     private fun authoritativeGroupTodayUsedMillis(rule: HookRule): Long {
-        if (!rule.groupEnabled) return 0L
+        if (!rule.groupDailyEnabled) return 0L
         val today = LocalDate.now().toString()
         val providerBase = rule.groupTodayUsedMillis
             .takeIf { rule.groupDayToken == today }
@@ -1187,8 +2088,10 @@ private class RuntimeLimiter(
                 "每日累计=${authoritativeDailyTotalMillis(context, rule, activeSegmentMillisForToday()) / 1000.0}s",
             )
         }
-        if (rule.perLaunchEnabled) add("单次累计=${perLaunchCommittedMs / 1000.0}s")
-        if (rule.groupEnabled) {
+        if (rule.perLaunchEnabled || rule.groupPerLaunchEnabled) {
+            add("单次累计=${perLaunchCommittedMs / 1000.0}s")
+        }
+        if (rule.groupDailyEnabled) {
             add("${rule.groupName}共享=${authoritativeGroupTodayUsedMillis(rule) / 1000.0}s")
         }
     }.joinToString("，")
@@ -1213,6 +2116,10 @@ private class RuntimeLimiter(
         }.getOrNull()?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) }?.let { result ->
             val rule = HookRule(
                 enabled = result.getBoolean(RuleContract.KEY_ENABLED, false),
+                sessionPlanningEnabled = result.getBoolean(
+                    RuleContract.KEY_SESSION_PLANNING_ENABLED,
+                    false,
+                ),
                 dailyEnabled = result.getBoolean(RuleContract.KEY_DAILY_ENABLED, false),
                 dailyLimitMillis = result.getLong(
                     RuleContract.KEY_DAILY_LIMIT_SECONDS,
@@ -1225,9 +2132,22 @@ private class RuntimeLimiter(
                     RuleContract.KEY_SYSTEM_TODAY_USED_MS,
                     -1L,
                 ),
+                systemUsageMeasuredAtElapsedMillis = result.getLong(
+                    RuleContract.KEY_SYSTEM_USAGE_MEASURED_AT_ELAPSED_MS,
+                    SystemClock.elapsedRealtime(),
+                ),
+                systemUsagePending = result.getBoolean(
+                    RuleContract.KEY_SYSTEM_USAGE_PENDING,
+                    false,
+                ),
                 groupEnabled = result.getBoolean(RuleContract.KEY_GROUP_ENABLED, false),
                 groupId = result.getString(RuleContract.KEY_GROUP_ID).orEmpty(),
                 groupName = result.getString(RuleContract.KEY_GROUP_NAME).orEmpty(),
+                groupDailyEnabled = result.getBoolean(
+                    RuleContract.KEY_GROUP_DAILY_ENABLED,
+                    // Provider versions before group multi-rule support only exposed a daily quota.
+                    result.getBoolean(RuleContract.KEY_GROUP_ENABLED, false),
+                ),
                 groupDailyLimitMillis = result.getLong(
                     RuleContract.KEY_GROUP_DAILY_LIMIT_SECONDS,
                     RuleRepository.DEFAULT_GROUP_LIMIT_SECONDS,
@@ -1245,6 +2165,38 @@ private class RuntimeLimiter(
                     RuleContract.KEY_GROUP_MEASURED_AT_ELAPSED_MS,
                     SystemClock.elapsedRealtime(),
                 ),
+                groupPerLaunchEnabled = result.getBoolean(
+                    RuleContract.KEY_GROUP_PER_LAUNCH_ENABLED,
+                    false,
+                ),
+                groupPerLaunchLimitMillis = result.getLong(
+                    RuleContract.KEY_GROUP_PER_LAUNCH_LIMIT_SECONDS,
+                    RuleRepository.DEFAULT_LIMIT_SECONDS,
+                ).coerceIn(
+                    RuleRepository.MIN_LIMIT_SECONDS,
+                    RuleRepository.MAX_LIMIT_SECONDS,
+                ) * 1000L,
+                groupScheduleEnabled = result.getBoolean(
+                    RuleContract.KEY_GROUP_SCHEDULE_ENABLED,
+                    false,
+                ),
+                groupScheduleMode = result.getString(RuleContract.KEY_GROUP_SCHEDULE_MODE)
+                    ?.let { runCatching { ScheduleMode.valueOf(it) }.getOrNull() }
+                    ?: ScheduleMode.BLOCK_DURING,
+                groupScheduleWindows = ScheduleCodec.decode(
+                    result.getString(RuleContract.KEY_GROUP_SCHEDULE_WINDOWS),
+                ),
+                groupCooldownEnabled = result.getBoolean(
+                    RuleContract.KEY_GROUP_COOLDOWN_ENABLED,
+                    false,
+                ),
+                groupCooldownMillis = result.getLong(
+                    RuleContract.KEY_GROUP_COOLDOWN_SECONDS,
+                    RuleRepository.DEFAULT_COOLDOWN_SECONDS,
+                ).coerceIn(
+                    RuleRepository.MIN_COOLDOWN_SECONDS,
+                    RuleRepository.MAX_COOLDOWN_SECONDS,
+                ) * 1000L,
                 perLaunchEnabled = result.getBoolean(RuleContract.KEY_PER_LAUNCH_ENABLED, false),
                 perLaunchLimitMillis = result.getLong(
                     RuleContract.KEY_PER_LAUNCH_LIMIT_SECONDS,
@@ -1274,6 +2226,13 @@ private class RuntimeLimiter(
                     RuleContract.KEY_FULL_SCREEN_EXIT_WARNING_ENABLED,
                     false,
                 ),
+                exitWarningVibrationEnabled = result.getBoolean(
+                    RuleContract.KEY_EXIT_WARNING_VIBRATION_ENABLED,
+                    false,
+                ),
+                languageMode = result.getString(RuleContract.KEY_LANGUAGE_MODE)
+                    ?.let { runCatching { AppLanguageMode.valueOf(it) }.getOrNull() }
+                    ?: AppLanguageMode.SYSTEM,
                 extensionMillis = result.getLong(
                     RuleContract.KEY_EXTENSION_SECONDS,
                     RuleRepository.DEFAULT_EXTENSION_SECONDS,
@@ -1344,6 +2303,8 @@ private class RuntimeLimiter(
         val groupEnabled = groupId.isNotBlank() &&
             packageName in groupMembers &&
             preferences.getBoolean("${groupPrefix}enabled", false)
+        val groupDailyEnabled = groupEnabled &&
+            preferences.getBoolean("${groupPrefix}daily_enabled", true)
         if (storedVersion == Long.MIN_VALUE && membershipVersion == Long.MIN_VALUE && !groupEnabled) {
             return null
         }
@@ -1371,6 +2332,10 @@ private class RuntimeLimiter(
         return HookRule(
             enabled = (legacyEnabled && (dailyEnabled || perLaunchEnabled || scheduleEnabled)) ||
                 groupEnabled,
+            sessionPlanningEnabled = preferences.getBoolean(
+                "${prefix}session_planning_enabled",
+                false,
+            ),
             dailyEnabled = dailyEnabled,
             dailyLimitMillis = (if (dailyLimitSeconds >= 0L) dailyLimitSeconds else legacyLimitSeconds)
                 .coerceIn(
@@ -1378,9 +2343,12 @@ private class RuntimeLimiter(
                     RuleRepository.MAX_LIMIT_SECONDS,
                 ) * 1000L,
             systemTodayUsedMillis = -1L,
+            systemUsageMeasuredAtElapsedMillis = SystemClock.elapsedRealtime(),
+            systemUsagePending = false,
             groupEnabled = groupEnabled,
             groupId = groupId,
             groupName = preferences.getString("${groupPrefix}name", "").orEmpty(),
+            groupDailyEnabled = groupDailyEnabled,
             groupDailyLimitMillis = preferences.getLong(
                 "${groupPrefix}daily_limit_seconds",
                 RuleRepository.DEFAULT_GROUP_LIMIT_SECONDS,
@@ -1396,6 +2364,34 @@ private class RuntimeLimiter(
             },
             groupDayToken = LocalDate.now().toString(),
             groupMeasuredAtElapsedMillis = SystemClock.elapsedRealtime(),
+            groupPerLaunchEnabled = groupEnabled &&
+                preferences.getBoolean("${groupPrefix}per_launch_enabled", false),
+            groupPerLaunchLimitMillis = preferences.getLong(
+                "${groupPrefix}per_launch_limit_seconds",
+                RuleRepository.DEFAULT_LIMIT_SECONDS,
+            ).coerceIn(
+                RuleRepository.MIN_LIMIT_SECONDS,
+                RuleRepository.MAX_LIMIT_SECONDS,
+            ) * 1000L,
+            groupScheduleEnabled = groupEnabled &&
+                preferences.getBoolean("${groupPrefix}schedule_enabled", false),
+            groupScheduleMode = preferences.getString(
+                "${groupPrefix}schedule_mode",
+                ScheduleMode.BLOCK_DURING.name,
+            )?.let { runCatching { ScheduleMode.valueOf(it) }.getOrNull() }
+                ?: ScheduleMode.BLOCK_DURING,
+            groupScheduleWindows = ScheduleCodec.decode(
+                preferences.getString("${groupPrefix}schedule_windows", null),
+            ),
+            groupCooldownEnabled = groupEnabled &&
+                preferences.getBoolean("${groupPrefix}cooldown_enabled", false),
+            groupCooldownMillis = preferences.getLong(
+                "${groupPrefix}cooldown_seconds",
+                RuleRepository.DEFAULT_COOLDOWN_SECONDS,
+            ).coerceIn(
+                RuleRepository.MIN_COOLDOWN_SECONDS,
+                RuleRepository.MAX_COOLDOWN_SECONDS,
+            ) * 1000L,
             perLaunchEnabled = perLaunchEnabled,
             perLaunchLimitMillis = (if (perLaunchLimitSeconds >= 0L) {
                 perLaunchLimitSeconds
@@ -1428,6 +2424,15 @@ private class RuntimeLimiter(
                 RuleRepository.KEY_FULL_SCREEN_EXIT_WARNING_ENABLED,
                 false,
             ),
+            exitWarningVibrationEnabled = preferences.getBoolean(
+                RuleRepository.KEY_EXIT_WARNING_VIBRATION_ENABLED,
+                false,
+            ),
+            languageMode = preferences.getString(
+                RuleRepository.KEY_LANGUAGE_MODE,
+                AppLanguageMode.SYSTEM.name,
+            )?.let { runCatching { AppLanguageMode.valueOf(it) }.getOrNull() }
+                ?: AppLanguageMode.SYSTEM,
             extensionMillis = preferences.getLong(
                 RuleRepository.KEY_EXTENSION_SECONDS,
                 RuleRepository.DEFAULT_EXTENSION_SECONDS,
@@ -1444,16 +2449,25 @@ private class RuntimeLimiter(
     private fun cacheRule(context: Context, rule: HookRule) {
         val signature = listOf(
             rule.enabled,
+            rule.sessionPlanningEnabled,
             rule.dailyEnabled,
             rule.dailyLimitMillis,
             rule.groupEnabled,
             rule.groupId,
             rule.groupName,
+            rule.groupDailyEnabled,
             rule.groupDailyLimitMillis,
             rule.groupTodayUsedMillis,
             rule.groupVersion,
             rule.groupDayToken,
             rule.groupMeasuredAtElapsedMillis,
+            rule.groupPerLaunchEnabled,
+            rule.groupPerLaunchLimitMillis,
+            rule.groupScheduleEnabled,
+            rule.groupScheduleMode.name,
+            ScheduleCodec.encode(rule.groupScheduleWindows),
+            rule.groupCooldownEnabled,
+            rule.groupCooldownMillis,
             rule.perLaunchEnabled,
             rule.perLaunchLimitMillis,
             rule.scheduleEnabled,
@@ -1464,6 +2478,8 @@ private class RuntimeLimiter(
             rule.version,
             rule.exitWarningEnabled,
             rule.fullScreenExitWarningEnabled,
+            rule.exitWarningVibrationEnabled,
+            rule.languageMode.name,
             rule.extensionMillis,
             rule.diagnosticsEnabled,
             rule.usageStatsEnabled,
@@ -1473,16 +2489,28 @@ private class RuntimeLimiter(
         prefs.edit()
             .putBoolean(CACHE_PRESENT, true)
             .putBoolean(CACHE_ENABLED, rule.enabled)
+            .putBoolean(CACHE_SESSION_PLANNING_ENABLED, rule.sessionPlanningEnabled)
             .putBoolean(CACHE_DAILY_ENABLED, rule.dailyEnabled)
             .putLong(CACHE_DAILY_LIMIT_MS, rule.dailyLimitMillis)
             .putBoolean(CACHE_GROUP_ENABLED, rule.groupEnabled)
             .putString(CACHE_GROUP_ID, rule.groupId)
             .putString(CACHE_GROUP_NAME, rule.groupName)
+            .putBoolean(CACHE_GROUP_DAILY_ENABLED, rule.groupDailyEnabled)
             .putLong(CACHE_GROUP_DAILY_LIMIT_MS, rule.groupDailyLimitMillis)
             .putLong(CACHE_GROUP_TODAY_USED_MS, rule.groupTodayUsedMillis)
             .putLong(CACHE_GROUP_VERSION, rule.groupVersion)
             .putString(CACHE_GROUP_DAY_TOKEN, rule.groupDayToken)
             .putLong(CACHE_GROUP_MEASURED_AT_ELAPSED_MS, rule.groupMeasuredAtElapsedMillis)
+            .putBoolean(CACHE_GROUP_PER_LAUNCH_ENABLED, rule.groupPerLaunchEnabled)
+            .putLong(CACHE_GROUP_PER_LAUNCH_LIMIT_MS, rule.groupPerLaunchLimitMillis)
+            .putBoolean(CACHE_GROUP_SCHEDULE_ENABLED, rule.groupScheduleEnabled)
+            .putString(CACHE_GROUP_SCHEDULE_MODE, rule.groupScheduleMode.name)
+            .putString(
+                CACHE_GROUP_SCHEDULE_WINDOWS,
+                ScheduleCodec.encode(rule.groupScheduleWindows),
+            )
+            .putBoolean(CACHE_GROUP_COOLDOWN_ENABLED, rule.groupCooldownEnabled)
+            .putLong(CACHE_GROUP_COOLDOWN_MS, rule.groupCooldownMillis)
             .putBoolean(CACHE_PER_LAUNCH_ENABLED, rule.perLaunchEnabled)
             .putLong(CACHE_PER_LAUNCH_LIMIT_MS, rule.perLaunchLimitMillis)
             .putBoolean(CACHE_SCHEDULE_ENABLED, rule.scheduleEnabled)
@@ -1496,6 +2524,11 @@ private class RuntimeLimiter(
                 CACHE_FULL_SCREEN_EXIT_WARNING_ENABLED,
                 rule.fullScreenExitWarningEnabled,
             )
+            .putBoolean(
+                CACHE_EXIT_WARNING_VIBRATION_ENABLED,
+                rule.exitWarningVibrationEnabled,
+            )
+            .putString(CACHE_LANGUAGE_MODE, rule.languageMode.name)
             .putLong(CACHE_EXTENSION_MS, rule.extensionMillis)
             .putBoolean(CACHE_DIAGNOSTICS_ENABLED, rule.diagnosticsEnabled)
             .putBoolean(CACHE_USAGE_STATS_ENABLED, rule.usageStatsEnabled)
@@ -1508,6 +2541,7 @@ private class RuntimeLimiter(
         if (!prefs.getBoolean(CACHE_PRESENT, false)) return null
         return HookRule(
             enabled = prefs.getBoolean(CACHE_ENABLED, false),
+            sessionPlanningEnabled = prefs.getBoolean(CACHE_SESSION_PLANNING_ENABLED, false),
             dailyEnabled = prefs.getBoolean(CACHE_DAILY_ENABLED, false),
             dailyLimitMillis = prefs.getLong(
                 CACHE_DAILY_LIMIT_MS,
@@ -1517,9 +2551,15 @@ private class RuntimeLimiter(
                 RuleRepository.MAX_LIMIT_SECONDS * 1000L,
             ),
             systemTodayUsedMillis = -1L,
+            systemUsageMeasuredAtElapsedMillis = SystemClock.elapsedRealtime(),
+            systemUsagePending = false,
             groupEnabled = prefs.getBoolean(CACHE_GROUP_ENABLED, false),
             groupId = prefs.getString(CACHE_GROUP_ID, "").orEmpty(),
             groupName = prefs.getString(CACHE_GROUP_NAME, "").orEmpty(),
+            groupDailyEnabled = prefs.getBoolean(
+                CACHE_GROUP_DAILY_ENABLED,
+                prefs.getBoolean(CACHE_GROUP_ENABLED, false),
+            ),
             groupDailyLimitMillis = prefs.getLong(
                 CACHE_GROUP_DAILY_LIMIT_MS,
                 RuleRepository.DEFAULT_GROUP_LIMIT_SECONDS * 1000L,
@@ -1533,6 +2573,31 @@ private class RuntimeLimiter(
             groupMeasuredAtElapsedMillis = prefs.getLong(
                 CACHE_GROUP_MEASURED_AT_ELAPSED_MS,
                 SystemClock.elapsedRealtime(),
+            ),
+            groupPerLaunchEnabled = prefs.getBoolean(CACHE_GROUP_PER_LAUNCH_ENABLED, false),
+            groupPerLaunchLimitMillis = prefs.getLong(
+                CACHE_GROUP_PER_LAUNCH_LIMIT_MS,
+                RuleRepository.DEFAULT_LIMIT_SECONDS * 1000L,
+            ).coerceIn(
+                RuleRepository.MIN_LIMIT_SECONDS * 1000L,
+                RuleRepository.MAX_LIMIT_SECONDS * 1000L,
+            ),
+            groupScheduleEnabled = prefs.getBoolean(CACHE_GROUP_SCHEDULE_ENABLED, false),
+            groupScheduleMode = prefs.getString(
+                CACHE_GROUP_SCHEDULE_MODE,
+                ScheduleMode.BLOCK_DURING.name,
+            )?.let { runCatching { ScheduleMode.valueOf(it) }.getOrNull() }
+                ?: ScheduleMode.BLOCK_DURING,
+            groupScheduleWindows = ScheduleCodec.decode(
+                prefs.getString(CACHE_GROUP_SCHEDULE_WINDOWS, null),
+            ),
+            groupCooldownEnabled = prefs.getBoolean(CACHE_GROUP_COOLDOWN_ENABLED, false),
+            groupCooldownMillis = prefs.getLong(
+                CACHE_GROUP_COOLDOWN_MS,
+                RuleRepository.DEFAULT_COOLDOWN_SECONDS * 1000L,
+            ).coerceIn(
+                RuleRepository.MIN_COOLDOWN_SECONDS * 1000L,
+                RuleRepository.MAX_COOLDOWN_SECONDS * 1000L,
             ),
             perLaunchEnabled = prefs.getBoolean(CACHE_PER_LAUNCH_ENABLED, false),
             perLaunchLimitMillis = prefs.getLong(
@@ -1561,6 +2626,13 @@ private class RuntimeLimiter(
                 CACHE_FULL_SCREEN_EXIT_WARNING_ENABLED,
                 false,
             ),
+            exitWarningVibrationEnabled = prefs.getBoolean(
+                CACHE_EXIT_WARNING_VIBRATION_ENABLED,
+                false,
+            ),
+            languageMode = prefs.getString(CACHE_LANGUAGE_MODE, AppLanguageMode.SYSTEM.name)
+                ?.let { runCatching { AppLanguageMode.valueOf(it) }.getOrNull() }
+                ?: AppLanguageMode.SYSTEM,
             extensionMillis = prefs.getLong(
                 CACHE_EXTENSION_MS,
                 RuleRepository.DEFAULT_EXTENSION_SECONDS * 1000L,
@@ -1576,17 +2648,28 @@ private class RuntimeLimiter(
 
     private fun unavailableRule() = HookRule(
         enabled = false,
+        sessionPlanningEnabled = false,
         dailyEnabled = false,
         dailyLimitMillis = RuleRepository.DEFAULT_LIMIT_SECONDS * 1000L,
         systemTodayUsedMillis = -1L,
+        systemUsageMeasuredAtElapsedMillis = SystemClock.elapsedRealtime(),
+        systemUsagePending = false,
         groupEnabled = false,
         groupId = "",
         groupName = "",
+        groupDailyEnabled = false,
         groupDailyLimitMillis = RuleRepository.DEFAULT_GROUP_LIMIT_SECONDS * 1000L,
         groupTodayUsedMillis = -1L,
         groupVersion = 0L,
         groupDayToken = "",
         groupMeasuredAtElapsedMillis = SystemClock.elapsedRealtime(),
+        groupPerLaunchEnabled = false,
+        groupPerLaunchLimitMillis = RuleRepository.DEFAULT_LIMIT_SECONDS * 1000L,
+        groupScheduleEnabled = false,
+        groupScheduleMode = ScheduleMode.BLOCK_DURING,
+        groupScheduleWindows = emptyList(),
+        groupCooldownEnabled = false,
+        groupCooldownMillis = RuleRepository.DEFAULT_COOLDOWN_SECONDS * 1000L,
         perLaunchEnabled = false,
         perLaunchLimitMillis = RuleRepository.DEFAULT_LIMIT_SECONDS * 1000L,
         scheduleEnabled = false,
@@ -1597,6 +2680,8 @@ private class RuntimeLimiter(
         version = Long.MIN_VALUE,
         exitWarningEnabled = true,
         fullScreenExitWarningEnabled = false,
+        exitWarningVibrationEnabled = false,
+        languageMode = AppLanguageMode.SYSTEM,
         extensionMillis = RuleRepository.DEFAULT_EXTENSION_SECONDS * 1000L,
         diagnosticsEnabled = true,
         usageStatsEnabled = true,
@@ -1637,17 +2722,28 @@ private class RuntimeLimiter(
 
     private data class HookRule(
         val enabled: Boolean,
+        val sessionPlanningEnabled: Boolean,
         val dailyEnabled: Boolean,
         val dailyLimitMillis: Long,
         val systemTodayUsedMillis: Long,
+        val systemUsageMeasuredAtElapsedMillis: Long,
+        val systemUsagePending: Boolean,
         val groupEnabled: Boolean,
         val groupId: String,
         val groupName: String,
+        val groupDailyEnabled: Boolean,
         val groupDailyLimitMillis: Long,
         val groupTodayUsedMillis: Long,
         val groupVersion: Long,
         val groupDayToken: String,
         val groupMeasuredAtElapsedMillis: Long,
+        val groupPerLaunchEnabled: Boolean,
+        val groupPerLaunchLimitMillis: Long,
+        val groupScheduleEnabled: Boolean,
+        val groupScheduleMode: ScheduleMode,
+        val groupScheduleWindows: List<ScheduleWindow>,
+        val groupCooldownEnabled: Boolean,
+        val groupCooldownMillis: Long,
         val perLaunchEnabled: Boolean,
         val perLaunchLimitMillis: Long,
         val scheduleEnabled: Boolean,
@@ -1658,6 +2754,8 @@ private class RuntimeLimiter(
         val version: Long,
         val exitWarningEnabled: Boolean,
         val fullScreenExitWarningEnabled: Boolean,
+        val exitWarningVibrationEnabled: Boolean,
+        val languageMode: AppLanguageMode,
         val extensionMillis: Long,
         val diagnosticsEnabled: Boolean,
         val usageStatsEnabled: Boolean,
@@ -1676,12 +2774,18 @@ private class RuntimeLimiter(
         val reachedLabels: String,
         val nextThresholdLabel: String,
         val groupOnlyReached: Boolean,
+        val hasThreshold: Boolean,
     )
 
     private data class PendingUsageBatch(
         var durationMillis: Long = 0L,
         var launches: Int = 0,
         var limitHits: Int = 0,
+    )
+
+    private data class ScheduleHitResult(
+        val recorded: Boolean,
+        val statsPersisted: Boolean,
     )
 
     private companion object {
@@ -1694,19 +2798,30 @@ private class RuntimeLimiter(
         const val KEY_USED_MS = "used_ms"
         const val KEY_COOLDOWN_STARTED_AT = "cooldown_started_at"
         const val KEY_COOLDOWN_RULE_VERSION = "cooldown_rule_version"
+        const val KEY_COOLDOWN_RULE_IDENTITY = "cooldown_rule_identity"
+        const val KEY_SCHEDULE_BLOCK_TOKEN = "schedule_block_token"
         const val CACHE_PRESENT = "present"
         const val CACHE_SIGNATURE = "signature"
         const val CACHE_ENABLED = "enabled"
+        const val CACHE_SESSION_PLANNING_ENABLED = "session_planning_enabled"
         const val CACHE_DAILY_ENABLED = "daily_enabled"
         const val CACHE_DAILY_LIMIT_MS = "daily_limit_ms"
         const val CACHE_GROUP_ENABLED = "group_enabled"
         const val CACHE_GROUP_ID = "group_id"
         const val CACHE_GROUP_NAME = "group_name"
+        const val CACHE_GROUP_DAILY_ENABLED = "group_daily_enabled"
         const val CACHE_GROUP_DAILY_LIMIT_MS = "group_daily_limit_ms"
         const val CACHE_GROUP_TODAY_USED_MS = "group_today_used_ms"
         const val CACHE_GROUP_VERSION = "group_version"
         const val CACHE_GROUP_DAY_TOKEN = "group_day_token"
         const val CACHE_GROUP_MEASURED_AT_ELAPSED_MS = "group_measured_at_elapsed_ms"
+        const val CACHE_GROUP_PER_LAUNCH_ENABLED = "group_per_launch_enabled"
+        const val CACHE_GROUP_PER_LAUNCH_LIMIT_MS = "group_per_launch_limit_ms"
+        const val CACHE_GROUP_SCHEDULE_ENABLED = "group_schedule_enabled"
+        const val CACHE_GROUP_SCHEDULE_MODE = "group_schedule_mode"
+        const val CACHE_GROUP_SCHEDULE_WINDOWS = "group_schedule_windows"
+        const val CACHE_GROUP_COOLDOWN_ENABLED = "group_cooldown_enabled"
+        const val CACHE_GROUP_COOLDOWN_MS = "group_cooldown_ms"
         const val CACHE_PER_LAUNCH_ENABLED = "per_launch_enabled"
         const val CACHE_PER_LAUNCH_LIMIT_MS = "per_launch_limit_ms"
         const val CACHE_SCHEDULE_ENABLED = "schedule_enabled"
@@ -1717,6 +2832,8 @@ private class RuntimeLimiter(
         const val CACHE_RULE_VERSION = "rule_version"
         const val CACHE_EXIT_WARNING_ENABLED = "exit_warning_enabled"
         const val CACHE_FULL_SCREEN_EXIT_WARNING_ENABLED = "full_screen_exit_warning_enabled"
+        const val CACHE_EXIT_WARNING_VIBRATION_ENABLED = "exit_warning_vibration_enabled"
+        const val CACHE_LANGUAGE_MODE = "language_mode"
         const val CACHE_EXTENSION_MS = "extension_ms"
         const val CACHE_DIAGNOSTICS_ENABLED = "diagnostics_enabled"
         const val CACHE_USAGE_STATS_ENABLED = "usage_stats_enabled"
@@ -1731,9 +2848,11 @@ private class RuntimeLimiter(
         const val FINAL_STATS_RETRY_DELAY_MS = 250L
         const val EXIT_RECOVERY_DELAY_MS = 2_000L
         const val WARNING_LEAD_MS = 5_000L
+        const val EXIT_WARNING_VIBRATION_MS = 1_200L
         const val COUNTDOWN_REFRESH_MS = 1_000L
         const val SCHEDULE_RECHECK_MAX_MS = 60_000L
         const val RULE_RECHECK_MAX_MS = 60_000L
+        const val SYSTEM_USAGE_PENDING_RECHECK_MS = 1_000L
         const val GROUP_USAGE_SYNC_INTERVAL_MS = 15_000L
         const val MAX_STATS_RETRIES = 3
         const val MAX_STATS_DURATION_PER_DAY_MS = 24L * 60L * 60L * 1000L

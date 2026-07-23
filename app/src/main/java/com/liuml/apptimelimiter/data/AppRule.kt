@@ -10,6 +10,12 @@ enum class ScheduleMode {
     BLOCK_DURING,
 }
 
+enum class AppLanguageMode {
+    SYSTEM,
+    SIMPLIFIED_CHINESE,
+    ENGLISH,
+}
+
 data class ScheduleWindow(
     val daysOfWeek: Set<Int>,
     val startMinute: Int,
@@ -31,6 +37,7 @@ data class ScheduleWindow(
 data class AppRule(
     val packageName: String,
     val enabled: Boolean = false,
+    val sessionPlanningEnabled: Boolean = false,
     val dailyEnabled: Boolean = false,
     val dailyLimitSeconds: Long = 30 * 60,
     val perLaunchEnabled: Boolean = false,
@@ -53,7 +60,15 @@ data class AppGroup(
     val id: String,
     val name: String,
     val enabled: Boolean = true,
+    val dailyEnabled: Boolean = true,
     val dailyLimitSeconds: Long = 60L * 60L,
+    val perLaunchEnabled: Boolean = false,
+    val perLaunchLimitSeconds: Long = 30L * 60L,
+    val scheduleEnabled: Boolean = false,
+    val scheduleMode: ScheduleMode = ScheduleMode.BLOCK_DURING,
+    val scheduleWindows: List<ScheduleWindow> = emptyList(),
+    val cooldownEnabled: Boolean = false,
+    val cooldownSeconds: Long = 5L * 60L,
     val packageNames: Set<String> = emptySet(),
     val version: Long = 0L,
 )
@@ -61,6 +76,8 @@ data class AppGroup(
 data class GlobalSettings(
     val exitWarningEnabled: Boolean = true,
     val fullScreenExitWarningEnabled: Boolean = false,
+    val exitWarningVibrationEnabled: Boolean = false,
+    val languageMode: AppLanguageMode = AppLanguageMode.SYSTEM,
     val extensionSeconds: Long = 5 * 60L,
     val diagnosticsEnabled: Boolean = true,
     val launcherIconHidden: Boolean = false,

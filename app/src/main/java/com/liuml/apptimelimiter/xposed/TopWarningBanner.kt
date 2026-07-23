@@ -22,6 +22,7 @@ import kotlin.math.max
 internal enum class WarningBannerKind {
     TIME_LIMIT,
     SCHEDULE,
+    SESSION_PLAN,
 }
 
 /**

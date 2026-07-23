@@ -15,6 +15,11 @@ data class ScheduleDecision(
         ?.let { Duration.between(now, it).toMillis().coerceAtLeast(0L) }
 }
 
+data class ScheduleConstraint(
+    val mode: ScheduleMode,
+    val windows: List<ScheduleWindow>,
+)
+
 object ScheduleEvaluator {
     fun evaluate(
         mode: ScheduleMode,
@@ -45,6 +50,39 @@ object ScheduleEvaluator {
             ScheduleMode.ALLOW_ONLY -> insideWindow
             ScheduleMode.BLOCK_DURING -> !insideWindow
         }
+    }
+
+    /**
+     * Intersects multiple schedules and skips boundaries where the combined state does not change.
+     * This keeps "next available" stable when app and group windows overlap.
+     */
+    fun evaluateAll(
+        constraints: List<ScheduleConstraint>,
+        now: ZonedDateTime,
+    ): ScheduleDecision {
+        val validConstraints = constraints.mapNotNull { constraint ->
+            constraint.windows.filter(ScheduleWindow::isValid)
+                .takeIf(List<ScheduleWindow>::isNotEmpty)
+                ?.let { constraint.copy(windows = it) }
+        }
+        if (validConstraints.isEmpty()) {
+            return ScheduleDecision(allowed = true, nextTransition = null)
+        }
+        val allowedNow = validConstraints.all { isAllowed(it.mode, it.windows, now) }
+        val transition = transitionCandidates(
+            windows = validConstraints.flatMap(ScheduleConstraint::windows),
+            today = now.toLocalDate(),
+            zone = now.zone,
+        )
+            .asSequence()
+            .filter { it.isAfter(now) }
+            .distinct()
+            .sorted()
+            .firstOrNull { candidate ->
+                val justAfter = candidate.plusNanos(1_000_000L)
+                validConstraints.all { isAllowed(it.mode, it.windows, justAfter) } != allowedNow
+            }
+        return ScheduleDecision(allowedNow, transition)
     }
 
     private fun contains(window: ScheduleWindow, now: ZonedDateTime): Boolean {
