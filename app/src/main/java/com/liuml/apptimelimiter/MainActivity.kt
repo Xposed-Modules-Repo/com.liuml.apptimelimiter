@@ -663,28 +663,7 @@ private fun TimeLimiterScreen(
             onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
             onSave = saveSettings@{ settings ->
                 val previousSettings = repository.getGlobalSettings()
-                val iconResult = runCatching {
-                    LauncherIconController.setHidden(context, settings.launcherIconHidden)
-                }
-                if (iconResult.isFailure) {
-                    Toast.makeText(
-                        context,
-                        localizedText(
-                            context,
-                            "修改桌面图标失败：${iconResult.exceptionOrNull()?.message}",
-                            "Failed to change launcher icon: ${iconResult.exceptionOrNull()?.message}",
-                        ),
-                        Toast.LENGTH_LONG,
-                    ).show()
-                    return@saveSettings
-                }
                 if (!repository.saveGlobalSettings(settings)) {
-                    runCatching {
-                        LauncherIconController.setHidden(
-                            context,
-                            previousSettings.launcherIconHidden,
-                        )
-                    }
                     Toast.makeText(
                         context,
                         localizedText(
@@ -704,22 +683,47 @@ private fun TimeLimiterScreen(
                         "warning=${settings.exitWarningEnabled}, fullScreen=${settings.fullScreenExitWarningEnabled}, vibration=${settings.exitWarningVibrationEnabled}, language=${settings.languageMode}, extension=${settings.extensionSeconds}s, diagnostics=${settings.diagnosticsEnabled}, iconHidden=${settings.launcherIconHidden}, usageStats=${settings.usageStatsEnabled}",
                     )
                 }
-                if (settings.launcherIconHidden) {
-                    Toast.makeText(
-                        context,
-                        localizedText(
-                            context,
-                            "桌面图标已关闭，可从 LSPosed 模块页打开应用",
-                            "Launcher icon hidden; open the app from the LSPosed module page",
-                        ),
-                        Toast.LENGTH_LONG,
-                    ).show()
-                }
                 usageRevision++
                 showSettings = false
                 if (settings.languageMode != previousSettings.languageMode) {
                     val manualRecreate = AppLocaleController.apply(context, settings.languageMode)
                     if (manualRecreate) (context as? Activity)?.recreate()
+                }
+                if (settings.launcherIconHidden != previousSettings.launcherIconHidden) {
+                    if (settings.launcherIconHidden) {
+                        Toast.makeText(
+                            context,
+                            localizedText(
+                                context,
+                                "正在隐藏桌面图标；以后可从 LSPosed 或系统应用信息的“应用内设置”进入",
+                                "Hiding the launcher icon; reopen from LSPosed or App settings in system app info",
+                            ),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                    val iconResult = runCatching {
+                        LauncherIconController.setHidden(
+                            context = context,
+                            hidden = settings.launcherIconHidden,
+                            refreshLauncher = settings.launcherIconHidden,
+                        )
+                    }
+                    if (iconResult.isFailure) {
+                        repository.saveGlobalSettings(
+                            settings.copy(
+                                launcherIconHidden = previousSettings.launcherIconHidden,
+                            ),
+                        )
+                        Toast.makeText(
+                            context,
+                            localizedText(
+                                context,
+                                "修改桌面图标失败：${iconResult.exceptionOrNull()?.message}",
+                                "Failed to change launcher icon: ${iconResult.exceptionOrNull()?.message}",
+                            ),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
                 }
             },
         )
@@ -2121,7 +2125,7 @@ private fun SettingsDialog(
                         Column(Modifier.weight(1f)) {
                             Text("隐藏桌面图标", fontWeight = FontWeight.Medium)
                             Text(
-                                "关闭后可从 LSPosed 模块页打开应用",
+                                "隐藏后仍可从 LSPosed 或系统应用信息进入设置",
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
@@ -2142,7 +2146,7 @@ private fun SettingsDialog(
                                 verticalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
                                 Text(
-                                    "隐藏后请先尝试从 LSPosed 模块页打开设置。若没有入口，可连接电脑执行：",
+                                    "隐藏后，桌面缓存图标可能短暂残留且无法点击，刷新后会消失。可从 LSPosed 模块页，或“系统设置 → 应用 → 时停 → 应用内设置”进入；也可连接电脑执行：",
                                     color = Color(0xFF8C1D18),
                                     style = MaterialTheme.typography.bodySmall,
                                 )

@@ -4,13 +4,13 @@
 
 ![Android 8.1+](https://img.shields.io/badge/Android-8.1%2B-3DDC84?logo=android&logoColor=white)
 ![LSPosed API 93+](https://img.shields.io/badge/LSPosed-API%2093%2B-5C6BC0)
-![Version 0.9.3](https://img.shields.io/badge/version-0.9.3-8E44AD)
+![Version 0.9.4](https://img.shields.io/badge/version-0.9.4-8E44AD)
 
 Stock screen-time tools are usually built for reports, daily caps, and focus modes. **Time Stop** is built for people who want sharper controls: per-app quotas, per-launch timers, weekly allow/block windows, shared group budgets, cooldowns after forced exits, Hook verification, and diagnostics that show what is actually happening inside the target process.
 
 [Latest release](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed module page](https://modules.lsposed.org/module/com.liuml.apptimelimiter/) · [中文说明](#中文说明)
 
-Current version: `0.9.3`
+Current version: `0.9.4`
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -47,7 +47,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Hook verification | Persists current-version Hook verification per controlled app and warns immediately when a newly controlled app or group member has not reported back. |
 | Diagnostics | Logs Hook setup, rule reads, timer starts, sync events, stats writes, and limit exits so configuration problems are traceable. |
 | System-app guardrails | Third-party apps can have their target process terminated; system apps only have their UI closed. |
-| Updates and feedback | Checks GitHub Releases, uses Android's download manager for APK updates, and offers email diagnostics or the QQ group for feedback and beta participation. |
+| Updates and feedback | Checks GitHub Releases, uses Android's download manager for APK updates, and offers email diagnostics or QQ group `1009712674` for feedback and beta participation. |
 
 Changing a rule resets the Hook-local accumulator for that app, but Android's system usage for the current day remains part of the daily baseline when usage access is granted. That makes rule tweaking visible, not a loophole.
 
@@ -160,7 +160,7 @@ This tool should be used only by the device owner or on explicitly authorized ma
 
 [下载最新版本](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed 模块页面](https://modules.lsposed.org/module/com.liuml.apptimelimiter/)
 
-当前版本：`0.9.3`
+当前版本：`0.9.4`
 
 ## 它和系统屏幕时间有什么不同？
 
@@ -201,8 +201,8 @@ This tool should be used only by the device owner or on explicitly authorized ma
 | 诊断日志 | 记录 Hook 安装、规则来源、计时开始与暂停、统计写入和限制触发，方便快速定位配置问题。 |
 | 系统安全保护 | 第三方应用到期后结束自身进程；系统应用只关闭界面，不结束系统进程，并记录开机诊断锚点。 |
 | 个性化设置 | 可选择顶部或全屏退出提醒、长震动，并控制语言、诊断记录和默认延时时长；修改规则后会重置 Hook 本地累计，系统当日时长仍保留。 |
-| 隐藏桌面入口 | 可隐藏启动图标，并通过 LSPosed 模块页或 `apptimelimiter://settings` 恢复进入设置。 |
-| 功能导览与联系 | 每次打开管理应用时可左右滑动查看主要功能，勾选“不再显示”后停止提示；设置与“关于”页支持邮件或 QQ 群反馈，并提供加入内测和软件声明入口。 |
+| 隐藏桌面入口 | 只隐藏 Launcher 图标，保留独立模块设置入口；可从 LSPosed 模块页、系统应用信息中的“应用内设置”或 ADB 恢复进入。部分桌面缓存的旧图标可能短暂残留且无法点击，刷新桌面后会消失。 |
+| 功能导览与联系 | 每次打开管理应用时可左右滑动查看主要功能，勾选“不再显示”后停止提示；设置与“关于”页支持邮件或 QQ 群 `1009712674` 反馈，并提供加入内测和软件声明入口。 |
 | 更新与反馈 | 可检查 GitHub Releases、调用系统下载管理器更新，并通过邮件附带诊断日志反馈问题。 |
 
 Hook 计时仅覆盖 `Activity.onResume` 到 `Activity.onPause` 的前台阶段，切到后台会暂停。修改规则时会重置该应用的 Hook 本地累计；如果已授权系统使用统计，Android 记录的当日时长仍会参与每日限制，不能通过修改规则清零。

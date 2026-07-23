@@ -2,7 +2,7 @@
 
 Precision app-time control for Android power users who want policy, telemetry, and enforcement in the same loop.
 
-Current version: `0.9.3`
+Current version: `0.9.4`
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -40,7 +40,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Hook verification | Persists current-version Hook verification per controlled app and warns immediately when a newly controlled app or group member has not reported back. |
 | Diagnostics | Logs Hook setup, rule reads, timer starts, sync events, stats writes, and limit exits so configuration problems are traceable. |
 | System-app guardrails | Third-party apps can have their target process terminated; system apps only have their UI closed. |
-| Updates and feedback | Checks GitHub Releases, uses Android's download manager for APK updates, and offers email diagnostics or the QQ group for feedback and beta participation. |
+| Updates and feedback | Checks GitHub Releases, uses Android's download manager for APK updates, and offers email diagnostics or QQ group `1009712674` for feedback and beta participation. |
 
 Changing a rule resets the Hook-local accumulator for that app, but Android's system usage for the current day remains part of the daily baseline when usage access is granted. That makes rule tweaking visible, not a loophole.
 

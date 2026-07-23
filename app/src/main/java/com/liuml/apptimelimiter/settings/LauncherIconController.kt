@@ -5,7 +5,11 @@ import android.content.Context
 import android.content.pm.PackageManager
 
 object LauncherIconController {
-    fun setHidden(context: Context, hidden: Boolean) {
+    fun setHidden(
+        context: Context,
+        hidden: Boolean,
+        refreshLauncher: Boolean = false,
+    ) {
         val component = ComponentName(context, "${context.packageName}.LauncherAlias")
         context.packageManager.setComponentEnabledSetting(
             component,
@@ -14,10 +18,11 @@ object LauncherIconController {
             } else {
                 PackageManager.COMPONENT_ENABLED_STATE_ENABLED
             },
-            PackageManager.DONT_KILL_APP,
+            if (refreshLauncher) 0 else PackageManager.DONT_KILL_APP,
         )
     }
 
     const val RECOVERY_COMMAND =
-        "adb shell am start -a android.intent.action.VIEW -d apptimelimiter://settings"
+        "adb shell pm enable com.liuml.apptimelimiter/.LauncherAlias\n" +
+            "adb shell am start -n com.liuml.apptimelimiter/.MainActivity"
 }
