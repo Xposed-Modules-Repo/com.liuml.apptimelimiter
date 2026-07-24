@@ -99,4 +99,12 @@ class SessionPlanPolicyTest {
         assertFalse(SessionPlanPolicy.EXPIRY_EFFECTS.startsCooldown)
         assertEquals(0, SessionPlanPolicy.EXPIRY_EFFECTS.limitHitIncrement)
     }
+
+    @Test
+    fun `prompt failure retries twice then fails closed`() {
+        assertTrue(SessionPlanPolicy.shouldRetryPrompt(1))
+        assertTrue(SessionPlanPolicy.shouldRetryPrompt(2))
+        assertFalse(SessionPlanPolicy.shouldRetryPrompt(3))
+        assertFalse(SessionPlanPolicy.shouldRetryPrompt(0))
+    }
 }

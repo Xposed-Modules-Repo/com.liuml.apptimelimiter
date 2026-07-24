@@ -8,4 +8,12 @@ object GroupMembershipPolicy {
     ): Boolean = packageNames.any { packageName ->
         assignedGroupByPackage[packageName]?.let { it != targetGroupId } == true
     }
+
+    fun hasNewMemberWithPersonalConfiguration(
+        requestedMembers: Collection<String>,
+        existingMembers: Collection<String>,
+        packagesWithPersonalConfiguration: Set<String>,
+    ): Boolean = (requestedMembers - existingMembers.toSet()).any {
+        it in packagesWithPersonalConfiguration
+    }
 }

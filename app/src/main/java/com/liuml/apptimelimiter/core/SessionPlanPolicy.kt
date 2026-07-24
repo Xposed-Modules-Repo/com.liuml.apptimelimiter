@@ -5,6 +5,7 @@ object SessionPlanPolicy {
     const val MIN_DURATION_MILLIS = 60_000L
     const val MAX_DURATION_MILLIS = 24L * 60L * 60L * 1_000L
     const val WARNING_LEAD_MILLIS = 5_000L
+    const val MAX_PROMPT_ATTEMPTS = 3
 
     fun sanitizeDurationMillis(durationMillis: Long): Long =
         durationMillis.coerceIn(MIN_DURATION_MILLIS, MAX_DURATION_MILLIS)
@@ -48,6 +49,9 @@ object SessionPlanPolicy {
     /** A plan may be offered when no timed quota exists or the earliest quota still has time left. */
     fun canOfferPlan(earliestQuotaRemainingMillis: Long?): Boolean =
         earliestQuotaRemainingMillis == null || earliestQuotaRemainingMillis > 0L
+
+    fun shouldRetryPrompt(failedAttempts: Int): Boolean =
+        failedAttempts in 1 until MAX_PROMPT_ATTEMPTS
 
     data class ExpiryEffects(
         val startsCooldown: Boolean,

@@ -1,6 +1,9 @@
 package com.liuml.apptimelimiter.core
 
 object CooldownPolicy {
+    fun canEnable(dailyEnabled: Boolean, perLaunchEnabled: Boolean): Boolean =
+        dailyEnabled || perLaunchEnabled
+
     fun remainingMillis(
         startedAtMillis: Long,
         durationMillis: Long,

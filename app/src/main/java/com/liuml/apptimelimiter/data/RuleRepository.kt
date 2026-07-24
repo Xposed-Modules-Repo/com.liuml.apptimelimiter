@@ -4,6 +4,11 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import com.liuml.apptimelimiter.core.SharedCooldownClaim
+import com.liuml.apptimelimiter.core.SharedCooldownPolicy
+import com.liuml.apptimelimiter.core.SharedCooldownRecord
+import com.liuml.apptimelimiter.core.CooldownPolicy
+import com.liuml.apptimelimiter.core.LimitEnforcementPolicy
 import com.liuml.apptimelimiter.ipc.RuleContract
 import com.liuml.apptimelimiter.core.GroupMembershipPolicy
 import java.io.File
@@ -48,6 +53,8 @@ class RuleRepository(context: Context) {
         )
         val scheduleEnabled = prefs.getBoolean("${prefix}schedule_enabled", false) &&
             scheduleWindows.isNotEmpty()
+        val cooldownEnabled = prefs.getBoolean("${prefix}cooldown_enabled", false) &&
+            CooldownPolicy.canEnable(dailyEnabled, perLaunchEnabled)
         return AppRule(
             packageName = packageName,
             enabled = legacyEnabled && (dailyEnabled || perLaunchEnabled || scheduleEnabled),
@@ -72,7 +79,7 @@ class RuleRepository(context: Context) {
             )?.let { runCatching { ScheduleMode.valueOf(it) }.getOrNull() }
                 ?: ScheduleMode.BLOCK_DURING,
             scheduleWindows = scheduleWindows,
-            cooldownEnabled = prefs.getBoolean("${prefix}cooldown_enabled", false),
+            cooldownEnabled = cooldownEnabled,
             cooldownSeconds = prefs.getLong(
                 "${prefix}cooldown_seconds",
                 DEFAULT_COOLDOWN_SECONDS,
@@ -86,6 +93,14 @@ class RuleRepository(context: Context) {
             .filter(ScheduleWindow::isValid)
             .take(ScheduleCodec.MAX_WINDOWS)
         val scheduleEnabled = rule.scheduleEnabled && scheduleWindows.isNotEmpty()
+        val cooldownEnabled = rule.cooldownEnabled &&
+            CooldownPolicy.canEnable(rule.dailyEnabled, rule.perLaunchEnabled)
+        val hasPersonalConfiguration = rule.sessionPlanningEnabled ||
+            rule.dailyEnabled ||
+            rule.perLaunchEnabled ||
+            scheduleEnabled ||
+            cooldownEnabled
+        if (hasPersonalConfiguration && groupForPackage(rule.packageName) != null) return false
         val packages = prefs.getStringSet(KEY_PACKAGES, emptySet()).orEmpty().toMutableSet()
         packages += rule.packageName
         val prefix = prefix(rule.packageName)
@@ -114,7 +129,7 @@ class RuleRepository(context: Context) {
             .putBoolean("${prefix}schedule_enabled", scheduleEnabled)
             .putString("${prefix}schedule_mode", rule.scheduleMode.name)
             .putString("${prefix}schedule_windows", ScheduleCodec.encode(scheduleWindows))
-            .putBoolean("${prefix}cooldown_enabled", rule.cooldownEnabled)
+            .putBoolean("${prefix}cooldown_enabled", cooldownEnabled)
             .putLong(
                 "${prefix}cooldown_seconds",
                 rule.cooldownSeconds.coerceIn(MIN_COOLDOWN_SECONDS, MAX_COOLDOWN_SECONDS),
@@ -153,6 +168,12 @@ class RuleRepository(context: Context) {
         val scheduleWindows = ScheduleCodec.decode(
             prefs.getString("${prefix}schedule_windows", null),
         )
+        val dailyEnabled = prefs.getBoolean("${prefix}daily_enabled", true)
+        val perLaunchEnabled = prefs.getBoolean("${prefix}per_launch_enabled", false)
+        val scheduleEnabled = prefs.getBoolean("${prefix}schedule_enabled", false) &&
+            scheduleWindows.isNotEmpty()
+        val cooldownEnabled = prefs.getBoolean("${prefix}cooldown_enabled", false) &&
+            CooldownPolicy.canEnable(dailyEnabled, perLaunchEnabled)
         return AppGroup(
             id = groupId,
             name = prefs.getString("${prefix}name", null)
@@ -161,25 +182,24 @@ class RuleRepository(context: Context) {
                 .take(MAX_GROUP_NAME_LENGTH),
             enabled = prefs.getBoolean("${prefix}enabled", true),
             // Groups created before multi-rule support only had a shared daily quota.
-            dailyEnabled = prefs.getBoolean("${prefix}daily_enabled", true),
+            dailyEnabled = dailyEnabled,
             dailyLimitSeconds = prefs.getLong(
                 "${prefix}daily_limit_seconds",
                 DEFAULT_GROUP_LIMIT_SECONDS,
             ).coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS),
-            perLaunchEnabled = prefs.getBoolean("${prefix}per_launch_enabled", false),
+            perLaunchEnabled = perLaunchEnabled,
             perLaunchLimitSeconds = prefs.getLong(
                 "${prefix}per_launch_limit_seconds",
                 DEFAULT_LIMIT_SECONDS,
             ).coerceIn(MIN_LIMIT_SECONDS, MAX_LIMIT_SECONDS),
-            scheduleEnabled = prefs.getBoolean("${prefix}schedule_enabled", false) &&
-                scheduleWindows.isNotEmpty(),
+            scheduleEnabled = scheduleEnabled,
             scheduleMode = prefs.getString(
                 "${prefix}schedule_mode",
                 ScheduleMode.BLOCK_DURING.name,
             )?.let { runCatching { ScheduleMode.valueOf(it) }.getOrNull() }
                 ?: ScheduleMode.BLOCK_DURING,
             scheduleWindows = scheduleWindows,
-            cooldownEnabled = prefs.getBoolean("${prefix}cooldown_enabled", false),
+            cooldownEnabled = cooldownEnabled,
             cooldownSeconds = prefs.getLong(
                 "${prefix}cooldown_seconds",
                 DEFAULT_COOLDOWN_SECONDS,
@@ -225,11 +245,21 @@ class RuleRepository(context: Context) {
             .filter(ScheduleWindow::isValid)
             .take(ScheduleCodec.MAX_WINDOWS)
         val scheduleEnabled = group.scheduleEnabled && scheduleWindows.isNotEmpty()
-        val hasActiveRule = group.dailyEnabled || group.perLaunchEnabled ||
-            scheduleEnabled || group.cooldownEnabled
+        val cooldownEnabled = group.cooldownEnabled &&
+            CooldownPolicy.canEnable(group.dailyEnabled, group.perLaunchEnabled)
+        val hasActiveRule = group.dailyEnabled || group.perLaunchEnabled || scheduleEnabled
+        val effectiveGroupEnabled = group.enabled && members.isNotEmpty() && hasActiveRule
 
         val prefix = groupPrefix(groupId)
         val previousMembers = prefs.getStringSet("${prefix}packages", emptySet()).orEmpty()
+        if (
+            GroupMembershipPolicy.hasNewMemberWithPersonalConfiguration(
+                requestedMembers = members,
+                existingMembers = previousMembers,
+                packagesWithPersonalConfiguration = members
+                    .filterTo(mutableSetOf()) { getRule(it).hasPersonalConfiguration() },
+            )
+        ) return false
         val previousVersion = prefs.getLong("${prefix}version", 0L)
         val nextVersion = maxOf(System.currentTimeMillis(), previousVersion + 1L)
         val groupIds = prefs.getStringSet(KEY_GROUP_IDS, emptySet()).orEmpty().toMutableSet()
@@ -242,7 +272,7 @@ class RuleRepository(context: Context) {
             .putString("${prefix}name", group.name.trim().ifBlank { DEFAULT_GROUP_NAME }.take(MAX_GROUP_NAME_LENGTH))
             .putBoolean(
                 "${prefix}enabled",
-                group.enabled && members.isNotEmpty() && hasActiveRule,
+                effectiveGroupEnabled,
             )
             .putBoolean("${prefix}daily_enabled", group.dailyEnabled)
             .putLong(
@@ -257,13 +287,16 @@ class RuleRepository(context: Context) {
             .putBoolean("${prefix}schedule_enabled", scheduleEnabled)
             .putString("${prefix}schedule_mode", group.scheduleMode.name)
             .putString("${prefix}schedule_windows", ScheduleCodec.encode(scheduleWindows))
-            .putBoolean("${prefix}cooldown_enabled", group.cooldownEnabled)
+            .putBoolean("${prefix}cooldown_enabled", cooldownEnabled)
             .putLong(
                 "${prefix}cooldown_seconds",
                 group.cooldownSeconds.coerceIn(MIN_COOLDOWN_SECONDS, MAX_COOLDOWN_SECONDS),
             )
             .putStringSet("${prefix}packages", members)
             .putLong("${prefix}version", nextVersion)
+        if (!effectiveGroupEnabled || !cooldownEnabled) {
+            removeGroupCooldownRuntime(editor, prefix)
+        }
         previousMembers.filterNot { it in members }.forEach { packageName ->
             if (prefs.getString("$KEY_PACKAGE_GROUP_PREFIX$packageName", null) == groupId) {
                 editor.remove("$KEY_PACKAGE_GROUP_PREFIX$packageName")
@@ -280,6 +313,85 @@ class RuleRepository(context: Context) {
             makePreferencesReadable()
         }
         return persisted
+    }
+
+    fun getGroupCooldownRecord(groupId: String): SharedCooldownRecord {
+        if (groupId.isBlank()) return SharedCooldownRecord()
+        val prefix = groupPrefix(groupId)
+        return SharedCooldownRecord(
+            startedAtMillis = prefs.getLong("${prefix}runtime_cooldown_started_at", 0L),
+            endsAtMillis = prefs.getLong("${prefix}runtime_cooldown_ends_at", 0L),
+            incidentId = prefs.getString("${prefix}runtime_cooldown_incident", null).orEmpty(),
+            sourcePackage = prefs.getString(
+                "${prefix}runtime_cooldown_source_package",
+                null,
+            ).orEmpty(),
+        )
+    }
+
+    /**
+     * Clears only the active runtime window after it has expired. The bounded incident history is
+     * deliberately retained so the same exhausted daily/session event cannot restart cooldown.
+     */
+    fun consumeExpiredGroupCooldown(
+        groupId: String,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): SharedCooldownRecord? = synchronized(GROUP_COOLDOWN_LOCK) {
+        val record = getGroupCooldownRecord(groupId)
+        if (record.endsAtMillis <= 0L || record.endsAtMillis > nowMillis) {
+            return@synchronized null
+        }
+        val editor = prefs.edit()
+        removeGroupCooldownRuntime(editor, groupPrefix(groupId))
+        if (!editor.commit()) return@synchronized null
+        makePreferencesReadable()
+        record
+    }
+
+    fun claimGroupCooldown(
+        groupId: String,
+        incidentId: String,
+        sourcePackage: String,
+        occurredAtMillis: Long,
+        durationMillis: Long,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): SharedCooldownClaim = synchronized(GROUP_COOLDOWN_LOCK) {
+        val prefix = groupPrefix(groupId)
+        val handledKey = "${prefix}runtime_cooldown_handled_incidents"
+        val handled = prefs.getString(handledKey, null)
+            .orEmpty()
+            .lineSequence()
+            .filter(String::isNotBlank)
+            .toList()
+        val claim = SharedCooldownPolicy.claim(
+            existingRecord = getGroupCooldownRecord(groupId),
+            handledIncidentIds = handled,
+            incidentId = incidentId,
+            sourcePackage = sourcePackage,
+            occurredAtMillis = occurredAtMillis,
+            durationMillis = durationMillis,
+            nowMillis = nowMillis,
+        )
+        val editor = prefs.edit()
+            .putString(handledKey, claim.handledIncidentIds.joinToString("\n"))
+        if (claim.record.endsAtMillis > 0L) {
+            editor
+                .putLong(
+                    "${prefix}runtime_cooldown_started_at",
+                    claim.record.startedAtMillis,
+                )
+                .putLong("${prefix}runtime_cooldown_ends_at", claim.record.endsAtMillis)
+                .putString("${prefix}runtime_cooldown_incident", claim.record.incidentId)
+                .putString(
+                    "${prefix}runtime_cooldown_source_package",
+                    claim.record.sourcePackage,
+                )
+        } else {
+            removeGroupCooldownRuntime(editor, prefix)
+        }
+        check(editor.commit()) { "Failed to persist group cooldown state" }
+        makePreferencesReadable()
+        claim
     }
 
     fun deleteGroup(groupId: String): Boolean {
@@ -321,6 +433,9 @@ class RuleRepository(context: Context) {
         diagnosticsEnabled = prefs.getBoolean(KEY_DIAGNOSTICS_ENABLED, true),
         launcherIconHidden = prefs.getBoolean(KEY_LAUNCHER_ICON_HIDDEN, false),
         usageStatsEnabled = prefs.getBoolean(KEY_USAGE_STATS_ENABLED, true),
+        limitEnforcementMode = LimitEnforcementPolicy.parseMode(
+            prefs.getString(KEY_LIMIT_ENFORCEMENT_MODE, null),
+        ),
     )
 
     fun saveGlobalSettings(settings: GlobalSettings): Boolean {
@@ -342,6 +457,7 @@ class RuleRepository(context: Context) {
             .putBoolean(KEY_DIAGNOSTICS_ENABLED, settings.diagnosticsEnabled)
             .putBoolean(KEY_LAUNCHER_ICON_HIDDEN, settings.launcherIconHidden)
             .putBoolean(KEY_USAGE_STATS_ENABLED, settings.usageStatsEnabled)
+            .putString(KEY_LIMIT_ENFORCEMENT_MODE, settings.limitEnforcementMode.name)
             .commit()
         if (persisted) makePreferencesReadable()
         return persisted
@@ -372,7 +488,19 @@ class RuleRepository(context: Context) {
     private fun prefix(packageName: String) = "rule.$packageName."
     private fun groupPrefix(groupId: String) = "group.$groupId."
 
+    private fun removeGroupCooldownRuntime(
+        editor: SharedPreferences.Editor,
+        prefix: String,
+    ) {
+        editor
+            .remove("${prefix}runtime_cooldown_started_at")
+            .remove("${prefix}runtime_cooldown_ends_at")
+            .remove("${prefix}runtime_cooldown_incident")
+            .remove("${prefix}runtime_cooldown_source_package")
+    }
+
     companion object {
+        private val GROUP_COOLDOWN_LOCK = Any()
         const val PREFS_NAME = "rules"
         const val KEY_PACKAGES = "configured_packages"
         const val KEY_GROUP_IDS = "group_ids"
@@ -397,6 +525,7 @@ class RuleRepository(context: Context) {
         const val KEY_DIAGNOSTICS_ENABLED = "global.diagnostics_enabled"
         const val KEY_LAUNCHER_ICON_HIDDEN = "global.launcher_icon_hidden"
         const val KEY_USAGE_STATS_ENABLED = "global.usage_stats_enabled"
+        const val KEY_LIMIT_ENFORCEMENT_MODE = "global.limit_enforcement_mode"
         const val DEFAULT_EXTENSION_SECONDS = 5L * 60L
         const val DEFAULT_COOLDOWN_SECONDS = 5L * 60L
         const val MIN_COOLDOWN_SECONDS = 60L

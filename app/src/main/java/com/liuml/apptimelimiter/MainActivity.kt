@@ -63,11 +63,13 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.draw.clip
@@ -95,6 +97,8 @@ import com.liuml.apptimelimiter.data.AppRule
 import com.liuml.apptimelimiter.data.AppGroup
 import com.liuml.apptimelimiter.data.AppLanguageMode
 import com.liuml.apptimelimiter.data.GlobalSettings
+import com.liuml.apptimelimiter.data.hasPersonalConfiguration
+import com.liuml.apptimelimiter.data.LimitEnforcementMode
 import com.liuml.apptimelimiter.data.InstalledApp
 import com.liuml.apptimelimiter.data.InstalledAppsRepository
 import com.liuml.apptimelimiter.data.RuleRepository
@@ -102,6 +106,7 @@ import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.data.ScheduleMode
 import com.liuml.apptimelimiter.data.ScheduleWindow
 import com.liuml.apptimelimiter.core.GroupUsagePolicy
+import com.liuml.apptimelimiter.core.CooldownPolicy
 import com.liuml.apptimelimiter.localization.AppLocaleController
 import com.liuml.apptimelimiter.localization.SupportedLanguage
 import com.liuml.apptimelimiter.localization.UiText
@@ -115,6 +120,9 @@ import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.update.ReleaseInfo
 import com.liuml.apptimelimiter.update.UpdateCheckResult
 import com.liuml.apptimelimiter.update.UpdateChecker
+import com.liuml.apptimelimiter.xposedstatus.ManagedAppHookState
+import com.liuml.apptimelimiter.xposedstatus.XposedStatusPolicy
+import com.liuml.apptimelimiter.xposedstatus.XposedStatusRepository
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -126,6 +134,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
+    private val xposedStatusRepository = XposedStatusRepository.instance
+
     override fun attachBaseContext(newBase: Context) {
         val languageMode = runCatching {
             RuleRepository(newBase).getGlobalSettings().languageMode
@@ -135,6 +145,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        xposedStatusRepository.initialize()
         val ruleRepository = RuleRepository(this)
         val diagnosticsRepository = DiagnosticsRepository(this)
         val usageStatsRepository = UsageStatsRepository(this)
@@ -160,10 +171,16 @@ class MainActivity : ComponentActivity() {
                         diagnosticsRepository,
                         usageStatsRepository,
                         deviceUsageStatsRepository,
+                        xposedStatusRepository,
                     )
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        xposedStatusRepository.refresh()
     }
 }
 
@@ -175,8 +192,10 @@ private fun TimeLimiterScreen(
     diagnosticsRepository: DiagnosticsRepository,
     usageStatsRepository: UsageStatsRepository,
     deviceUsageStatsRepository: DeviceUsageStatsRepository,
+    xposedStatusRepository: XposedStatusRepository,
 ) {
     val context = LocalContext.current
+    val xposedSnapshot by xposedStatusRepository.snapshot.collectAsState()
     val rules = remember {
         mutableStateMapOf<String, AppRule>().also { map ->
             apps.forEach { map[it.packageName] = repository.getRule(it.packageName) }
@@ -201,11 +220,18 @@ private fun TimeLimiterScreen(
     var groups by remember { mutableStateOf(repository.getGroups()) }
     var editingGroup by remember { mutableStateOf<AppGroup?>(null) }
     var scopeReminderPackages by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var scopeRequestInProgress by remember { mutableStateOf(false) }
     var usageRevision by remember { mutableIntStateOf(0) }
-    var showFeatureIntro by remember {
+    var showFeatureIntro by rememberSaveable {
         mutableStateOf(
             !context.getSharedPreferences("ui", Context.MODE_PRIVATE)
                 .getBoolean(FEATURE_INTRO_DISABLED_KEY, false),
+        )
+    }
+    var showBetaInvite by rememberSaveable {
+        mutableStateOf(
+            !context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+                .getBoolean(BETA_INVITE_DISABLED_KEY, false),
         )
     }
     var showSetupGuide by remember { mutableStateOf(false) }
@@ -310,8 +336,30 @@ private fun TimeLimiterScreen(
             )
         }
     }
-    val verifiedHookPackages = remember(hookFeaturePackages, usageRevision) {
-        usageStatsRepository.verifiedHookPackages(hookFeaturePackages, BuildConfig.VERSION_CODE)
+    val hookVersionByPackage = remember(hookSummaries) {
+        hookSummaries.associate { it.packageName to it.hookVersionCode }
+    }
+    val hookStatusPackages = remember(allLaunchablePackages, hookFeaturePackages) {
+        allLaunchablePackages + hookFeaturePackages
+    }
+    val hookStatusByPackage = remember(
+        hookStatusPackages,
+        hookVersionByPackage,
+        xposedSnapshot,
+    ) {
+        hookStatusPackages.associateWith { packageName ->
+            XposedStatusPolicy.resolve(
+                packageName = packageName,
+                snapshot = xposedSnapshot,
+                legacyHookVersionCode = hookVersionByPackage[packageName] ?: 0,
+                currentVersionCode = BuildConfig.VERSION_CODE,
+            )
+        }
+    }
+    val scopeReadyPackages = remember(hookStatusPackages, hookStatusByPackage) {
+        hookStatusPackages.filterTo(mutableSetOf()) { packageName ->
+            hookStatusByPackage[packageName]?.let(XposedStatusPolicy::isScopeReady) == true
+        }
     }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -412,7 +460,8 @@ private fun TimeLimiterScreen(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 enabledCount = enabledPackages.size,
                 todayTotalMillis = todayTotalMillis,
-                verifiedHookPackages = verifiedHookPackages,
+                hookStates = enabledPackages.mapNotNull(hookStatusByPackage::get),
+                frameworkConnected = xposedSnapshot.connected,
                 statsEnabled = statsEnabled,
                 usageAccessGranted = usageAccessGranted,
                 onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
@@ -466,9 +515,17 @@ private fun TimeLimiterScreen(
                         app = app,
                         rule = rule,
                         groupName = groupByPackage[app.packageName]?.name,
-                        hookVerified = app.packageName in verifiedHookPackages,
-                        onClick = { editingApp = app },
+                        hookState = hookStatusByPackage[app.packageName]
+                            ?: ManagedAppHookState.COMPATIBILITY_PENDING,
+                        onClick = {
+                            groupByPackage[app.packageName]?.let { editingGroup = it }
+                                ?: run { editingApp = app }
+                        },
                         onToggle = { enabled ->
+                            groupByPackage[app.packageName]?.let {
+                                editingGroup = it
+                                return@AppRow
+                            }
                             if (enabled) {
                                 editingApp = app
                             } else {
@@ -565,7 +622,7 @@ private fun TimeLimiterScreen(
                 rules[app.packageName] = repository.getRule(app.packageName)
                 if (
                     newlyControlled &&
-                    app.packageName !in verifiedHookPackages
+                    app.packageName !in scopeReadyPackages
                 ) {
                     scopeReminderPackages = setOf(app.packageName)
                 }
@@ -579,6 +636,7 @@ private fun TimeLimiterScreen(
             initialGroup = group,
             apps = selectableApps,
             groups = groups,
+            rules = rules.toMap(),
             onDismiss = { editingGroup = null },
             onSave = { updated ->
                 val newlyControlledPackages = if (updated.enabled) {
@@ -588,7 +646,7 @@ private fun TimeLimiterScreen(
                 }
                 if (repository.saveGroup(updated)) {
                     groups = repository.getGroups()
-                    scopeReminderPackages = newlyControlledPackages - verifiedHookPackages
+                    scopeReminderPackages = newlyControlledPackages - scopeReadyPackages
                     editingGroup = null
                     usageRevision++
                 } else {
@@ -596,8 +654,8 @@ private fun TimeLimiterScreen(
                         context,
                         localizedText(
                             context,
-                            "保存失败：应用可能已属于其他分组",
-                            "Save failed: an app may already belong to another group",
+                            "保存失败：应用可能已有个人设置或属于其他分组",
+                            "Save failed: an app may have personal settings or belong to another group",
                         ),
                         Toast.LENGTH_LONG,
                     ).show()
@@ -629,7 +687,9 @@ private fun TimeLimiterScreen(
 
     if (showSettings) {
         SettingsDialog(
-            initialSettings = repository.getGlobalSettings(),
+            initialSettings = repository.getGlobalSettings().copy(
+                launcherIconHidden = LauncherIconController.isHidden(context),
+            ),
             usageAccessGranted = usageAccessGranted,
             onDismiss = { showSettings = false },
             onDonate = { openAlipayDonation(context) },
@@ -662,8 +722,38 @@ private fun TimeLimiterScreen(
             },
             onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
             onSave = saveSettings@{ settings ->
-                val previousSettings = repository.getGlobalSettings()
+                val previousSettings = repository.getGlobalSettings().copy(
+                    launcherIconHidden = LauncherIconController.isHidden(context),
+                )
+                var iconResult: LauncherIconController.ChangeResult? = null
+                if (settings.launcherIconHidden != previousSettings.launcherIconHidden) {
+                    iconResult = runCatching {
+                        LauncherIconController.setHidden(
+                            context = context,
+                            hidden = settings.launcherIconHidden,
+                        )
+                    }.getOrElse { error ->
+                        Toast.makeText(
+                            context,
+                            localizedText(
+                                context,
+                                "修改桌面图标失败：${error.message}",
+                                "Failed to change launcher icon: ${error.message}",
+                            ),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        return@saveSettings
+                    }
+                }
                 if (!repository.saveGlobalSettings(settings)) {
+                    if (iconResult != null) {
+                        runCatching {
+                            LauncherIconController.setHidden(
+                                context,
+                                previousSettings.launcherIconHidden,
+                            )
+                        }
+                    }
                     Toast.makeText(
                         context,
                         localizedText(
@@ -680,7 +770,7 @@ private fun TimeLimiterScreen(
                         "INFO",
                         context.packageName,
                         "SETTINGS_SAVED",
-                        "warning=${settings.exitWarningEnabled}, fullScreen=${settings.fullScreenExitWarningEnabled}, vibration=${settings.exitWarningVibrationEnabled}, language=${settings.languageMode}, extension=${settings.extensionSeconds}s, diagnostics=${settings.diagnosticsEnabled}, iconHidden=${settings.launcherIconHidden}, usageStats=${settings.usageStatsEnabled}",
+                        "warning=${settings.exitWarningEnabled}, fullScreen=${settings.fullScreenExitWarningEnabled}, vibration=${settings.exitWarningVibrationEnabled}, language=${settings.languageMode}, extension=${settings.extensionSeconds}s, enforcement=${settings.limitEnforcementMode}, diagnostics=${settings.diagnosticsEnabled}, iconHidden=${settings.launcherIconHidden}, usageStats=${settings.usageStatsEnabled}",
                     )
                 }
                 usageRevision++
@@ -689,39 +779,34 @@ private fun TimeLimiterScreen(
                     val manualRecreate = AppLocaleController.apply(context, settings.languageMode)
                     if (manualRecreate) (context as? Activity)?.recreate()
                 }
-                if (settings.launcherIconHidden != previousSettings.launcherIconHidden) {
+                if (iconResult != null) {
                     if (settings.launcherIconHidden) {
                         Toast.makeText(
                             context,
                             localizedText(
                                 context,
-                                "正在隐藏桌面图标；以后可从 LSPosed 或系统应用信息的“应用内设置”进入",
-                                "Hiding the launcher icon; reopen from LSPosed or App settings in system app info",
+                                if (iconResult.launcherResolvable) {
+                                    "组件已隐藏，但桌面尚未刷新；旧图标可能暂时保留且无法点击，可手动删除或刷新桌面"
+                                } else {
+                                    "桌面图标已隐藏；以后可从 LSPosed 模块页打开设置"
+                                },
+                                if (iconResult.launcherResolvable) {
+                                    "The component is hidden, but the launcher has not refreshed yet"
+                                } else {
+                                    "Launcher icon hidden; reopen settings from the LSPosed module page"
+                                },
                             ),
                             Toast.LENGTH_LONG,
                         ).show()
-                    }
-                    val iconResult = runCatching {
-                        LauncherIconController.setHidden(
-                            context = context,
-                            hidden = settings.launcherIconHidden,
-                            refreshLauncher = settings.launcherIconHidden,
-                        )
-                    }
-                    if (iconResult.isFailure) {
-                        repository.saveGlobalSettings(
-                            settings.copy(
-                                launcherIconHidden = previousSettings.launcherIconHidden,
-                            ),
-                        )
+                    } else {
                         Toast.makeText(
                             context,
                             localizedText(
                                 context,
-                                "修改桌面图标失败：${iconResult.exceptionOrNull()?.message}",
-                                "Failed to change launcher icon: ${iconResult.exceptionOrNull()?.message}",
+                                "桌面图标已恢复",
+                                "Launcher icon restored",
                             ),
-                            Toast.LENGTH_LONG,
+                            Toast.LENGTH_SHORT,
                         ).show()
                     }
                 }
@@ -801,26 +886,92 @@ private fun TimeLimiterScreen(
     if (scopeReminderPackages.isNotEmpty()) {
         val appByPackage = remember(apps) { apps.associateBy(InstalledApp::packageName) }
         val labels = scopeReminderPackages.map { appByPackage[it]?.label ?: it }.sorted()
+        val requestablePackages = scopeReminderPackages.filterTo(mutableSetOf()) { packageName ->
+            xposedSnapshot.connected &&
+                hookStatusByPackage[packageName] == ManagedAppHookState.NOT_IN_SCOPE
+        }
         AlertDialog(
-            onDismissRequest = { scopeReminderPackages = emptySet() },
+            onDismissRequest = {
+                if (!scopeRequestInProgress) scopeReminderPackages = emptySet()
+            },
             title = { Text("请确认 LSPosed 作用域") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(labels.joinToString("、"))
                     Text(
-                        "规则已保存，但这些应用尚未回传当前版本的 Hook 验证。请确认已加入时停的 LSPosed 作用域，再强制停止并重新打开目标应用。",
+                        if (requestablePackages.isNotEmpty()) {
+                            "检测到这些应用尚未加入时停的 LSPosed 作用域。可以向框架申请加入，确认后请强制停止并重新打开目标应用。"
+                        } else {
+                            "当前框架无法直接确认这些应用的作用域，或 Hook 版本仍待验证。请在 LSPosed 中检查作用域，再强制停止并重新打开目标应用。"
+                        },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             },
             confirmButton = {
-                Button(onClick = { scopeReminderPackages = emptySet() }) { Text("我已了解") }
+                Button(
+                    enabled = !scopeRequestInProgress,
+                    onClick = {
+                        if (requestablePackages.isEmpty()) {
+                            scopeReminderPackages = emptySet()
+                        } else {
+                            scopeRequestInProgress = true
+                            xposedStatusRepository.requestScope(requestablePackages) {
+                                    approved,
+                                    errorMessage,
+                                ->
+                                scopeRequestInProgress = false
+                                if (errorMessage != null) {
+                                    Toast.makeText(
+                                        context,
+                                        localizedText(
+                                            context,
+                                            "作用域申请失败：$errorMessage",
+                                            "Scope request failed: $errorMessage",
+                                        ),
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                } else {
+                                    scopeReminderPackages -= approved
+                                    Toast.makeText(
+                                        context,
+                                        if (approved.isEmpty()) {
+                                            localizedText(
+                                                context,
+                                                "未添加新的作用域",
+                                                "No new scope was added",
+                                            )
+                                        } else {
+                                            localizedText(
+                                                context,
+                                                "已批准 ${approved.size} 个应用，请强停后重开目标应用",
+                                                "${approved.size} apps approved; force-stop and reopen them",
+                                            )
+                                        },
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                }
+                            }
+                        }
+                    },
+                ) {
+                    Text(
+                        when {
+                            scopeRequestInProgress -> "正在申请"
+                            requestablePackages.isNotEmpty() -> "请求加入作用域"
+                            else -> "我已了解"
+                        },
+                    )
+                }
             },
             dismissButton = {
-                TextButton(onClick = {
-                    scopeReminderPackages = emptySet()
-                    showSetupGuide = true
-                }) { Text("查看配置要求") }
+                TextButton(
+                    enabled = !scopeRequestInProgress,
+                    onClick = {
+                        scopeReminderPackages = emptySet()
+                        showSetupGuide = true
+                    },
+                ) { Text("查看配置要求") }
             },
         )
     }
@@ -835,6 +986,19 @@ private fun TimeLimiterScreen(
                         .apply()
                 }
                 showFeatureIntro = false
+            },
+        )
+    } else if (showBetaInvite) {
+        BetaInviteDialog(
+            onClose = { doNotShowAgain, joinGroup ->
+                if (doNotShowAgain) {
+                    context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+                        .edit()
+                        .putBoolean(BETA_INVITE_DISABLED_KEY, true)
+                        .apply()
+                }
+                showBetaInvite = false
+                if (joinGroup) openQqGroup(context)
             },
         )
     } else if (showSetupGuide) {
@@ -858,7 +1022,8 @@ private fun HomeDashboard(
     modifier: Modifier,
     enabledCount: Int,
     todayTotalMillis: Long,
-    verifiedHookPackages: Set<String>,
+    hookStates: List<ManagedAppHookState>,
+    frameworkConnected: Boolean,
     statsEnabled: Boolean,
     usageAccessGranted: Boolean,
     onRequestUsageAccess: () -> Unit,
@@ -867,22 +1032,39 @@ private fun HomeDashboard(
     onOpenGuide: () -> Unit,
     onOpenLogs: () -> Unit,
 ) {
-    val verifiedCount = verifiedHookPackages.size.coerceAtMost(enabledCount)
-    val pendingCount = (enabledCount - verifiedCount).coerceAtLeast(0)
-    val allVerified = enabledCount > 0 && pendingCount == 0
+    val readyCount = hookStates.count(XposedStatusPolicy::isScopeReady)
+        .coerceAtMost(enabledCount)
+    val pendingCount = (enabledCount - readyCount).coerceAtLeast(0)
+    val missingScopeCount = hookStates.count { it == ManagedAppHookState.NOT_IN_SCOPE }
+    val abnormalCount = hookStates.count {
+        it == ManagedAppHookState.RUNNING_STALE ||
+            it == ManagedAppHookState.RUNNING_FAILED
+    }
+    val runningCount = hookStates.count { it == ManagedAppHookState.RUNNING_CURRENT }
+    val allReady = enabledCount > 0 && pendingCount == 0
     val statusTitle = when {
         enabledCount == 0 -> "未启用管控"
-        allVerified -> "Hook 已验证"
-        verifiedCount > 0 -> "已验证 $verifiedCount / $enabledCount 个应用"
-        else -> "等待 Hook 验证"
+        missingScopeCount > 0 -> "$missingScopeCount 个应用未加入作用域"
+        abnormalCount > 0 -> "Hook 状态异常"
+        runningCount > 0 -> "Hook 正在运行"
+        allReady && frameworkConnected -> "作用域已配置"
+        allReady -> "Hook 已验证"
+        readyCount > 0 -> "已就绪 $readyCount / $enabledCount 个应用"
+        frameworkConnected -> "等待目标应用启动"
+        else -> "兼容模式，等待 Hook 验证"
     }
     val statusDescription = when {
         enabledCount == 0 -> "请先选择需要管控的应用"
-        allVerified -> "$enabledCount 个管控应用均已回传当前版本 Hook 记录"
-        else -> "仍有 $pendingCount 个应用待验证；请确认作用域后强停并重开它们"
+        missingScopeCount > 0 -> "请将缺失的应用加入时停作用域"
+        abnormalCount > 0 -> "请强制停止目标应用并重新打开，以加载当前模块版本"
+        runningCount > 0 -> "$runningCount 个目标应用进程已回传当前 Hook 状态"
+        allReady && frameworkConnected -> "$enabledCount 个管控应用均已加入作用域"
+        allReady -> "$enabledCount 个管控应用均已回传当前版本 Hook 记录"
+        frameworkConnected -> "仍有 $pendingCount 个应用启动后才能完成 Hook 验证"
+        else -> "当前框架不支持直接读取作用域，将在目标应用启动后验证"
     }
-    val healthy = allVerified
-    val warning = enabledCount > 0 && !allVerified
+    val healthy = allReady
+    val warning = enabledCount > 0 && !allReady
     LazyColumn(
         modifier = modifier,
         contentPadding = androidx.compose.foundation.layout.PaddingValues(20.dp),
@@ -1241,7 +1423,7 @@ private fun GroupManagementScreen(
                 Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("分组额度与规则", fontWeight = FontWeight.Bold, color = Color(0xFF154B99))
                     Text(
-                        "可统一设置共享每日额度、单次打开、可用时段和退出后冷却；应用自己的规则仍会同时生效。",
+                        "可统一设置共享每日额度、单次打开、可用时段和共享冷却；加入后个人规则暂停，移出后恢复。",
                         style = MaterialTheme.typography.bodyMedium,
                         color = Color(0xFF294D7A),
                     )
@@ -1323,6 +1505,7 @@ private fun GroupEditorDialog(
     initialGroup: AppGroup,
     apps: List<InstalledApp>,
     groups: List<AppGroup>,
+    rules: Map<String, AppRule>,
     onDismiss: () -> Unit,
     onSave: (AppGroup) -> Unit,
     onDelete: () -> Unit,
@@ -1368,12 +1551,16 @@ private fun GroupEditorDialog(
             .flatMap { group -> group.packageNames.map { it to group.name } }
             .toMap()
     }
+    val personalRulePackages = remember(rules) {
+        rules.filterValues(AppRule::hasPersonalConfiguration).keys
+    }
     val parsedDailyMinutes = dailyMinutes.toLongOrNull()?.takeIf { it in 1L..1_440L }
     val parsedPerLaunchMinutes = perLaunchMinutes.toLongOrNull()?.takeIf { it in 1L..1_440L }
     val parsedCooldownMinutes = cooldownMinutes.toLongOrNull()?.takeIf { it in 1L..1_440L }
     val scheduleValid = !scheduleEnabled ||
         (scheduleWindows.isNotEmpty() && scheduleWindows.all(ScheduleWindow::isValid))
-    val hasRule = dailyEnabled || perLaunchEnabled || scheduleEnabled || cooldownEnabled
+    val cooldownAvailable = CooldownPolicy.canEnable(dailyEnabled, perLaunchEnabled)
+    val hasRule = dailyEnabled || perLaunchEnabled || scheduleEnabled
     val canSave = name.trim().isNotEmpty() &&
         selectedPackages.isNotEmpty() &&
         hasRule &&
@@ -1442,7 +1629,10 @@ private fun GroupEditorDialog(
                         enabled = dailyEnabled,
                         minutes = dailyMinutes,
                         parsedMinutes = parsedDailyMinutes,
-                        onEnabledChange = { dailyEnabled = it },
+                        onEnabledChange = {
+                            dailyEnabled = it
+                            if (!it && !perLaunchEnabled) cooldownEnabled = false
+                        },
                         onMinutesChange = { dailyMinutes = it },
                     )
                 }
@@ -1454,7 +1644,10 @@ private fun GroupEditorDialog(
                         enabled = perLaunchEnabled,
                         minutes = perLaunchMinutes,
                         parsedMinutes = parsedPerLaunchMinutes,
-                        onEnabledChange = { perLaunchEnabled = it },
+                        onEnabledChange = {
+                            perLaunchEnabled = it
+                            if (!it && !dailyEnabled) cooldownEnabled = false
+                        },
                         onMinutesChange = { perLaunchMinutes = it },
                     )
                 }
@@ -1473,17 +1666,29 @@ private fun GroupEditorDialog(
                 item {
                     ThresholdEditor(
                         title = "退出后冷却",
-                        description = "成员被强制退出后，在设定时间内禁止其再次打开",
+                        description = "任一成员达到分组额度后，整个分组共同进入冷却",
                         enabled = cooldownEnabled,
+                        toggleAvailable = cooldownAvailable,
                         minutes = cooldownMinutes,
                         parsedMinutes = parsedCooldownMinutes,
-                        onEnabledChange = { cooldownEnabled = it },
+                        onEnabledChange = {
+                            if (cooldownAvailable) cooldownEnabled = it
+                        },
                         onMinutesChange = { cooldownMinutes = it },
                     )
                 }
+                if (!cooldownAvailable) {
+                    item {
+                        Text(
+                            "需先开启每日累计或单次打开，才能启用退出后冷却。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
                 item {
                     Text(
-                        "应用自己的规则与分组规则同时计算，任一先触发即执行退出。",
+                        "组内应用只执行本分组规则；个人规则与本次计划在分组期间暂停。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary,
                     )
@@ -1492,7 +1697,7 @@ private fun GroupEditorDialog(
                 item {
                     Text("选择应用（${selectedPackages.size}）", fontWeight = FontWeight.Medium)
                     Text(
-                        "已选应用会自动置顶。每个应用只能属于一个组；所有成员仍需在 LSPosed 作用域中勾选。",
+                        "已选应用会自动置顶。已有个人设置或已属于其他组的应用不能新加入。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1519,6 +1724,8 @@ private fun GroupEditorDialog(
                 items(matchingApps, key = InstalledApp::packageName) { app ->
                     val occupiedBy = occupiedByOtherGroup[app.packageName]
                     val selected = app.packageName in selectedPackages
+                    val hasPersonalRule = app.packageName in personalRulePackages
+                    val selectable = selected || (occupiedBy == null && !hasPersonalRule)
                     FilterChip(
                         selected = selected,
                         onClick = {
@@ -1528,10 +1735,16 @@ private fun GroupEditorDialog(
                                 selectedPackages + app.packageName
                             }
                         },
-                        enabled = occupiedBy == null,
+                        enabled = selectable,
                         label = {
                             Text(
-                                if (occupiedBy == null) app.label else "${app.label}（已在 $occupiedBy）",
+                                when {
+                                    occupiedBy != null -> "${app.label}（已在 $occupiedBy）"
+                                    hasPersonalRule && !selected ->
+                                        "${app.label}（已有个人设置）"
+                                    hasPersonalRule -> "${app.label}（个人设置已暂停）"
+                                    else -> app.label
+                                },
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
@@ -1555,7 +1768,7 @@ private fun GroupEditorDialog(
                             scheduleEnabled = scheduleEnabled,
                             scheduleMode = scheduleMode,
                             scheduleWindows = scheduleWindows,
-                            cooldownEnabled = cooldownEnabled,
+                            cooldownEnabled = cooldownEnabled && cooldownAvailable,
                             cooldownSeconds = (parsedCooldownMinutes ?: 1L) * 60L,
                             packageNames = selectedPackages,
                         ),
@@ -1591,7 +1804,7 @@ private fun AppRow(
     app: InstalledApp,
     rule: AppRule,
     groupName: String?,
-    hookVerified: Boolean,
+    hookState: ManagedAppHookState,
     onClick: () -> Unit,
     onToggle: (Boolean) -> Unit,
 ) {
@@ -1628,29 +1841,37 @@ private fun AppRow(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    if (rule.enabled) ManagedBadge()
-                    if (rule.sessionPlanningEnabled) ManagedBadge("计划")
+                    if (groupName == null && rule.enabled) ManagedBadge()
+                    if (groupName == null && rule.sessionPlanningEnabled) ManagedBadge("计划")
                     if (groupName != null) ManagedBadge("分组")
-                    if (controlled && !hookVerified) PendingHookBadge()
                 }
-                Text(
-                    if (controlled) {
-                        listOfNotNull(
-                            ruleSummary(rule).takeIf { rule.enabled },
-                            "打开时制定计划".takeIf { rule.sessionPlanningEnabled },
-                            groupName?.let { "$it · 共享额度" },
-                        ).joinToString(" · ")
-                    } else {
-                        app.packageName
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    if (controlled) HookStatusBadge(hookState)
+                    Text(
+                        if (controlled) {
+                            listOfNotNull(
+                                ruleSummary(rule).takeIf { groupName == null && rule.enabled },
+                                "打开时制定计划".takeIf {
+                                    groupName == null && rule.sessionPlanningEnabled
+                                },
+                                groupName?.let { "$it · 共享额度" },
+                            ).joinToString(" · ")
+                        } else {
+                            app.packageName
+                        },
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
             Switch(
-                checked = rule.enabled || rule.sessionPlanningEnabled,
+                checked = controlled,
                 onCheckedChange = onToggle,
             )
         }
@@ -1658,14 +1879,35 @@ private fun AppRow(
 }
 
 @Composable
-private fun PendingHookBadge() {
+private fun HookStatusBadge(state: ManagedAppHookState) {
+    val label = when (state) {
+        ManagedAppHookState.NOT_IN_SCOPE -> "未加入作用域"
+        ManagedAppHookState.IN_SCOPE_IDLE -> "已在作用域"
+        ManagedAppHookState.RUNNING_CURRENT -> "Hook 运行中"
+        ManagedAppHookState.RUNNING_STALE -> "Hook 待重载"
+        ManagedAppHookState.RUNNING_FAILED -> "Hook 异常"
+        ManagedAppHookState.LEGACY_VERIFIED -> "Hook 已验证"
+        ManagedAppHookState.COMPATIBILITY_PENDING -> "待 Hook 验证"
+    }
+    val background = when (state) {
+        ManagedAppHookState.RUNNING_CURRENT,
+        ManagedAppHookState.LEGACY_VERIFIED,
+        -> Color(0xFF237A45)
+        ManagedAppHookState.IN_SCOPE_IDLE -> Color(0xFF315EA8)
+        ManagedAppHookState.NOT_IN_SCOPE,
+        ManagedAppHookState.COMPATIBILITY_PENDING,
+        -> Color(0xFFB54708)
+        ManagedAppHookState.RUNNING_STALE,
+        ManagedAppHookState.RUNNING_FAILED,
+        -> Color(0xFFB42318)
+    }
     Surface(
-        color = Color(0xFFB54708),
+        color = background,
         contentColor = Color.White,
         shape = RoundedCornerShape(999.dp),
     ) {
         Text(
-            "待 Hook 验证",
+            label,
             modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
             style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.Bold,
@@ -1750,7 +1992,7 @@ private fun FeatureIntroDialog(onClose: (doNotShowAgain: Boolean) -> Unit) {
                 eyebrow = "应用分组",
                 title = "一组应用，共享一套规则",
                 description = "将短视频、游戏等应用归入同一组，统一配置共享每日额度、单次打开、时段和冷却。",
-                highlights = listOf("已选应用自动置顶，便于维护", "应用独立规则与分组规则同时生效"),
+                highlights = listOf("已选应用自动置顶，便于维护", "任一成员触发后全组共用同一冷却"),
             ),
             FeatureIntroPage(
                 eyebrow = "开始之前",
@@ -1762,7 +2004,7 @@ private fun FeatureIntroDialog(onClose: (doNotShowAgain: Boolean) -> Unit) {
     }
     val pagerState = rememberPagerState(pageCount = { pages.size })
     val scope = rememberCoroutineScope()
-    var doNotShowAgain by remember { mutableStateOf(false) }
+    var doNotShowAgain by rememberSaveable { mutableStateOf(false) }
     val lastPage = pagerState.currentPage == pages.lastIndex
 
     AlertDialog(
@@ -1890,6 +2132,108 @@ private fun FeatureIntroDialog(onClose: (doNotShowAgain: Boolean) -> Unit) {
 }
 
 @Composable
+private fun BetaInviteDialog(
+    onClose: (doNotShowAgain: Boolean, joinGroup: Boolean) -> Unit,
+) {
+    val context = LocalContext.current
+    var doNotShowAgain by rememberSaveable { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = { onClose(doNotShowAgain, false) },
+        title = {
+            Text(
+                localizedText(
+                    context,
+                    "推荐加入时停内测群",
+                    "Join the Time Stop beta group",
+                ),
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f),
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            localizedText(
+                                context,
+                                "提前体验新功能",
+                                "Try new features early",
+                            ),
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.labelLarge,
+                        )
+                        Text(
+                            localizedText(
+                                context,
+                                "加入 QQ 群可获取测试版本、反馈兼容性问题，并参与新功能讨论。",
+                                "Join the QQ group for test builds, compatibility feedback, and feature discussions.",
+                            ),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            localizedText(
+                                context,
+                                "QQ群：$QQ_GROUP_NUMBER",
+                                "QQ group: $QQ_GROUP_NUMBER",
+                            ),
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { doNotShowAgain = !doNotShowAgain },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = doNotShowAgain,
+                        onCheckedChange = { doNotShowAgain = it },
+                    )
+                    Text(
+                        localizedText(
+                            context,
+                            "不再提示",
+                            "Do not show again",
+                        ),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = { onClose(doNotShowAgain, true) }) {
+                Text(
+                    localizedText(
+                        context,
+                        "加入内测群",
+                        "Join beta group",
+                    ),
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { onClose(doNotShowAgain, false) }) {
+                Text(
+                    localizedText(
+                        context,
+                        "暂不加入",
+                        "Not now",
+                    ),
+                )
+            }
+        },
+    )
+}
+
+@Composable
 private fun SetupGuideDialog(onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1937,6 +2281,9 @@ private fun SettingsDialog(
     var diagnosticsEnabled by remember { mutableStateOf(initialSettings.diagnosticsEnabled) }
     var launcherIconHidden by remember { mutableStateOf(initialSettings.launcherIconHidden) }
     var usageStatsEnabled by remember { mutableStateOf(initialSettings.usageStatsEnabled) }
+    var limitEnforcementMode by remember {
+        mutableStateOf(initialSettings.limitEnforcementMode)
+    }
     var extensionMinutes by remember {
         mutableStateOf((initialSettings.extensionSeconds / 60L).coerceAtLeast(1L).toString())
     }
@@ -1952,6 +2299,44 @@ private fun SettingsDialog(
             ) {
                 item {
                     SettingsSectionTitle("提醒与延时")
+                }
+                item {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("达到限制后", fontWeight = FontWeight.Medium)
+                        Text(
+                            "强制退出用于硬限制；独立休息页可暂停目标界面，冷静后继续",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            FilterChip(
+                                selected = limitEnforcementMode ==
+                                    LimitEnforcementMode.FORCE_EXIT,
+                                onClick = {
+                                    limitEnforcementMode = LimitEnforcementMode.FORCE_EXIT
+                                },
+                                label = { Text("强制退出（默认）") },
+                            )
+                            FilterChip(
+                                selected = limitEnforcementMode ==
+                                    LimitEnforcementMode.EXTERNAL_BREAK_PAGE,
+                                onClick = {
+                                    limitEnforcementMode =
+                                        LimitEnforcementMode.EXTERNAL_BREAK_PAGE
+                                },
+                                label = { Text("独立休息页") },
+                            )
+                        }
+                        if (
+                            limitEnforcementMode ==
+                            LimitEnforcementMode.EXTERNAL_BREAK_PAGE
+                        ) {
+                            Text(
+                                "达到限制后会打开时停的独立休息页，使目标界面自然暂停，并尝试暂停常见的 MediaPlayer、ExoPlayer/Media3 和网页音视频。部分系统可能询问是否允许打开时停；自研播放器、后台服务和游戏引擎可能继续运行。休息页不提供延时，主页与最近任务仍可使用；单次额度需配合冷却，结束后自动继续。切换执行方式后，请强停并重开管控应用。",
+                                color = MaterialTheme.colorScheme.primary,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
                 }
                 item {
                     Row(
@@ -2125,7 +2510,7 @@ private fun SettingsDialog(
                         Column(Modifier.weight(1f)) {
                             Text("隐藏桌面图标", fontWeight = FontWeight.Medium)
                             Text(
-                                "隐藏后仍可从 LSPosed 或系统应用信息进入设置",
+                                "隐藏后仍可从 LSPosed 模块页打开设置",
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
@@ -2219,6 +2604,7 @@ private fun SettingsDialog(
                             exitWarningVibrationEnabled = vibrationEnabled,
                             languageMode = languageMode,
                             extensionSeconds = (parsedMinutes ?: 5L) * 60L,
+                            limitEnforcementMode = limitEnforcementMode,
                             diagnosticsEnabled = diagnosticsEnabled,
                             launcherIconHidden = launcherIconHidden,
                             usageStatsEnabled = usageStatsEnabled,
@@ -2493,6 +2879,7 @@ private const val ALIPAY_PACKAGE = "com.eg.android.AlipayGphone"
 private const val QQ_GROUP_NUMBER = "1009712674"
 private val QQ_PACKAGES = listOf("com.tencent.mobileqq", "com.tencent.tim")
 private const val FEATURE_INTRO_DISABLED_KEY = "feature_intro_disabled"
+private const val BETA_INVITE_DISABLED_KEY = "beta_invite_disabled"
 
 private fun localizedText(context: Context, chinese: String, english: String): String {
     val mode = RuleRepository(context).getGlobalSettings().languageMode
@@ -2574,6 +2961,7 @@ private fun RuleDialog(
     val parsedCooldownMinutes = cooldownMinutes.toLongOrNull()?.takeIf { it in 1..1440 }
     val scheduleValid = !scheduleEnabled ||
         (scheduleWindows.isNotEmpty() && scheduleWindows.all(ScheduleWindow::isValid))
+    val cooldownAvailable = CooldownPolicy.canEnable(dailyEnabled, perLaunchEnabled)
     val canSave = (dailyEnabled || perLaunchEnabled || scheduleEnabled || sessionPlanningEnabled) &&
         (!dailyEnabled || parsedDailyMinutes != null) &&
         (!perLaunchEnabled || parsedPerLaunchMinutes != null) &&
@@ -2618,7 +3006,10 @@ private fun RuleDialog(
                         enabled = dailyEnabled,
                         minutes = dailyMinutes,
                         parsedMinutes = parsedDailyMinutes,
-                        onEnabledChange = { dailyEnabled = it },
+                        onEnabledChange = {
+                            dailyEnabled = it
+                            if (!it && !perLaunchEnabled) cooldownEnabled = false
+                        },
                         onMinutesChange = { dailyMinutes = it },
                     )
                 }
@@ -2630,7 +3021,10 @@ private fun RuleDialog(
                         enabled = perLaunchEnabled,
                         minutes = perLaunchMinutes,
                         parsedMinutes = parsedPerLaunchMinutes,
-                        onEnabledChange = { perLaunchEnabled = it },
+                        onEnabledChange = {
+                            perLaunchEnabled = it
+                            if (!it && !dailyEnabled) cooldownEnabled = false
+                        },
                         onMinutesChange = { perLaunchMinutes = it },
                     )
                 }
@@ -2656,13 +3050,25 @@ private fun RuleDialog(
                 item {
                     ThresholdEditor(
                         title = "退出后冷却",
-                        description = "被时停强制退出后，在设定时间内禁止再次打开",
+                        description = "达到每日或单次额度后，在设定时间内限制再次使用",
                         enabled = cooldownEnabled,
+                        toggleAvailable = cooldownAvailable,
                         minutes = cooldownMinutes,
                         parsedMinutes = parsedCooldownMinutes,
-                        onEnabledChange = { cooldownEnabled = it },
+                        onEnabledChange = {
+                            if (cooldownAvailable) cooldownEnabled = it
+                        },
                         onMinutesChange = { cooldownMinutes = it },
                     )
+                }
+                if (!cooldownAvailable) {
+                    item {
+                        Text(
+                            "需先开启每日累计或单次打开，才能启用退出后冷却。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
                 if (cooldownEnabled) {
                     item {
@@ -2720,7 +3126,7 @@ private fun RuleDialog(
                             scheduleEnabled = scheduleEnabled,
                             scheduleMode = scheduleMode,
                             scheduleWindows = scheduleWindows,
-                            cooldownEnabled = cooldownEnabled,
+                            cooldownEnabled = cooldownEnabled && cooldownAvailable,
                             cooldownSeconds = (parsedCooldownMinutes ?: 1L) * 60L,
                         ),
                     )
@@ -2732,20 +3138,22 @@ private fun RuleDialog(
         },
         dismissButton = {
             Row {
-                TextButton(
-                    onClick = {
-                        onSave(
-                            initialRule.copy(
-                                enabled = true,
-                                dailyEnabled = false,
-                                perLaunchEnabled = true,
-                                perLaunchLimitSeconds = 10L,
-                                scheduleEnabled = false,
-                                cooldownEnabled = false,
-                            ),
-                        )
-                    },
-                ) { Text("10 秒测试") }
+                if (BuildConfig.DEBUG) {
+                    TextButton(
+                        onClick = {
+                            onSave(
+                                initialRule.copy(
+                                    enabled = true,
+                                    dailyEnabled = false,
+                                    perLaunchEnabled = true,
+                                    perLaunchLimitSeconds = 10L,
+                                    scheduleEnabled = false,
+                                    cooldownEnabled = false,
+                                ),
+                            )
+                        },
+                    ) { Text("10 秒测试") }
+                }
                 TextButton(onClick = onDismiss) { Text("取消") }
             }
         },
@@ -2980,6 +3388,7 @@ private fun ThresholdEditor(
     title: String,
     description: String,
     enabled: Boolean,
+    toggleAvailable: Boolean = true,
     minutes: String,
     parsedMinutes: Long?,
     onEnabledChange: (Boolean) -> Unit,
@@ -2995,7 +3404,11 @@ private fun ThresholdEditor(
                 Text(title, fontWeight = FontWeight.Medium)
                 Text(description, style = MaterialTheme.typography.bodySmall)
             }
-            Switch(checked = enabled, onCheckedChange = onEnabledChange)
+            Switch(
+                checked = enabled,
+                onCheckedChange = onEnabledChange,
+                enabled = toggleAvailable,
+            )
         }
         TextField(
             value = minutes,

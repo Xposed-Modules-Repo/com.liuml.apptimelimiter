@@ -13,13 +13,18 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.util.Base64
+import com.liuml.apptimelimiter.core.BreakSessionPolicy
 import com.liuml.apptimelimiter.core.GroupUsagePolicy
+import com.liuml.apptimelimiter.core.SharedCooldownClaimStatus
+import com.liuml.apptimelimiter.data.LimitEnforcementMode
 import com.liuml.apptimelimiter.data.RuleRepository
 import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
 import java.time.LocalDate
+import java.security.SecureRandom
 import java.util.concurrent.Executors
 
 class RuleProvider : ContentProvider() {
@@ -33,6 +38,8 @@ class RuleProvider : ContentProvider() {
     private var usageSnapshot: SystemUsageSnapshot? = null
     private val warningVibrationLock = Any()
     private val lastWarningVibrationByPackage = mutableMapOf<String, Long>()
+    private val breakSessionLock = Any()
+    private val secureRandom = SecureRandom()
 
     override fun onCreate(): Boolean {
         context?.let { deviceUsageStatsRepository = DeviceUsageStatsRepository(it) }
@@ -47,15 +54,28 @@ class RuleProvider : ContentProvider() {
                 val packageName = arg.orEmpty()
                 if (!isCallerAllowed(packageName)) return denied()
                 val rule = ruleRepository.getRule(packageName)
-                val group = ruleRepository.groupForPackage(packageName)
+                val assignedGroup = ruleRepository.groupForPackage(packageName)
+                val group = assignedGroup
                     ?.takeIf { it.enabled && it.packageNames.isNotEmpty() }
+                val personalRuleActive = assignedGroup == null
                 val settings = ruleRepository.getGlobalSettings()
+                val expiredGroupCooldown = assignedGroup?.let {
+                    ruleRepository.consumeExpiredGroupCooldown(it.id)
+                }
+                if (expiredGroupCooldown != null && settings.diagnosticsEnabled) {
+                    DiagnosticsRepository(appContext).append(
+                        level = "INFO",
+                        packageName = expiredGroupCooldown.sourcePackage.ifBlank { packageName },
+                        event = "GROUP_COOLDOWN_EXPIRED",
+                        message = "group=${assignedGroup?.id}, incident=${expiredGroupCooldown.incidentId}, endedAt=${expiredGroupCooldown.endsAtMillis}",
+                    )
+                }
                 val systemUsageRepository = deviceUsageStatsRepository
                     ?: DeviceUsageStatsRepository(appContext).also {
                         deviceUsageStatsRepository = it
                     }
                 val trackedPackages = buildSet {
-                    if (rule.dailyEnabled) add(packageName)
+                    if (personalRuleActive && rule.dailyEnabled) add(packageName)
                     if (group?.dailyEnabled == true) addAll(group.packageNames)
                 }
                 val hasUsageAccess = trackedPackages.isNotEmpty() && systemUsageRepository.hasUsageAccess()
@@ -68,7 +88,11 @@ class RuleProvider : ContentProvider() {
                 } else {
                     SystemUsageLookup.EMPTY
                 }
-                val systemTodayUsedMillis = if (rule.dailyEnabled && usageLookup.available) {
+                val systemTodayUsedMillis = if (
+                    personalRuleActive &&
+                    rule.dailyEnabled &&
+                    usageLookup.available
+                ) {
                     usageLookup.durations[packageName] ?: 0L
                 } else {
                     -1L
@@ -86,24 +110,42 @@ class RuleProvider : ContentProvider() {
                 val groupMeasuredAtElapsedMillis = usageLookup.measuredAtElapsedMillis
                     .takeIf { usageLookup.available }
                     ?: SystemClock.elapsedRealtime()
+                val groupCooldownRecord = group
+                    ?.takeIf { it.cooldownEnabled }
+                    ?.let { ruleRepository.getGroupCooldownRecord(it.id) }
                 Bundle().apply {
                     putBoolean(RuleContract.KEY_OK, true)
-                    putBoolean(RuleContract.KEY_ENABLED, rule.enabled || group != null)
+                    putBoolean(
+                        RuleContract.KEY_ENABLED,
+                        if (personalRuleActive) rule.enabled else group != null,
+                    )
                     putBoolean(
                         RuleContract.KEY_SESSION_PLANNING_ENABLED,
-                        rule.sessionPlanningEnabled,
+                        personalRuleActive && rule.sessionPlanningEnabled,
                     )
-                    putBoolean(RuleContract.KEY_DAILY_ENABLED, rule.dailyEnabled)
+                    putBoolean(
+                        RuleContract.KEY_DAILY_ENABLED,
+                        personalRuleActive && rule.dailyEnabled,
+                    )
                     putLong(RuleContract.KEY_DAILY_LIMIT_SECONDS, rule.dailyLimitSeconds)
-                    putBoolean(RuleContract.KEY_PER_LAUNCH_ENABLED, rule.perLaunchEnabled)
+                    putBoolean(
+                        RuleContract.KEY_PER_LAUNCH_ENABLED,
+                        personalRuleActive && rule.perLaunchEnabled,
+                    )
                     putLong(RuleContract.KEY_PER_LAUNCH_LIMIT_SECONDS, rule.perLaunchLimitSeconds)
-                    putBoolean(RuleContract.KEY_SCHEDULE_ENABLED, rule.scheduleEnabled)
+                    putBoolean(
+                        RuleContract.KEY_SCHEDULE_ENABLED,
+                        personalRuleActive && rule.scheduleEnabled,
+                    )
                     putString(RuleContract.KEY_SCHEDULE_MODE, rule.scheduleMode.name)
                     putString(
                         RuleContract.KEY_SCHEDULE_WINDOWS,
                         ScheduleCodec.encode(rule.scheduleWindows),
                     )
-                    putBoolean(RuleContract.KEY_COOLDOWN_ENABLED, rule.cooldownEnabled)
+                    putBoolean(
+                        RuleContract.KEY_COOLDOWN_ENABLED,
+                        personalRuleActive && rule.cooldownEnabled,
+                    )
                     putLong(RuleContract.KEY_COOLDOWN_SECONDS, rule.cooldownSeconds)
                     putLong(RuleContract.KEY_VERSION, rule.version)
                     putBoolean(RuleContract.KEY_EXIT_WARNING_ENABLED, settings.exitWarningEnabled)
@@ -119,6 +161,10 @@ class RuleProvider : ContentProvider() {
                     putLong(RuleContract.KEY_EXTENSION_SECONDS, settings.extensionSeconds)
                     putBoolean(RuleContract.KEY_DIAGNOSTICS_ENABLED, settings.diagnosticsEnabled)
                     putBoolean(RuleContract.KEY_USAGE_STATS_ENABLED, settings.usageStatsEnabled)
+                    putString(
+                        RuleContract.KEY_LIMIT_ENFORCEMENT_MODE,
+                        settings.limitEnforcementMode.name,
+                    )
                     putLong(RuleContract.KEY_SYSTEM_TODAY_USED_MS, systemTodayUsedMillis)
                     putLong(
                         RuleContract.KEY_SYSTEM_USAGE_MEASURED_AT_ELAPSED_MS,
@@ -126,8 +172,8 @@ class RuleProvider : ContentProvider() {
                     )
                     putBoolean(RuleContract.KEY_SYSTEM_USAGE_PENDING, usageLookup.refreshPending)
                     putBoolean(RuleContract.KEY_GROUP_ENABLED, group != null)
-                    putString(RuleContract.KEY_GROUP_ID, group?.id.orEmpty())
-                    putString(RuleContract.KEY_GROUP_NAME, group?.name.orEmpty())
+                    putString(RuleContract.KEY_GROUP_ID, assignedGroup?.id.orEmpty())
+                    putString(RuleContract.KEY_GROUP_NAME, assignedGroup?.name.orEmpty())
                     putBoolean(
                         RuleContract.KEY_GROUP_DAILY_ENABLED,
                         group?.dailyEnabled ?: false,
@@ -171,7 +217,174 @@ class RuleProvider : ContentProvider() {
                         RuleContract.KEY_GROUP_MEASURED_AT_ELAPSED_MS,
                         groupMeasuredAtElapsedMillis,
                     )
+                    putLong(
+                        RuleContract.KEY_GROUP_COOLDOWN_STARTED_AT_MS,
+                        groupCooldownRecord?.startedAtMillis ?: 0L,
+                    )
+                    putLong(
+                        RuleContract.KEY_GROUP_COOLDOWN_ENDS_AT_MS,
+                        groupCooldownRecord?.endsAtMillis ?: 0L,
+                    )
+                    putString(
+                        RuleContract.KEY_GROUP_COOLDOWN_INCIDENT_ID,
+                        groupCooldownRecord?.incidentId.orEmpty(),
+                    )
+                    putString(
+                        RuleContract.KEY_GROUP_COOLDOWN_SOURCE_PACKAGE,
+                        groupCooldownRecord?.sourcePackage.orEmpty(),
+                    )
                 }
+            }
+
+            RuleContract.METHOD_CLAIM_GROUP_COOLDOWN -> {
+                val packageName = arg.orEmpty()
+                if (!isCallerAllowed(packageName)) return denied()
+                if (!isConfiguredPackage(ruleRepository, packageName)) return denied()
+                val group = ruleRepository.groupForPackage(packageName)
+                    ?.takeIf { it.enabled && packageName in it.packageNames }
+                    ?: return denied()
+                val requestedGroupId = extras?.getString(RuleContract.KEY_GROUP_ID).orEmpty()
+                val incidentId = extras?.getString(RuleContract.KEY_INCIDENT_ID)
+                    .orEmpty()
+                    .take(MAX_INCIDENT_ID_LENGTH)
+                if (
+                    requestedGroupId != group.id ||
+                    incidentId.isBlank() ||
+                    incidentId.any { it == '\n' || it == '\r' }
+                ) return denied()
+                val nowMillis = System.currentTimeMillis()
+                val occurredAtMillis = extras?.getLong(
+                    RuleContract.KEY_INCIDENT_OCCURRED_AT_MS,
+                    nowMillis,
+                ) ?: nowMillis
+                val claim = runCatching {
+                    ruleRepository.claimGroupCooldown(
+                        groupId = group.id,
+                        incidentId = incidentId,
+                        sourcePackage = packageName,
+                        occurredAtMillis = occurredAtMillis,
+                        durationMillis = if (group.cooldownEnabled) {
+                            group.cooldownSeconds.coerceIn(
+                                RuleRepository.MIN_COOLDOWN_SECONDS,
+                                RuleRepository.MAX_COOLDOWN_SECONDS,
+                            ) * 1000L
+                        } else {
+                            0L
+                        },
+                        nowMillis = nowMillis,
+                    )
+                }.getOrNull() ?: return denied()
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, true)
+                    putBoolean(RuleContract.KEY_INCIDENT_NEW, claim.isNewIncident)
+                    putBoolean(
+                        RuleContract.KEY_GROUP_COOLDOWN_STARTED,
+                        claim.cooldownStarted,
+                    )
+                    putLong(
+                        RuleContract.KEY_GROUP_COOLDOWN_STARTED_AT_MS,
+                        claim.record.startedAtMillis,
+                    )
+                    putLong(
+                        RuleContract.KEY_GROUP_COOLDOWN_ENDS_AT_MS,
+                        claim.record.endsAtMillis,
+                    )
+                    putString(
+                        RuleContract.KEY_GROUP_COOLDOWN_INCIDENT_ID,
+                        claim.record.incidentId,
+                    )
+                    putString(
+                        RuleContract.KEY_GROUP_COOLDOWN_SOURCE_PACKAGE,
+                        claim.record.sourcePackage,
+                    )
+                    putString(
+                        RuleContract.KEY_EVENT,
+                        when (claim.status) {
+                            SharedCooldownClaimStatus.STARTED -> "GROUP_COOLDOWN_STARTED"
+                            SharedCooldownClaimStatus.ABSORBED_BY_ACTIVE ->
+                                "GROUP_COOLDOWN_REUSED"
+                            SharedCooldownClaimStatus.ALREADY_HANDLED ->
+                                "QUOTA_INCIDENT_DUPLICATE"
+                            SharedCooldownClaimStatus.HANDLED_WITHOUT_COOLDOWN ->
+                                "GROUP_QUOTA_INCIDENT_RECORDED"
+                        },
+                    )
+                }
+            }
+
+            RuleContract.METHOD_CREATE_BREAK_SESSION -> {
+                val packageName = arg.orEmpty()
+                if (!isCallerAllowed(packageName)) return denied()
+                if (!isConfiguredPackage(ruleRepository, packageName)) return denied()
+                if (
+                    ruleRepository.getGlobalSettings().limitEnforcementMode !=
+                    LimitEnforcementMode.EXTERNAL_BREAK_PAGE
+                ) return denied()
+                val nowMillis = System.currentTimeMillis()
+                val token = generateBreakSessionToken()
+                val expiresAtMillis = synchronized(breakSessionLock) {
+                    val prefs = appContext.getSharedPreferences(
+                        BREAK_SESSION_PREFS,
+                        android.content.Context.MODE_PRIVATE,
+                    )
+                    val updated = BreakSessionPolicy.issue(
+                        existing = BreakSessionPolicy.decode(
+                            prefs.getString(KEY_BREAK_SESSION_RECORDS, null),
+                        ),
+                        token = token,
+                        targetPackage = packageName,
+                        nowMillis = nowMillis,
+                    )
+                    if (
+                        !prefs.edit()
+                            .putString(
+                                KEY_BREAK_SESSION_RECORDS,
+                                BreakSessionPolicy.encode(updated),
+                            )
+                            .commit()
+                    ) return denied()
+                    updated.lastOrNull { it.token == token }?.expiresAtMillis ?: 0L
+                }
+                if (expiresAtMillis <= nowMillis) return denied()
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, true)
+                    putString(RuleContract.KEY_BREAK_SESSION_TOKEN, token)
+                    putLong(
+                        RuleContract.KEY_BREAK_SESSION_EXPIRES_AT_MS,
+                        expiresAtMillis,
+                    )
+                }
+            }
+
+            RuleContract.METHOD_CONSUME_BREAK_SESSION -> {
+                if (Binder.getCallingUid() != Process.myUid()) return denied()
+                val packageName = arg.orEmpty()
+                val token = extras?.getString(RuleContract.KEY_BREAK_SESSION_TOKEN)
+                    .orEmpty()
+                    .take(MAX_BREAK_SESSION_TOKEN_LENGTH)
+                if (packageName.isBlank() || token.isBlank()) return denied()
+                val accepted = synchronized(breakSessionLock) {
+                    val prefs = appContext.getSharedPreferences(
+                        BREAK_SESSION_PREFS,
+                        android.content.Context.MODE_PRIVATE,
+                    )
+                    val consumed = BreakSessionPolicy.consume(
+                        existing = BreakSessionPolicy.decode(
+                            prefs.getString(KEY_BREAK_SESSION_RECORDS, null),
+                        ),
+                        token = token,
+                        targetPackage = packageName,
+                        nowMillis = System.currentTimeMillis(),
+                    )
+                    val persisted = prefs.edit()
+                        .putString(
+                            KEY_BREAK_SESSION_RECORDS,
+                            BreakSessionPolicy.encode(consumed.records),
+                        )
+                        .commit()
+                    consumed.accepted && persisted
+                }
+                Bundle().apply { putBoolean(RuleContract.KEY_OK, accepted) }
             }
 
             RuleContract.METHOD_APPEND_LOG -> {
@@ -251,6 +464,15 @@ class RuleProvider : ContentProvider() {
         Binder.getCallingUid() == Process.myUid() || packageName in repository.configuredPackages()
 
     private fun denied() = Bundle().apply { putBoolean(RuleContract.KEY_OK, false) }
+
+    private fun generateBreakSessionToken(): String {
+        val bytes = ByteArray(BREAK_SESSION_TOKEN_BYTES)
+        secureRandom.nextBytes(bytes)
+        return Base64.encodeToString(
+            bytes,
+            Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP,
+        )
+    }
 
     private fun lookupSystemUsage(
         repository: RuleRepository,
@@ -366,10 +588,15 @@ class RuleProvider : ContentProvider() {
         const val MAX_HOOK_VERSION_CODE = 1_000_000
         const val MAX_EVENT_LENGTH = 80
         const val MAX_MESSAGE_LENGTH = 2_000
+        const val MAX_INCIDENT_ID_LENGTH = 320
         const val SYSTEM_USAGE_REFRESH_INTERVAL_MS = 15_000L
         const val MIN_SYSTEM_USAGE_REFRESH_ATTEMPT_INTERVAL_MS = 5_000L
         const val WARNING_VIBRATION_DURATION_MS = 1_200L
         const val WARNING_VIBRATION_MIN_INTERVAL_MS = 30_000L
+        const val BREAK_SESSION_PREFS = "break_sessions"
+        const val KEY_BREAK_SESSION_RECORDS = "records"
+        const val BREAK_SESSION_TOKEN_BYTES = 24
+        const val MAX_BREAK_SESSION_TOKEN_LENGTH = 128
         val ALLOWED_LOG_LEVELS = setOf("DEBUG", "INFO", "WARN", "ERROR")
     }
 

@@ -6,14 +6,14 @@ plugins {
 
 android {
     namespace = "com.liuml.apptimelimiter"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.liuml.apptimelimiter"
         minSdk = 27
         targetSdk = 35
-        versionCode = 19
-        versionName = "0.9.4"
+        versionCode = 20
+        versionName = "0.9.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -67,6 +67,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
+    implementation("io.github.libxposed:service:102.0.0")
     compileOnly(project(":xposed-stubs"))
 
     testImplementation("junit:junit:4.13.2")

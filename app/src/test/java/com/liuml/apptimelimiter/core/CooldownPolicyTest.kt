@@ -5,6 +5,13 @@ import org.junit.Test
 
 class CooldownPolicyTest {
     @Test
+    fun `cooldown requires a daily or per-launch quota`() {
+        assertEquals(false, CooldownPolicy.canEnable(false, false))
+        assertEquals(true, CooldownPolicy.canEnable(true, false))
+        assertEquals(true, CooldownPolicy.canEnable(false, true))
+    }
+
+    @Test
     fun `remaining time decreases from forced exit`() {
         assertEquals(
             40_000L,

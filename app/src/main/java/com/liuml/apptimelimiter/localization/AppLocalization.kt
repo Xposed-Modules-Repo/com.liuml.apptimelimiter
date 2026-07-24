@@ -95,6 +95,21 @@ object UiText {
         Regex("^已验证 (\\d+) / (\\d+) 个应用$").matchEntire(source)?.let {
             return "${it.groupValues[1]} / ${it.groupValues[2]} apps verified"
         }
+        Regex("^(\\d+) 个应用未加入作用域$").matchEntire(source)?.let {
+            return "${it.groupValues[1]} apps are outside the scope"
+        }
+        Regex("^已就绪 (\\d+) / (\\d+) 个应用$").matchEntire(source)?.let {
+            return "${it.groupValues[1]} / ${it.groupValues[2]} apps ready"
+        }
+        Regex("^仍有 (\\d+) 个应用启动后才能完成 Hook 验证$").matchEntire(source)?.let {
+            return "${it.groupValues[1]} apps need to be launched to finish Hook verification"
+        }
+        Regex("^(\\d+) 个目标应用进程已回传当前 Hook 状态$").matchEntire(source)?.let {
+            return "${it.groupValues[1]} target processes reported the current Hook state"
+        }
+        Regex("^(\\d+) 个管控应用均已加入作用域$").matchEntire(source)?.let {
+            return "All ${it.groupValues[1]} controlled apps are in scope"
+        }
         Regex("^仍有 (\\d+) 个应用待验证；请确认作用域后强停并重开它们$").matchEntire(source)?.let {
             return "${it.groupValues[1]} apps still need verification; check the scope, then force-stop and reopen them"
         }
@@ -188,11 +203,23 @@ object UiText {
         "显示系统应用" to "Show system apps",
         "请确认 LSPosed 作用域" to "Confirm the LSPosed scope",
         "规则已保存，但这些应用尚未回传当前版本的 Hook 验证。请确认已加入时停的 LSPosed 作用域，再强制停止并重新打开目标应用。" to "The rule was saved, but these apps have not reported the current Hook version. Add them to the Time Stop LSPosed scope, then force-stop and reopen them.",
+        "检测到这些应用尚未加入时停的 LSPosed 作用域。可以向框架申请加入，确认后请强制停止并重新打开目标应用。" to "These apps are not in the Time Stop LSPosed scope. Request scope access, then force-stop and reopen the target apps after approval.",
+        "当前框架无法直接确认这些应用的作用域，或 Hook 版本仍待验证。请在 LSPosed 中检查作用域，再强制停止并重新打开目标应用。" to "This framework cannot expose the scope directly, or the Hook version is still pending. Check the scope in LSPosed, then force-stop and reopen the target apps.",
+        "请求加入作用域" to "Request scope access",
+        "正在申请" to "Requesting",
         "我已了解" to "Understood",
         "查看配置要求" to "View setup requirements",
         "未启用管控" to "Control is disabled",
         "Hook 已验证" to "Hook verified",
+        "Hook 正在运行" to "Hook is running",
+        "Hook 状态异常" to "Hook state is abnormal",
+        "作用域已配置" to "Scope configured",
+        "等待目标应用启动" to "Waiting for target apps to start",
+        "兼容模式，等待 Hook 验证" to "Compatibility mode; waiting for Hook verification",
         "等待 Hook 验证" to "Waiting for Hook verification",
+        "请将缺失的应用加入时停作用域" to "Add the missing apps to the Time Stop scope",
+        "请强制停止目标应用并重新打开，以加载当前模块版本" to "Force-stop and reopen the target apps to load the current module version",
+        "当前框架不支持直接读取作用域，将在目标应用启动后验证" to "This framework cannot expose scope directly; verification will occur after the target app starts",
         "请先选择需要管控的应用" to "Select apps to control first",
         "今日总使用" to "Total today",
         "管控应用数" to "Controlled apps",
@@ -215,7 +242,12 @@ object UiText {
         "需要 LSPosed" to "LSPosed required",
         "保存规则后，请在 LSPosed 中启用本模块并勾选目标应用。首次启用或修改作用域后，需要强制停止目标应用再打开。" to "After saving a rule, enable this module in LSPosed and select the target app. Force-stop and reopen it after first setup or a scope change.",
         "共享每日额度" to "Shared daily allowance",
-        "组内应用共同消耗一个每日额度；应用自己的每日、单次和时段规则仍会同时生效。" to "Apps in a group share one daily allowance. Their own daily, per-launch and schedule rules remain active.",
+        "组内应用共同消耗一个每日额度；加入后个人规则暂停，移出分组后恢复。" to "Apps in a group share one daily allowance. Personal rules are suspended while grouped and resume after removal.",
+        "可统一设置共享每日额度、单次打开、可用时段和共享冷却；加入后个人规则暂停，移出后恢复。" to "Configure shared daily, per-launch, schedule, and cooldown rules. Personal rules are suspended while grouped and resume after removal.",
+        "任一成员触发后全组共用同一冷却" to "One member triggers the same cooldown for the whole group",
+        "组内应用只执行本分组规则；个人规则与本次计划在分组期间暂停。" to "Group members run only this group policy. Personal rules and session planning are suspended while grouped.",
+        "已选应用会自动置顶。已有个人设置或已属于其他组的应用不能新加入。" to "Selected apps are pinned to the top. Apps with personal settings or another group cannot be newly added.",
+        "保存失败：应用可能已有个人设置或属于其他分组" to "Could not save: an app may have personal settings or belong to another group",
         "新建分组" to "New group",
         "新建应用分组" to "New app group",
         "新分组" to "New group",
@@ -239,6 +271,11 @@ object UiText {
         "确认删除" to "Delete",
         "共享额度" to "Shared allowance",
         "待 Hook 验证" to "Hook pending",
+        "未加入作用域" to "Not in scope",
+        "已在作用域" to "In scope",
+        "Hook 运行中" to "Hook running",
+        "Hook 待重载" to "Hook reload needed",
+        "Hook 异常" to "Hook error",
         "管控中" to "Controlled",
         "运行前需要完成" to "Before you start",
         "本版本不需要相机、存储、通知等 Android 运行时权限。" to "This version does not need camera, storage, notification or other Android runtime permissions.",
@@ -248,6 +285,12 @@ object UiText {
         "4. 保存规则后，强制停止目标应用并重新打开。" to "4. After saving, force-stop and reopen the target app.",
         "若诊断日志没有 HOOK_READY，说明 Hook 没有进入目标进程，请先检查第 2、3 项。" to "If diagnostics do not contain HOOK_READY, the Hook did not enter the target process. Check steps 2 and 3.",
         "我知道了" to "Got it",
+        "达到限制后" to "When a limit is reached",
+        "强制退出用于硬限制；独立休息页可暂停目标界面，冷静后继续" to "Force exit provides a hard limit. The standalone break page pauses the target screen and continues after cooldown",
+        "强制退出（默认）" to "Force exit (default)",
+        "独立休息页" to "Standalone break page",
+        "达到限制后会打开时停的独立休息页，使目标界面自然暂停，并尝试暂停常见的 MediaPlayer、ExoPlayer/Media3 和网页音视频。部分系统可能询问是否允许打开时停；自研播放器、后台服务和游戏引擎可能继续运行。休息页不提供延时，主页与最近任务仍可使用；单次额度需配合冷却，结束后自动继续。切换执行方式后，请强停并重开管控应用。" to "When a limit is reached, Time Stop opens its standalone break page so the target screen pauses naturally. It also attempts to pause common MediaPlayer, ExoPlayer/Media3, and web audio/video playback. Some systems may ask before opening Time Stop; custom players, background services, and game engines may keep running. The page has no extension action; Home and Recents remain available. Pair per-launch limits with cooldown to continue automatically. Force-stop and reopen managed apps after switching enforcement mode.",
+        "需先开启每日累计或单次打开，才能启用退出后冷却。" to "Enable a daily or per-launch quota before enabling post-exit cooldown.",
         "退出前提醒" to "Pre-exit warning",
         "到期前 5 秒在屏幕顶部显示倒计时" to "Show a countdown five seconds before exit",
         "全屏退出提醒" to "Full-screen exit warning",
@@ -267,6 +310,8 @@ object UiText {
         "每次点击延时（分钟）" to "Extension per tap (minutes)",
         "可设置 1–60 分钟；每次点击都会追加" to "Set 1–60 minutes; each tap adds another extension",
         "隐藏桌面图标" to "Hide launcher icon",
+        "隐藏后仍可从 LSPosed 模块页打开设置" to "Settings remain available from the LSPosed module page",
+        "隐藏后，桌面缓存图标可能短暂残留且无法点击，刷新后会消失。可从 LSPosed 模块页，或“系统设置 → 应用 → 时停 → 应用内设置”进入；也可连接电脑执行：" to "A cached launcher icon may remain briefly and stop working until the launcher refreshes. Reopen from LSPosed, System settings → Apps → Time Stop → In-app settings, or connect a computer and run:",
         "关闭后可从 LSPosed 模块页打开应用" to "Open the app from the LSPosed module page after hiding it",
         "隐藏后请先尝试从 LSPosed 模块页打开设置。若没有入口，可连接电脑执行：" to "After hiding, first try opening settings from LSPosed. If unavailable, connect a computer and run:",
         "复制恢复命令" to "Copy recovery command",
@@ -313,7 +358,7 @@ object UiText {
         "每次目标应用进程启动后重新计时" to "Restarts when the target app process starts",
         "两个限制可同时开启，任何一个先到期都会退出应用。" to "Both limits can be enabled; the first one reached exits the app.",
         "退出后冷却" to "Post-exit cooldown",
-        "被时停强制退出后，在设定时间内禁止再次打开" to "Block reopening for the configured duration after a forced exit",
+        "达到每日或单次额度后，在设定时间内限制再次使用" to "Restrict further use for the configured duration after a daily or per-launch limit",
         "冷却期间反复打开不会重新计算冷却时间，也不会重复增加限制触发次数。" to "Repeated attempts do not restart cooldown or add duplicate limit hits.",
         "保存并启用" to "Save and enable",
         "10 秒测试" to "10-second test",

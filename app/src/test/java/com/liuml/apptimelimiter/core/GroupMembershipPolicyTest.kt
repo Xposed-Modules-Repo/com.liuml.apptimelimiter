@@ -29,4 +29,26 @@ class GroupMembershipPolicyTest {
             ),
         )
     }
+
+    @Test
+    fun `new member with personal settings is rejected`() {
+        assertTrue(
+            GroupMembershipPolicy.hasNewMemberWithPersonalConfiguration(
+                requestedMembers = listOf("existing", "new"),
+                existingMembers = listOf("existing"),
+                packagesWithPersonalConfiguration = setOf("new"),
+            ),
+        )
+    }
+
+    @Test
+    fun `legacy member with dormant personal settings remains editable`() {
+        assertFalse(
+            GroupMembershipPolicy.hasNewMemberWithPersonalConfiguration(
+                requestedMembers = listOf("existing"),
+                existingMembers = listOf("existing"),
+                packagesWithPersonalConfiguration = setOf("existing"),
+            ),
+        )
+    }
 }

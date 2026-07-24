@@ -16,6 +16,11 @@ enum class AppLanguageMode {
     ENGLISH,
 }
 
+enum class LimitEnforcementMode {
+    FORCE_EXIT,
+    EXTERNAL_BREAK_PAGE,
+}
+
 data class ScheduleWindow(
     val daysOfWeek: Set<Int>,
     val startMinute: Int,
@@ -50,6 +55,14 @@ data class AppRule(
     val version: Long = 0,
 )
 
+fun AppRule.hasPersonalConfiguration(): Boolean =
+    enabled ||
+        sessionPlanningEnabled ||
+        dailyEnabled ||
+        perLaunchEnabled ||
+        scheduleEnabled ||
+        cooldownEnabled
+
 data class InstalledApp(
     val label: String,
     val packageName: String,
@@ -82,4 +95,5 @@ data class GlobalSettings(
     val diagnosticsEnabled: Boolean = true,
     val launcherIconHidden: Boolean = false,
     val usageStatsEnabled: Boolean = true,
+    val limitEnforcementMode: LimitEnforcementMode = LimitEnforcementMode.FORCE_EXIT,
 )

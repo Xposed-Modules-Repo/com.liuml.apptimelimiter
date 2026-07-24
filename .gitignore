@@ -10,3 +10,5 @@ captures/
 .cxx/
 *.apk
 *.aab
+hs_err_pid*.log
+replay_pid*.log

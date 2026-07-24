@@ -20,8 +20,10 @@
     </queries>
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:description="@string/module_description"
+        android:fullBackupContent="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
@@ -47,6 +49,11 @@
             android:name=".MainActivity"
             android:exported="true">
             <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS" />
+            </intent-filter>
+            <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
@@ -55,6 +62,14 @@
                     android:scheme="apptimelimiter" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".LimitBlockActivity"
+            android:excludeFromRecents="false"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:noHistory="false"
+            android:theme="@style/Theme.AppTimeLimiter.BreakPage" />
 
         <activity-alias
             android:name=".LauncherAlias"
@@ -66,22 +81,6 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
-
-        <activity-alias
-            android:name=".ModuleSettingsAlias"
-            android:enabled="true"
-            android:exported="true"
-            android:label="@string/app_name"
-            android:targetActivity=".MainActivity">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.INFO" />
-            </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.APPLICATION_PREFERENCES" />
-                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity-alias>
 
