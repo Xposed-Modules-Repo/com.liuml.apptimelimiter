@@ -1,5 +1,5 @@
 Categories:
-  - Time
+  - Time Tracker
   - System
 License: GPL-3.0-only
 AuthorName: TACPR
@@ -45,4 +45,3 @@ AutoUpdateMode: Version %c-%v
 UpdateCheckMode: Tags
 CurrentVersion: 0.10.14
 CurrentVersionCode: 37
-

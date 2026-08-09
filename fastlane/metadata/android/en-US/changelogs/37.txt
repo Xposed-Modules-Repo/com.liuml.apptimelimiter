@@ -1,0 +1,1 @@
+Added non-root protection with package-level Accessibility foreground detection and UsageStats calibration, plus optional Shizuku force-stop enhancement. Added protection-mode diagnostics, repair guidance, session planning, shared group budgets, cooldown handling, and updated bilingual documentation.
