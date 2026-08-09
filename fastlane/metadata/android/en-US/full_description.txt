@@ -1,0 +1,18 @@
+Time Stop is a GPL-3.0-only Android app-time control tool for people who want explicit, composable boundaries instead of passive usage reports.
+
+Features:
+
+* Per-app daily quotas and per-launch timers
+* Weekly allow-only and block-during schedules, including overnight windows
+* App groups with shared daily allowances, per-launch rules, and cooldowns
+* Session planning with quick choices and custom 1–1440 minute durations
+* Countdown warnings, optional full-screen warnings, themes, and time quotes
+* Post-exit cooldowns that cannot be bypassed by reopening the app
+* LSPosed/Xposed enforcement with Hook heartbeat and scope diagnostics
+* Non-root protection through content-blind Accessibility foreground events and Android UsageStats
+* Optional Shizuku force-stop enhancement for configured third-party apps
+* Local diagnostics, statistics, and privacy-focused rule handling
+
+On rooted devices, LSPosed/Xposed provides the strongest enforcement path. On non-root devices, the app uses package-level foreground detection and Android usage access without reading window text, nodes, input, accounts, or notifications. Shizuku is optional and only improves force-stop execution; the normal restriction page remains available when it is not ready.
+
+Time Stop is not a replacement for Android's system settings. It is a focused policy engine for users who need finer-grained per-app rules, shared group budgets, schedule logic, cooldowns, and visible enforcement diagnostics.
