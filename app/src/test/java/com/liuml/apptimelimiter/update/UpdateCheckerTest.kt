@@ -34,4 +34,31 @@ class UpdateCheckerTest {
         assertFalse(isPublishableApkAsset("time-stop-release-unsigned.apk"))
         assertFalse(isPublishableApkAsset("checksums.txt"))
     }
+
+    @Test
+    fun `apk download must use the official GitHub release path`() {
+        assertTrue(
+            isTrustedReleaseAssetUrl(
+                "https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/" +
+                    "releases/download/34-0.10.11/time-stop.apk",
+            ),
+        )
+        assertFalse(
+            isTrustedReleaseAssetUrl(
+                "https://example.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/" +
+                    "releases/download/34-0.10.11/time-stop.apk",
+            ),
+        )
+        assertFalse(
+            isTrustedReleaseAssetUrl(
+                "http://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/" +
+                    "releases/download/34-0.10.11/time-stop.apk",
+            ),
+        )
+        assertFalse(
+            isTrustedReleaseAssetUrl(
+                "https://github.com/other/repository/releases/download/v1/time-stop.apk",
+            ),
+        )
+    }
 }

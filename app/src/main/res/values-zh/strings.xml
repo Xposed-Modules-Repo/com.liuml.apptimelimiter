@@ -2,4 +2,6 @@
 <resources>
     <string name="app_name">时停</string>
     <string name="module_description">按应用限制前台使用时长，达到限制后退出应用</string>
+    <string name="non_root_accessibility_label">时停普通保护</string>
+    <string name="non_root_accessibility_description">仅识别当前前台应用包名，并按你设置的时间规则返回桌面或显示限制提示；不会读取页面文字和输入内容。</string>
 </resources>

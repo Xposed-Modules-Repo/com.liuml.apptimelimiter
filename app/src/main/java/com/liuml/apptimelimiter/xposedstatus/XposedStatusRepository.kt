@@ -44,6 +44,7 @@ private class LibXposedServiceAdapter(
             } else {
                 emptyList()
             },
+            capturedAtMillis = System.currentTimeMillis(),
         )
     }
 
@@ -78,6 +79,8 @@ class XposedStatusRepository private constructor() {
     private var serviceAdapter: XposedServiceAdapter? = null
     @Volatile
     private var boundService: XposedService? = null
+    @Volatile
+    private var lastSuccessfulSnapshot: XposedFrameworkSnapshot? = null
 
     val snapshot: StateFlow<XposedFrameworkSnapshot> = _snapshot.asStateFlow()
 
@@ -96,14 +99,25 @@ class XposedStatusRepository private constructor() {
                         if (boundService !== service) return
                         boundService = null
                         serviceAdapter = null
-                        _snapshot.value = XposedFrameworkSnapshot(
+                        _snapshot.value = lastSuccessfulSnapshot?.copy(
+                            connected = false,
+                            stale = true,
+                            errorMessage = "Xposed service disconnected",
+                        ) ?: XposedFrameworkSnapshot(
+                            stale = true,
                             errorMessage = "Xposed service disconnected",
                         )
                     }
                 },
             )
         }.onFailure { error ->
-            _snapshot.value = XposedFrameworkSnapshot(
+            registered.set(false)
+            _snapshot.value = lastSuccessfulSnapshot?.copy(
+                connected = false,
+                stale = true,
+                errorMessage = "${error.javaClass.simpleName}: ${error.message.orEmpty()}",
+            ) ?: XposedFrameworkSnapshot(
+                stale = true,
                 errorMessage = "${error.javaClass.simpleName}: ${error.message.orEmpty()}",
             )
         }
@@ -112,11 +126,24 @@ class XposedStatusRepository private constructor() {
     fun refresh() {
         val adapter = serviceAdapter ?: return
         serviceExecutor.execute {
-            val refreshed = runCatching(adapter::snapshot).getOrElse { error ->
-                XposedFrameworkSnapshot(
-                    errorMessage = "${error.javaClass.simpleName}: ${error.message.orEmpty()}",
-                )
-            }
+            val refreshed = runCatching(adapter::snapshot).fold(
+                onSuccess = { snapshot ->
+                    lastSuccessfulSnapshot = snapshot
+                    snapshot
+                },
+                onFailure = { error ->
+                    lastSuccessfulSnapshot?.copy(
+                        connected = false,
+                        stale = true,
+                        errorMessage =
+                            "${error.javaClass.simpleName}: ${error.message.orEmpty()}",
+                    ) ?: XposedFrameworkSnapshot(
+                        stale = true,
+                        errorMessage =
+                            "${error.javaClass.simpleName}: ${error.message.orEmpty()}",
+                    )
+                },
+            )
             if (serviceAdapter === adapter) {
                 _snapshot.value = refreshed
             }

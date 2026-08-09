@@ -17,4 +17,28 @@
         <item name="android:navigationBarColor">#090909</item>
         <item name="android:colorAccent">#FFFFFF</item>
     </style>
+
+    <style name="Theme.AppTimeLimiter.TimePicker.Green.Light" parent="android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:colorAccent">#276B4E</item>
+    </style>
+
+    <style name="Theme.AppTimeLimiter.TimePicker.Green.Dark" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">#91D7AE</item>
+    </style>
+
+    <style name="Theme.AppTimeLimiter.TimePicker.Blue.Light" parent="android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:colorAccent">#315F91</item>
+    </style>
+
+    <style name="Theme.AppTimeLimiter.TimePicker.Blue.Dark" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">#A1C9FF</item>
+    </style>
+
+    <style name="Theme.AppTimeLimiter.TimePicker.Purple.Light" parent="android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:colorAccent">#6B4EA0</item>
+    </style>
+
+    <style name="Theme.AppTimeLimiter.TimePicker.Purple.Dark" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">#D4BBFF</item>
+    </style>
 </resources>

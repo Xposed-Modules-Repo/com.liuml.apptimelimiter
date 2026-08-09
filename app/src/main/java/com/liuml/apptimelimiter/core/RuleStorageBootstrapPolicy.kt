@@ -10,8 +10,9 @@ object RuleStorageBootstrapPolicy {
     fun action(
         privateMarkerPresent: Boolean,
         sharedMarkerPresent: Boolean,
+        primaryMarkerPresent: Boolean,
     ): RuleStorageBootstrapAction = when {
-        privateMarkerPresent && sharedMarkerPresent -> RuleStorageBootstrapAction.KEEP
+        primaryMarkerPresent -> RuleStorageBootstrapAction.KEEP
         !privateMarkerPresent && sharedMarkerPresent ->
             RuleStorageBootstrapAction.RESET_AFTER_DATA_CLEAR
         else -> RuleStorageBootstrapAction.ADOPT_EXISTING

@@ -21,6 +21,11 @@ data class CalculatedUsageSummary(
     val lastUsedAtMillis: Long,
 )
 
+data class CalculatedUsageSnapshot(
+    val summaries: Map<String, CalculatedUsageSummary> = emptyMap(),
+    val totalDurationMillis: Long = 0L,
+)
+
 /** Calculates durations strictly inside [startMillis, endMillis]. */
 object UsageEventDurationCalculator {
     fun calculate(
@@ -40,26 +45,53 @@ object UsageEventDurationCalculator {
         startMillis: Long,
         endMillis: Long,
         transitions: List<UsageTimelineEvent>,
-    ): Map<String, CalculatedUsageSummary> {
+    ): Map<String, CalculatedUsageSummary> = calculateSnapshot(
+        packageNames = packageNames,
+        startMillis = startMillis,
+        endMillis = endMillis,
+        transitions = transitions,
+    ).summaries
+
+    fun calculateSnapshot(
+        packageNames: Collection<String>,
+        startMillis: Long,
+        endMillis: Long,
+        transitions: List<UsageTimelineEvent>,
+    ): CalculatedUsageSnapshot {
         val tracked = packageNames.toSet()
         if (tracked.isEmpty() || endMillis <= startMillis) {
-            return tracked.associateWith {
-                CalculatedUsageSummary(0L, 0, 0L)
-            }
+            return CalculatedUsageSnapshot(
+                summaries = tracked.associateWith {
+                    CalculatedUsageSummary(0L, 0, 0L)
+                },
+            )
         }
         val foreground = tracked.associateWith { false }.toMutableMap()
         val startedAt = mutableMapOf<String, Long>()
         val durations = tracked.associateWith { 0L }.toMutableMap()
         val launchCounts = tracked.associateWith { 0 }.toMutableMap()
         val lastUsedAt = tracked.associateWith { 0L }.toMutableMap()
+        var totalStartedAt: Long? = null
+        var totalDuration = 0L
         var interactive = true
         var boundaryInitialized = false
+
+        fun startCounting(packageName: String, timestampMillis: Long) {
+            if (startedAt.isEmpty()) totalStartedAt = timestampMillis
+            startedAt[packageName] = timestampMillis
+        }
+
+        fun stopTotalCounting(timestampMillis: Long) {
+            val started = totalStartedAt ?: return
+            totalDuration += (timestampMillis - started).coerceAtLeast(0L)
+            totalStartedAt = null
+        }
 
         fun initializeBoundary() {
             if (boundaryInitialized) return
             if (interactive) {
                 foreground.filterValues { it }.keys.forEach { packageName ->
-                    startedAt[packageName] = startMillis
+                    startCounting(packageName, startMillis)
                     // A session carried across midnight still contributes one use session today.
                     launchCounts[packageName] = 1
                     lastUsedAt[packageName] = startMillis
@@ -72,6 +104,7 @@ object UsageEventDurationCalculator {
             val started = startedAt.remove(packageName) ?: return
             durations[packageName] = durations.getValue(packageName) +
                 (timestampMillis - started).coerceAtLeast(0L)
+            if (startedAt.isEmpty()) stopTotalCounting(timestampMillis)
         }
 
         fun applyTransition(transition: UsageTimelineEvent, beforeBoundary: Boolean) {
@@ -84,7 +117,7 @@ object UsageEventDurationCalculator {
                             foreground[packageName] = true
                             if (!beforeBoundary && interactive) {
                                 val started = transition.timestampMillis.coerceAtLeast(startMillis)
-                                startedAt[packageName] = started
+                                startCounting(packageName, started)
                                 launchCounts[packageName] = launchCounts.getValue(packageName) + 1
                                 lastUsedAt[packageName] = maxOf(lastUsedAt.getValue(packageName), started)
                             }
@@ -99,15 +132,19 @@ object UsageEventDurationCalculator {
                     if (interactive == transition.interactive) return
                     if (!beforeBoundary) {
                         if (transition.interactive) {
-                            foreground.filterValues { it }.keys.forEach { packageName ->
-                                startedAt[packageName] = transition.timestampMillis
-                                    .coerceAtLeast(startMillis)
-                            }
+                            // Do not revive packages that were foreground before screen-off.
+                            // Some ROMs omit their pause event, which otherwise makes every
+                            // previously opened app count the same future screen-on intervals.
                         } else {
                             foreground.filterValues { it }.keys.forEach { packageName ->
                                 stopCounting(packageName, transition.timestampMillis)
                             }
                         }
+                    }
+                    if (!transition.interactive) {
+                        foreground.keys.forEach { foreground[it] = false }
+                        startedAt.clear()
+                        totalStartedAt = null
                     }
                     interactive = transition.interactive
                 }
@@ -132,19 +169,23 @@ object UsageEventDurationCalculator {
             durations[packageName] = durations.getValue(packageName) +
                 (endMillis - started).coerceAtLeast(0L)
         }
+        stopTotalCounting(endMillis)
         val maxDuration = endMillis - startMillis
-        return tracked.associateWith { packageName ->
-            val duration = durations.getValue(packageName).coerceIn(0L, maxDuration)
-            CalculatedUsageSummary(
-                durationMillis = duration,
-                // Some OEMs omit the first foreground event while still exposing a valid interval.
-                launchCount = if (duration > 0L) {
-                    launchCounts.getValue(packageName).coerceAtLeast(1)
-                } else {
-                    launchCounts.getValue(packageName)
-                },
-                lastUsedAtMillis = lastUsedAt.getValue(packageName),
-            )
-        }
+        return CalculatedUsageSnapshot(
+            summaries = tracked.associateWith { packageName ->
+                val duration = durations.getValue(packageName).coerceIn(0L, maxDuration)
+                CalculatedUsageSummary(
+                    durationMillis = duration,
+                    // Some OEMs omit the first foreground event while still exposing a valid interval.
+                    launchCount = if (duration > 0L) {
+                        launchCounts.getValue(packageName).coerceAtLeast(1)
+                    } else {
+                        launchCounts.getValue(packageName)
+                    },
+                    lastUsedAtMillis = lastUsedAt.getValue(packageName),
+                )
+            },
+            totalDurationMillis = totalDuration.coerceIn(0L, maxDuration),
+        )
     }
 }

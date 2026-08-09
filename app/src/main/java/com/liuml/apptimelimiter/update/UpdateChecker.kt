@@ -13,6 +13,7 @@ import com.liuml.apptimelimiter.localization.SupportedLanguage
 import org.json.JSONArray
 import java.io.File
 import java.net.HttpURLConnection
+import java.net.URI
 import java.net.URL
 import kotlin.concurrent.thread
 
@@ -46,6 +47,13 @@ object UpdateChecker {
 
     fun download(context: Context, release: ReleaseInfo): Long {
         val english = isEnglish(context)
+        require(isTrustedReleaseAssetUrl(release.apkDownloadUrl)) {
+            if (english) {
+                "The update download URL is not from the official GitHub repository"
+            } else {
+                "更新下载地址不是官方 GitHub 仓库"
+            }
+        }
         val safeName = release.apkName.replace(Regex("[^A-Za-z0-9._-]"), "_")
         context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
             ?.let { File(it, safeName) }
@@ -95,7 +103,10 @@ object UpdateChecker {
             val apkAsset = (0 until assets.length())
                 .asSequence()
                 .map(assets::getJSONObject)
-                .firstOrNull { isPublishableApkAsset(it.optString("name")) }
+                .firstOrNull {
+                    isPublishableApkAsset(it.optString("name")) &&
+                        isTrustedReleaseAssetUrl(it.optString("browser_download_url"))
+                }
                 ?: return UpdateCheckResult.Error(
                     if (english) "The latest release does not include an APK" else "最新版本没有附带 APK",
                 )
@@ -137,6 +148,15 @@ internal fun isPublishableApkAsset(name: String): Boolean {
         "unsigned" !in normalized
 }
 
+internal fun isTrustedReleaseAssetUrl(value: String): Boolean {
+    val uri = runCatching { URI(value.trim()) }.getOrNull() ?: return false
+    return uri.scheme.equals("https", ignoreCase = true) &&
+        uri.host.equals("github.com", ignoreCase = true) &&
+        uri.userInfo == null &&
+        uri.port in setOf(-1, 443) &&
+        uri.path.orEmpty().startsWith(OFFICIAL_RELEASE_DOWNLOAD_PREFIX)
+}
+
 internal fun isVersionNewer(candidate: String, current: String): Boolean {
     val candidateParts = versionParts(candidate)
     val currentParts = versionParts(current)
@@ -148,6 +168,9 @@ internal fun isVersionNewer(candidate: String, current: String): Boolean {
     }
     return false
 }
+
+private const val OFFICIAL_RELEASE_DOWNLOAD_PREFIX =
+    "/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/download/"
 
 private fun versionParts(value: String): List<Int> {
     val normalized = value.trim().removePrefix("v").removePrefix("V")

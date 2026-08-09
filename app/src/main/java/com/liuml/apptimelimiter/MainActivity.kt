@@ -12,6 +12,8 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.net.Uri
+import android.provider.Settings
+import android.view.ContextThemeWrapper
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -97,7 +99,11 @@ import androidx.compose.ui.unit.TextUnit
 import com.liuml.apptimelimiter.data.AppRule
 import com.liuml.apptimelimiter.data.AppGroup
 import com.liuml.apptimelimiter.data.AppLanguageMode
+import com.liuml.apptimelimiter.data.AppThemeColor
+import com.liuml.apptimelimiter.data.AppThemeMode
 import com.liuml.apptimelimiter.data.GlobalSettings
+import com.liuml.apptimelimiter.data.NonRootCompatibilityMode
+import com.liuml.apptimelimiter.data.ProtectionMode
 import com.liuml.apptimelimiter.data.hasPersonalConfiguration
 import com.liuml.apptimelimiter.data.LimitEnforcementMode
 import com.liuml.apptimelimiter.data.InstalledApp
@@ -107,23 +113,51 @@ import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.data.ScheduleMode
 import com.liuml.apptimelimiter.data.ScheduleWindow
 import com.liuml.apptimelimiter.core.GroupUsagePolicy
+import com.liuml.apptimelimiter.core.HookStatusPresentationPolicy
 import com.liuml.apptimelimiter.core.CooldownPolicy
-import com.liuml.apptimelimiter.core.DonationPromptPolicy
+import com.liuml.apptimelimiter.core.ProtectionSettingsPolicy
+import com.liuml.apptimelimiter.core.PermissionRepairPromptPolicy
+import com.liuml.apptimelimiter.core.ProtectionHealth
+import com.liuml.apptimelimiter.core.ProtectionPresentationPolicy
+import com.liuml.apptimelimiter.core.ProtectionPresentationSeverity
+import com.liuml.apptimelimiter.core.ProtectionPresentationSnapshot
+import com.liuml.apptimelimiter.core.ProtectionPresentationState
+import com.liuml.apptimelimiter.core.ProtectionStatusPolicy
+import com.liuml.apptimelimiter.core.ScopeState
+import com.liuml.apptimelimiter.core.TargetProtectionInput
+import com.liuml.apptimelimiter.core.TargetProtectionStatus
+import com.liuml.apptimelimiter.core.TimeQuotePolicy
+import com.liuml.apptimelimiter.core.VersionAnnouncementPolicy
 import com.liuml.apptimelimiter.localization.AppLocaleController
 import com.liuml.apptimelimiter.localization.SupportedLanguage
 import com.liuml.apptimelimiter.localization.UiText
+import com.liuml.apptimelimiter.nonroot.NonRootProtectionStatusRepository
+import com.liuml.apptimelimiter.nonroot.AccessibilityRuntimeState
+import com.liuml.apptimelimiter.nonroot.NonRootHealthSnapshot
+import com.liuml.apptimelimiter.nonroot.ForegroundSignalSource
+import com.liuml.apptimelimiter.nonroot.NonRootPermissionIssue
+import com.liuml.apptimelimiter.nonroot.NonRootPermissionPolicy
+import com.liuml.apptimelimiter.nonroot.OemCompatibilityDestination
+import com.liuml.apptimelimiter.nonroot.OemCompatibilityNavigator
+import com.liuml.apptimelimiter.nonroot.ShizukuExecutionRepository
+import com.liuml.apptimelimiter.nonroot.ShizukuExecutionState
+import com.liuml.apptimelimiter.nonroot.TimeStopAccessibilityService
 import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
 import com.liuml.apptimelimiter.support.DonationLinkPolicy
 import com.liuml.apptimelimiter.support.FeedbackSender
 import com.liuml.apptimelimiter.settings.LauncherIconController
 import com.liuml.apptimelimiter.statistics.AppUsageSummary
-import com.liuml.apptimelimiter.statistics.CalculatedUsageSummary
+import com.liuml.apptimelimiter.statistics.CalculatedUsageSnapshot
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
-import com.liuml.apptimelimiter.statistics.HookCounterSyncPolicy
+import com.liuml.apptimelimiter.statistics.UsageSummaryMergePolicy
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.update.ReleaseInfo
+import com.liuml.apptimelimiter.update.AutomaticUpdatePolicy
 import com.liuml.apptimelimiter.update.UpdateCheckResult
 import com.liuml.apptimelimiter.update.UpdateChecker
+import com.liuml.apptimelimiter.ui.theme.LocalTimeStopExtendedColors
+import com.liuml.apptimelimiter.ui.theme.LocalTimeStopThemeState
+import com.liuml.apptimelimiter.ui.theme.TimeStopTheme
 import com.liuml.apptimelimiter.xposedstatus.ManagedAppHookState
 import com.liuml.apptimelimiter.xposedstatus.XposedStatusPolicy
 import com.liuml.apptimelimiter.xposedstatus.XposedStatusRepository
@@ -139,6 +173,7 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private val xposedStatusRepository = XposedStatusRepository.instance
+    private lateinit var nonRootStatusRepository: NonRootProtectionStatusRepository
 
     override fun attachBaseContext(newBase: Context) {
         val languageMode = runCatching {
@@ -150,19 +185,25 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         xposedStatusRepository.initialize()
+        nonRootStatusRepository = NonRootProtectionStatusRepository.get(this)
         val ruleRepository = RuleRepository(this)
         val diagnosticsRepository = DiagnosticsRepository(this)
         val usageStatsRepository = UsageStatsRepository(this)
         val deviceUsageStatsRepository = DeviceUsageStatsRepository(this)
         val installedAppsRepository = InstalledAppsRepository(this)
         setContent {
+            val initialSettings = remember { ruleRepository.getGlobalSettings() }
+            var themeMode by remember {
+                mutableStateOf(initialSettings.themeMode)
+            }
+            var themeColor by remember { mutableStateOf(initialSettings.themeColor) }
             var apps by remember { mutableStateOf<List<InstalledApp>?>(null) }
             LaunchedEffect(Unit) {
                 apps = withContext(Dispatchers.IO) {
                     installedAppsRepository.loadLaunchableApps()
                 }
             }
-            AppTimeLimiterTheme {
+            TimeStopTheme(themeMode, themeColor) {
                 val loadedApps = apps
                 if (loadedApps == null) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -176,6 +217,11 @@ class MainActivity : ComponentActivity() {
                         usageStatsRepository,
                         deviceUsageStatsRepository,
                         xposedStatusRepository,
+                        nonRootStatusRepository,
+                        onThemeChanged = { mode, color ->
+                            themeMode = mode
+                            themeColor = color
+                        },
                     )
                 }
             }
@@ -184,7 +230,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        xposedStatusRepository.initialize()
         xposedStatusRepository.refresh()
+        if (::nonRootStatusRepository.isInitialized) nonRootStatusRepository.refresh()
     }
 }
 
@@ -197,9 +245,15 @@ private fun TimeLimiterScreen(
     usageStatsRepository: UsageStatsRepository,
     deviceUsageStatsRepository: DeviceUsageStatsRepository,
     xposedStatusRepository: XposedStatusRepository,
+    nonRootStatusRepository: NonRootProtectionStatusRepository,
+    onThemeChanged: (AppThemeMode, AppThemeColor) -> Unit,
 ) {
     val context = LocalContext.current
     val xposedSnapshot by xposedStatusRepository.snapshot.collectAsState()
+    val nonRootSnapshot by nonRootStatusRepository.snapshot.collectAsState()
+    val nonRootHealthSnapshot by nonRootStatusRepository.healthSnapshot.collectAsState()
+    val shizukuRepository = remember(context) { ShizukuExecutionRepository.get(context) }
+    val shizukuState by shizukuRepository.state.collectAsState()
     val rules = remember {
         mutableStateMapOf<String, AppRule>().also { map ->
             apps.forEach { map[it.packageName] = repository.getRule(it.packageName) }
@@ -221,12 +275,16 @@ private fun TimeLimiterScreen(
     var showDonation by remember { mutableStateOf(false) }
     var checkingUpdate by remember { mutableStateOf(false) }
     var updateResult by remember { mutableStateOf<UpdateCheckResult?>(null) }
+    var pendingAutomaticUpdate by remember {
+        mutableStateOf<UpdateCheckResult.Available?>(null)
+    }
     var selectedSection by remember { mutableStateOf(MainSection.HOME) }
     var groups by remember { mutableStateOf(repository.getGroups()) }
     var editingGroup by remember { mutableStateOf<AppGroup?>(null) }
     var scopeReminderPackages by remember { mutableStateOf<Set<String>>(emptySet()) }
     var scopeRequestInProgress by remember { mutableStateOf(false) }
     var usageRevision by remember { mutableIntStateOf(0) }
+    var appResumeRevision by remember { mutableIntStateOf(0) }
     var showFeatureIntro by rememberSaveable {
         mutableStateOf(
             !context.getSharedPreferences("ui", Context.MODE_PRIVATE)
@@ -234,83 +292,160 @@ private fun TimeLimiterScreen(
         )
     }
     var showBetaInvite by rememberSaveable {
+        val preferences = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
         mutableStateOf(
-            !context.getSharedPreferences("ui", Context.MODE_PRIVATE)
-                .getBoolean(BETA_INVITE_DISABLED_KEY, false),
+            VersionAnnouncementPolicy.shouldShow(
+                currentVersionCode = BuildConfig.VERSION_CODE,
+                lastAcknowledgedVersionCode = preferences.getInt(
+                    BETA_INVITE_LAST_VERSION_KEY,
+                    -1,
+                ),
+            ),
         )
     }
     var showSetupGuide by remember { mutableStateOf(false) }
+    var showNonRootRepairPrompt by rememberSaveable { mutableStateOf(false) }
+    var currentPermissionPromptSignature by rememberSaveable { mutableStateOf("") }
+    var suppressCurrentPermissionIssue by rememberSaveable { mutableStateOf(false) }
     var showDonationPrompt by rememberSaveable {
         val preferences = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
-        val todayEpochDay = LocalDate.now().toEpochDay()
-        val storedFirstUseDay = if (preferences.contains(DONATION_FIRST_USE_DAY_KEY)) {
-            preferences.getLong(DONATION_FIRST_USE_DAY_KEY, todayEpochDay)
-        } else {
-            null
-        }
-        val storedLastPromptDay = if (
-            preferences.contains(DONATION_LAST_PROMPT_DAY_KEY)
-        ) {
-            preferences.getLong(DONATION_LAST_PROMPT_DAY_KEY, todayEpochDay)
-        } else {
-            null
-        }
-        val decision = DonationPromptPolicy.onLaunch(
-            storedFirstUseEpochDay = storedFirstUseDay,
-            storedLastPromptEpochDay = storedLastPromptDay,
-            storedLaunchesSincePrompt = preferences.getInt(
-                DONATION_LAUNCHES_SINCE_PROMPT_KEY,
-                0,
+        mutableStateOf(
+            VersionAnnouncementPolicy.shouldShow(
+                currentVersionCode = BuildConfig.VERSION_CODE,
+                lastAcknowledgedVersionCode = preferences.getInt(
+                    DONATION_PROMPT_LAST_VERSION_KEY,
+                    -1,
+                ),
             ),
-            todayEpochDay = todayEpochDay,
-            disabled = preferences.getBoolean(DONATION_PROMPT_DISABLED_KEY, false),
         )
-        val editor = preferences.edit()
-            .putLong(DONATION_FIRST_USE_DAY_KEY, decision.firstUseEpochDay)
-            .putInt(
-                DONATION_LAUNCHES_SINCE_PROMPT_KEY,
-                decision.launchesSincePrompt,
+    }
+
+    LaunchedEffect(Unit) {
+        val uiPreferences = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+        val nowMillis = System.currentTimeMillis()
+        val settings = repository.getGlobalSettings()
+        if (
+            AutomaticUpdatePolicy.shouldCheck(
+                enabled = settings.automaticUpdateCheckEnabled,
+                nowMillis = nowMillis,
+                lastCheckAtMillis = uiPreferences.getLong(
+                    AUTOMATIC_UPDATE_LAST_CHECK_AT_KEY,
+                    0L,
+                ),
             )
-        decision.lastPromptEpochDay?.let {
-            editor.putLong(DONATION_LAST_PROMPT_DAY_KEY, it)
+        ) {
+            UpdateChecker.check(context) { result ->
+                if (result !is UpdateCheckResult.Error) {
+                    uiPreferences.edit()
+                        .putLong(AUTOMATIC_UPDATE_LAST_CHECK_AT_KEY, System.currentTimeMillis())
+                        .apply()
+                }
+                if (result is UpdateCheckResult.Available) {
+                    if (checkingUpdate || updateResult != null) return@check
+                    val promptNow = System.currentTimeMillis()
+                    if (
+                        AutomaticUpdatePolicy.shouldPrompt(
+                            releaseVersion = result.release.version,
+                            nowMillis = promptNow,
+                            lastPromptedVersion = uiPreferences.getString(
+                                AUTOMATIC_UPDATE_LAST_PROMPT_VERSION_KEY,
+                                null,
+                            ),
+                            lastPromptedAtMillis = uiPreferences.getLong(
+                                AUTOMATIC_UPDATE_LAST_PROMPT_AT_KEY,
+                                0L,
+                            ),
+                        )
+                    ) {
+                        pendingAutomaticUpdate = result
+                    }
+                }
+            }
         }
-        editor.apply()
-        mutableStateOf(decision.shouldPrompt)
+    }
+
+    val anotherDialogVisible =
+        editingApp != null ||
+            editingGroup != null ||
+            showLogs ||
+            showSettings ||
+            showAbout ||
+            showFeedbackOptions ||
+            showDonation ||
+            checkingUpdate ||
+            updateResult != null ||
+            scopeReminderPackages.isNotEmpty() ||
+            showFeatureIntro ||
+            showBetaInvite ||
+            showSetupGuide ||
+            showNonRootRepairPrompt ||
+            showDonationPrompt
+    LaunchedEffect(pendingAutomaticUpdate, anotherDialogVisible) {
+        val available = pendingAutomaticUpdate ?: return@LaunchedEffect
+        if (anotherDialogVisible) return@LaunchedEffect
+        val promptedAt = System.currentTimeMillis()
+        context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+            .edit()
+            .putString(AUTOMATIC_UPDATE_LAST_PROMPT_VERSION_KEY, available.release.version)
+            .putLong(AUTOMATIC_UPDATE_LAST_PROMPT_AT_KEY, promptedAt)
+            .apply()
+        pendingAutomaticUpdate = null
+        updateResult = available
     }
 
     val groupByPackage = remember(groups) {
-        groups.filter(AppGroup::enabled)
-            .flatMap { group -> group.packageNames.map { it to group } }
+        groups.flatMap { group -> group.packageNames.map { it to group } }
             .toMap()
+    }
+    val appByPackage = remember(apps) { apps.associateBy(InstalledApp::packageName) }
+    val activeGroupPackages = remember(groups) {
+        groups.filter(AppGroup::enabled)
+            .flatMapTo(mutableSetOf(), AppGroup::packageNames)
     }
     val selectableApps = remember(apps, showSystemApps) {
         if (showSystemApps) apps else apps.filterNot(InstalledApp::isSystemApp)
     }
-    val visibleApps = remember(apps, search, onlyEnabled, showSystemApps, rules.toMap(), groupByPackage) {
+    val visibleApps = remember(
+        apps,
+        search,
+        onlyEnabled,
+        showSystemApps,
+        rules.toMap(),
+        groupByPackage,
+        activeGroupPackages,
+    ) {
         apps.filter { app ->
             (showSystemApps || !app.isSystemApp) &&
             (!onlyEnabled || rules[app.packageName]?.let {
-                it.enabled || it.sessionPlanningEnabled
-            } == true || app.packageName in groupByPackage) &&
+                app.packageName !in groupByPackage &&
+                    (it.enabled || it.sessionPlanningEnabled)
+            } == true || app.packageName in activeGroupPackages) &&
                 (search.isBlank() || app.label.contains(search, true) || app.packageName.contains(search, true))
         }.sortedWith(
             compareByDescending<InstalledApp> {
                 rules[it.packageName]?.let { rule ->
-                    rule.enabled || rule.sessionPlanningEnabled
-                } == true || it.packageName in groupByPackage
+                    it.packageName !in groupByPackage &&
+                        (rule.enabled || rule.sessionPlanningEnabled)
+                } == true || it.packageName in activeGroupPackages
             }
                 .thenBy { it.label.lowercase() },
         )
     }
-    val enabledPackages = remember(rules.toMap(), groupByPackage) {
-        rules.values.filter { it.enabled || it.sessionPlanningEnabled }
+    val enabledPackages = remember(rules.toMap(), groupByPackage, activeGroupPackages) {
+        rules.values.filter {
+            it.packageName !in groupByPackage &&
+                (it.enabled || it.sessionPlanningEnabled)
+        }
             .map(AppRule::packageName)
-            .toSet() + groupByPackage.keys
+            .toSet() + activeGroupPackages
     }
-    val hookFeaturePackages = remember(rules.toMap(), groupByPackage) {
-        rules.values.filter { it.enabled || it.sessionPlanningEnabled }
+    val hookFeaturePackages = remember(rules.toMap(), groupByPackage, activeGroupPackages) {
+        rules.values.filter {
+            it.packageName !in groupByPackage &&
+                (it.enabled || it.sessionPlanningEnabled)
+        }
             .map(AppRule::packageName)
-            .toSet() + groupByPackage.keys
+            .toSet() + activeGroupPackages
     }
     val statsEnabled = remember(usageRevision) {
         repository.getGlobalSettings().usageStatsEnabled
@@ -326,16 +461,15 @@ private fun TimeLimiterScreen(
     val systemTrackedPackages = remember(allLaunchablePackages, groupPackages, statsEnabled) {
         if (statsEnabled) allLaunchablePackages else groupPackages
     }
-    var systemSummaries by remember {
-        mutableStateOf<Map<String, CalculatedUsageSummary>>(emptyMap())
-    }
+    var systemUsageSnapshot by remember { mutableStateOf(CalculatedUsageSnapshot()) }
+    val systemSummaries = systemUsageSnapshot.summaries
     LaunchedEffect(systemTrackedPackages, usageRevision, usageAccessGranted) {
-        systemSummaries = if (usageAccessGranted && systemTrackedPackages.isNotEmpty()) {
+        systemUsageSnapshot = if (usageAccessGranted && systemTrackedPackages.isNotEmpty()) {
             withContext(Dispatchers.IO) {
-                deviceUsageStatsRepository.todayUsageSummaries(systemTrackedPackages)
+                deviceUsageStatsRepository.todayUsageSnapshot(systemTrackedPackages)
             }
         } else {
-            emptyMap()
+            CalculatedUsageSnapshot()
         }
     }
     val todaySummaries = remember(
@@ -360,13 +494,28 @@ private fun TimeLimiterScreen(
                     hook.durationMillis,
                     if (usageAccessGranted) system?.durationMillis ?: 0L else 0L,
                 ),
-                launchCount = system?.launchCount ?: hook.launchCount,
+                launchCount = UsageSummaryMergePolicy.authoritativeLaunchCount(
+                    moduleLaunchCount = hook.launchCount,
+                    systemLaunchCount = system?.launchCount,
+                ),
                 lastUsedAtMillis = maxOf(hook.lastUsedAtMillis, system?.lastUsedAtMillis ?: 0L),
             )
                 .takeIf { it.durationMillis > 0L || it.launchCount > 0 || it.limitHitCount > 0 }
         }
     }
-    val todayTotalMillis = todaySummaries.sumOf(AppUsageSummary::durationMillis)
+    val todayTotalMillis = remember(
+        todaySummaries,
+        systemUsageSnapshot.totalDurationMillis,
+        usageAccessGranted,
+        usageRevision,
+    ) {
+        UsageSummaryMergePolicy.authoritativeTotalDuration(
+            appDurationsMillis = todaySummaries.map(AppUsageSummary::durationMillis),
+            systemUnionDurationMillis = systemUsageSnapshot.totalDurationMillis
+                .takeIf { usageAccessGranted },
+            maximumDayDurationMillis = elapsedTodayMillis(),
+        )
+    }
     val groupUsageById = remember(groups, hookSummaries, systemSummaries) {
         val moduleDurations = hookSummaries.associate { it.packageName to it.durationMillis }
         val systemDurations = systemSummaries.mapValues { it.value.durationMillis }
@@ -380,6 +529,9 @@ private fun TimeLimiterScreen(
     }
     val hookVersionByPackage = remember(hookSummaries) {
         hookSummaries.associate { it.packageName to it.hookVersionCode }
+    }
+    val hookSummaryByPackage = remember(hookSummaries) {
+        hookSummaries.associateBy(AppUsageSummary::packageName)
     }
     val hookStatusPackages = remember(allLaunchablePackages, hookFeaturePackages) {
         allLaunchablePackages + hookFeaturePackages
@@ -398,15 +550,133 @@ private fun TimeLimiterScreen(
             )
         }
     }
-    val scopeReadyPackages = remember(hookStatusPackages, hookStatusByPackage) {
-        hookStatusPackages.filterTo(mutableSetOf()) { packageName ->
-            hookStatusByPackage[packageName]?.let(XposedStatusPolicy::isScopeReady) == true
+    val currentSettings = remember(usageRevision) { repository.getGlobalSettings() }
+    val nonRootModeEnabled = currentSettings.protectionMode.usesNonRoot
+    val shizukuRepairCapability = remember(shizukuState, usageRevision) {
+        shizukuRepository.repairCapabilityState()
+    }
+    val targetProtectionStatuses = remember(
+        enabledPackages,
+        hookStatusByPackage,
+        hookSummaryByPackage,
+        xposedSnapshot,
+        nonRootSnapshot,
+        shizukuState,
+        shizukuRepairCapability,
+        currentSettings.protectionMode,
+        currentSettings.protectionModeGeneration,
+    ) {
+        enabledPackages.map { packageName ->
+            val summary = hookSummaryByPackage[packageName]
+            ProtectionStatusPolicy.resolveTarget(
+                TargetProtectionInput(
+                    packageName = packageName,
+                    hasSavedRule = true,
+                    frameworkConnected = xposedSnapshot.connected,
+                    managedHookState = hookStatusByPackage[packageName]
+                        ?: ManagedAppHookState.COMPATIBILITY_PENDING,
+                    hookVersionCode = summary?.hookVersionCode ?: 0,
+                    hookModeGeneration = summary?.hookModeGeneration ?: 0L,
+                    currentVersionCode = BuildConfig.VERSION_CODE,
+                    selectedMode = currentSettings.protectionMode,
+                    selectedModeGeneration = currentSettings.protectionModeGeneration,
+                    accessibilityEnabled = nonRootSnapshot.accessibilityEnabled,
+                    accessibilityConfigured = nonRootSnapshot.accessibilityConfigured,
+                    usageAccessGranted = nonRootSnapshot.usageAccessGranted,
+                    shizukuState = if (currentSettings.protectionMode.usesShizuku) {
+                        shizukuState
+                    } else {
+                        shizukuRepairCapability
+                    },
+                ),
+            )
         }
+    }
+    val xposedDiagnosticStatuses = remember(
+        enabledPackages,
+        hookStatusByPackage,
+        hookSummaryByPackage,
+        xposedSnapshot,
+        currentSettings.protectionModeGeneration,
+    ) {
+        enabledPackages.map { packageName ->
+            val summary = hookSummaryByPackage[packageName]
+            ProtectionStatusPolicy.resolveTarget(
+                TargetProtectionInput(
+                    packageName = packageName,
+                    hasSavedRule = true,
+                    frameworkConnected = xposedSnapshot.connected,
+                    managedHookState = hookStatusByPackage[packageName]
+                        ?: ManagedAppHookState.COMPATIBILITY_PENDING,
+                    hookVersionCode = summary?.hookVersionCode ?: 0,
+                    hookModeGeneration = summary?.hookModeGeneration ?: 0L,
+                    currentVersionCode = BuildConfig.VERSION_CODE,
+                    selectedMode = ProtectionMode.XPOSED,
+                    selectedModeGeneration = currentSettings.protectionModeGeneration,
+                    accessibilityEnabled = false,
+                    usageAccessGranted = false,
+                    shizukuState = ShizukuExecutionState.DISABLED,
+                ),
+            )
+        }
+    }
+    val protectionOverview = remember(
+        currentSettings.protectionMode,
+        targetProtectionStatuses,
+    ) {
+        ProtectionStatusPolicy.overview(
+            currentSettings.protectionMode,
+            targetProtectionStatuses,
+        )
+    }
+    val protectionPresentation = remember(
+        currentSettings.protectionMode,
+        targetProtectionStatuses,
+        xposedDiagnosticStatuses,
+        nonRootSnapshot.accessibilityRuntimeState,
+        nonRootSnapshot.usageAccessGranted,
+        shizukuState,
+    ) {
+        ProtectionPresentationPolicy.resolve(
+            selectedMode = currentSettings.protectionMode,
+            targets = if (currentSettings.protectionMode == ProtectionMode.XPOSED) {
+                xposedDiagnosticStatuses
+            } else {
+                targetProtectionStatuses
+            },
+            accessibilityState = nonRootSnapshot.accessibilityRuntimeState,
+            usageAccessGranted = nonRootSnapshot.usageAccessGranted,
+            shizukuState = shizukuState,
+        )
+    }
+    val xposedSettingsAvailable = remember(
+        xposedSnapshot.connected,
+        hookVersionByPackage,
+    ) {
+        xposedSnapshot.connected || hookVersionByPackage.values.any { it > 0 }
+    }
+    val nonRootPermissionIssues = remember(
+        nonRootSnapshot.accessibilityRuntimeState,
+        nonRootSnapshot.usageAccessGranted,
+        shizukuState,
+        usageRevision,
+        currentSettings.protectionMode,
+    ) {
+        NonRootPermissionPolicy.issues(
+            nonRootEnabled = currentSettings.protectionMode.usesNonRoot,
+            accessibilityState = nonRootSnapshot.accessibilityRuntimeState,
+            usageAccessGranted = nonRootSnapshot.usageAccessGranted,
+            shizukuSelected = currentSettings.protectionMode.usesShizuku,
+            shizukuState = shizukuState,
+        )
     }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) usageRevision++
+            if (event == Lifecycle.Event.ON_RESUME) {
+                usageRevision++
+                appResumeRevision++
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -421,6 +691,174 @@ private fun TimeLimiterScreen(
             delay((nextMidnight - System.currentTimeMillis() + 250L).coerceAtLeast(1_000L))
             usageRevision++
         }
+    }
+    LaunchedEffect(
+        nonRootPermissionIssues,
+        appResumeRevision,
+        enabledPackages,
+        currentSettings.protectionMode,
+    ) {
+        val reconnectGraceMillis = PermissionRepairPromptPolicy.initialDelayMillis(
+            nonRootPermissionIssues,
+        )
+        if (reconnectGraceMillis > 0L) delay(reconnectGraceMillis)
+        val uiPrefs = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+        val decision = PermissionRepairPromptPolicy.decide(
+            mode = currentSettings.protectionMode,
+            targetCount = enabledPackages.size,
+            issues = nonRootPermissionIssues,
+            suppressedSignatures = uiPrefs.getStringSet(
+                NON_ROOT_REPAIR_SUPPRESSED_SIGNATURES_KEY,
+                emptySet(),
+            ).orEmpty(),
+            lastShownSignature = uiPrefs.getString(
+                NON_ROOT_REPAIR_LAST_SHOWN_SIGNATURE_KEY,
+                null,
+            ),
+            lastShownAtMillis = uiPrefs.getLong(
+                NON_ROOT_REPAIR_LAST_SHOWN_AT_KEY,
+                0L,
+            ),
+            nowMillis = System.currentTimeMillis(),
+        )
+        if (
+            showNonRootRepairPrompt &&
+            currentPermissionPromptSignature == decision.signature &&
+            nonRootPermissionIssues.isNotEmpty()
+        ) {
+            return@LaunchedEffect
+        }
+        showNonRootRepairPrompt = decision.shouldShow
+        if (decision.shouldShow) {
+            currentPermissionPromptSignature = decision.signature
+            suppressCurrentPermissionIssue = false
+            uiPrefs.edit()
+                .putString(NON_ROOT_REPAIR_LAST_SHOWN_SIGNATURE_KEY, decision.signature)
+                .putLong(NON_ROOT_REPAIR_LAST_SHOWN_AT_KEY, System.currentTimeMillis())
+                .commit()
+            if (currentSettings.diagnosticsEnabled) {
+                diagnosticsRepository.append(
+                    "INFO",
+                    context.packageName,
+                    "PERMISSION_REPAIR_PROMPT_SHOWN",
+                    "signature=${decision.signature}",
+                )
+            }
+        } else if (nonRootPermissionIssues.isEmpty()) {
+            currentPermissionPromptSignature = ""
+        } else if (currentSettings.diagnosticsEnabled) {
+            diagnosticsRepository.appendRateLimited(
+                level = "INFO",
+                packageName = context.packageName,
+                event = "PERMISSION_REPAIR_PROMPT_SUPPRESSED",
+                stateSignature = decision.signature + ':' + decision.reason.name,
+                message = "signature=${decision.signature}, reason=${decision.reason}",
+                windowMillis = 60_000L,
+            )
+        }
+    }
+    LaunchedEffect(nonRootModeEnabled) {
+        if (nonRootModeEnabled) {
+            scopeReminderPackages = emptySet()
+        }
+    }
+    LaunchedEffect(protectionOverview, targetProtectionStatuses) {
+        if (protectionOverview.issueCount <= 0 || !currentSettings.diagnosticsEnabled) {
+            return@LaunchedEffect
+        }
+        val signature = buildString {
+            append(currentSettings.protectionMode.name)
+            append(':')
+            append(currentSettings.protectionModeGeneration)
+            targetProtectionStatuses.filter { it.health != ProtectionHealth.HEALTHY }
+                .sortedBy(TargetProtectionStatus::packageName)
+                .forEach {
+                    append('|')
+                    append(it.packageName)
+                    append(':')
+                    append(it.message.name)
+                }
+        }
+        val uiPrefs = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+        if (uiPrefs.getString(PROTECTION_DEGRADED_SIGNATURE_KEY, null) != signature) {
+            uiPrefs.edit().putString(PROTECTION_DEGRADED_SIGNATURE_KEY, signature).apply()
+            diagnosticsRepository.append(
+                "WARN",
+                context.packageName,
+                "PROTECTION_STATUS_DEGRADED",
+                "mode=${currentSettings.protectionMode} generation=${currentSettings.protectionModeGeneration} issues=${protectionOverview.issueCount}",
+            )
+        }
+    }
+    LaunchedEffect(
+        xposedSnapshot.capturedAtMillis,
+        xposedSnapshot.stale,
+        xposedSnapshot.errorMessage,
+    ) {
+        if (!currentSettings.diagnosticsEnabled) return@LaunchedEffect
+        if (xposedSnapshot.capturedAtMillis <= 0L && xposedSnapshot.errorMessage == null) {
+            return@LaunchedEffect
+        }
+        diagnosticsRepository.append(
+            level = if (xposedSnapshot.connected) "INFO" else "WARN",
+            packageName = context.packageName,
+            event = if (xposedSnapshot.connected) {
+                "XPOSED_SCOPE_REFRESHED"
+            } else {
+                "XPOSED_SCOPE_REFRESH_FAILED"
+            },
+            message = "connected=${xposedSnapshot.connected}, stale=${xposedSnapshot.stale}, " +
+                "api=${xposedSnapshot.apiVersion}, scope=${xposedSnapshot.scopePackages.size}, " +
+                "error=${xposedSnapshot.errorMessage.orEmpty().take(160)}",
+        )
+    }
+    LaunchedEffect(protectionPresentation, currentSettings.diagnosticsEnabled) {
+        if (!currentSettings.diagnosticsEnabled) return@LaunchedEffect
+        val signature = buildString {
+            append(protectionPresentation.selectedMode)
+            append(':')
+            append(protectionPresentation.state)
+            append(':')
+            append(protectionPresentation.explicitIssuePackages.sorted().joinToString(","))
+        }
+        diagnosticsRepository.appendRateLimited(
+            level = if (
+                protectionPresentation.severity == ProtectionPresentationSeverity.REPAIR_REQUIRED
+            ) {
+                "WARN"
+            } else {
+                "INFO"
+            },
+            packageName = context.packageName,
+            event = "PROTECTION_EFFECTIVE_STATE_CHANGED",
+            stateSignature = signature,
+            message = "mode=${protectionPresentation.selectedMode}, state=${protectionPresentation.state}, " +
+                "severity=${protectionPresentation.severity}, targets=${protectionPresentation.targetCount}, " +
+                "issues=${protectionPresentation.explicitIssuePackages.size}",
+            windowMillis = 60_000L,
+        )
+    }
+    LaunchedEffect(
+        xposedSnapshot.connected,
+        xposedSnapshot.stale,
+        hookVersionByPackage,
+        currentSettings.diagnosticsEnabled,
+    ) {
+        if (!currentSettings.diagnosticsEnabled) return@LaunchedEffect
+        val source = when {
+            xposedSnapshot.connected -> "SERVICE"
+            hookVersionByPackage.values.any { it >= BuildConfig.VERSION_CODE } -> "HEARTBEAT"
+            xposedSnapshot.stale -> "STALE_SERVICE"
+            else -> "UNKNOWN"
+        }
+        diagnosticsRepository.appendRateLimited(
+            level = "INFO",
+            packageName = context.packageName,
+            event = "XPOSED_STATUS_SOURCE_CHANGED",
+            stateSignature = source,
+            message = "source=$source connected=${xposedSnapshot.connected} stale=${xposedSnapshot.stale}",
+            windowMillis = 60_000L,
+        )
     }
     LaunchedEffect(selectedSection, statsEnabled, usageAccessGranted) {
         while (
@@ -437,7 +875,7 @@ private fun TimeLimiterScreen(
     }
 
     Scaffold(
-        containerColor = Color(0xFFF7F8FC),
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
                 title = {
@@ -463,14 +901,16 @@ private fun TimeLimiterScreen(
                         )
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFFF7F8FC)),
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                ),
                 actions = {
                     TextButton(onClick = { showSettings = true }) { Text("设置") }
                 },
             )
         },
         bottomBar = {
-            NavigationBar(containerColor = Color(0xFFF1ECF8)) {
+            NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
                 MainSection.entries.forEach { section ->
                     val selected = selectedSection == section
                     NavigationBarItem(
@@ -502,8 +942,6 @@ private fun TimeLimiterScreen(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 enabledCount = enabledPackages.size,
                 todayTotalMillis = todayTotalMillis,
-                hookStates = enabledPackages.mapNotNull(hookStatusByPackage::get),
-                frameworkConnected = xposedSnapshot.connected,
                 statsEnabled = statsEnabled,
                 usageAccessGranted = usageAccessGranted,
                 onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
@@ -556,9 +994,16 @@ private fun TimeLimiterScreen(
                     AppRow(
                         app = app,
                         rule = rule,
-                        groupName = groupByPackage[app.packageName]?.name,
+                        groupName = groupByPackage[app.packageName]?.let { group ->
+                            if (group.enabled) group.name else "${group.name}（已停用）"
+                        },
                         hookState = hookStatusByPackage[app.packageName]
                             ?: ManagedAppHookState.COMPATIBILITY_PENDING,
+                        showHookIssue = HookStatusPresentationPolicy.shouldShowAppIssue(
+                            nonRootModeEnabled = nonRootModeEnabled,
+                            state = hookStatusByPackage[app.packageName]
+                                ?: ManagedAppHookState.COMPATIBILITY_PENDING,
+                        ),
                         onClick = {
                             groupByPackage[app.packageName]?.let { editingGroup = it }
                                 ?: run { editingApp = app }
@@ -621,6 +1066,7 @@ private fun TimeLimiterScreen(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 apps = apps,
                 summaries = todaySummaries,
+                todayTotalMillis = todayTotalMillis,
                 controlledPackages = enabledPackages,
                 statsEnabled = statsEnabled,
                 usageAccessGranted = usageAccessGranted,
@@ -664,7 +1110,11 @@ private fun TimeLimiterScreen(
                 rules[app.packageName] = repository.getRule(app.packageName)
                 if (
                     newlyControlled &&
-                    app.packageName !in scopeReadyPackages
+                    HookStatusPresentationPolicy.scopeReminderPackages(
+                        nonRootModeEnabled = nonRootModeEnabled,
+                        candidatePackages = setOf(app.packageName),
+                        states = hookStatusByPackage,
+                    ).isNotEmpty()
                 ) {
                     scopeReminderPackages = setOf(app.packageName)
                 }
@@ -688,7 +1138,12 @@ private fun TimeLimiterScreen(
                 }
                 if (repository.saveGroup(updated)) {
                     groups = repository.getGroups()
-                    scopeReminderPackages = newlyControlledPackages - scopeReadyPackages
+                    scopeReminderPackages =
+                        HookStatusPresentationPolicy.scopeReminderPackages(
+                            nonRootModeEnabled = nonRootModeEnabled,
+                            candidatePackages = newlyControlledPackages,
+                            states = hookStatusByPackage,
+                        )
                     editingGroup = null
                     usageRevision++
                 } else {
@@ -732,14 +1187,30 @@ private fun TimeLimiterScreen(
             initialSettings = repository.getGlobalSettings().copy(
                 launcherIconHidden = LauncherIconController.isHidden(context),
             ),
+            xposedAvailable = xposedSettingsAvailable,
             usageAccessGranted = usageAccessGranted,
-            onDismiss = { showSettings = false },
+            accessibilityEnabled = nonRootSnapshot.accessibilityEnabled,
+            accessibilityRuntimeState = nonRootSnapshot.accessibilityRuntimeState,
+            nonRootHealthSnapshot = nonRootHealthSnapshot,
+            shizukuState = shizukuState,
+            protectionPresentation = protectionPresentation,
+            xposedTargets = xposedDiagnosticStatuses,
+            xposedFrameworkConnected = xposedSnapshot.connected,
+            xposedSnapshotStale = xposedSnapshot.stale,
+            onDismiss = {
+                repository.getGlobalSettings().let {
+                    onThemeChanged(it.themeMode, it.themeColor)
+                }
+                showSettings = false
+            },
+            onThemePreviewChange = onThemeChanged,
             onDonate = {
                 showSettings = false
                 showDonation = true
             },
             onCheckUpdates = {
                 showSettings = false
+                pendingAutomaticUpdate = null
                 checkingUpdate = true
                 UpdateChecker.check(context) { result ->
                     checkingUpdate = false
@@ -769,6 +1240,76 @@ private fun TimeLimiterScreen(
                 ).show()
             },
             onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
+            onRequestAccessibility = nonRootStatusRepository::openAccessibilitySettings,
+            onRequestShizukuPermission = nonRootStatusRepository::requestShizukuPermission,
+            onOpenShizukuGuide = {
+                openUrl(context, "https://shizuku.rikka.app/guide/setup/")
+            },
+            onOpenAppSystemSettings = {
+                context.startActivity(
+                    Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:${context.packageName}"),
+                    ),
+                )
+            },
+            onRefreshProtectionStatus = {
+                xposedStatusRepository.initialize()
+                xposedStatusRepository.refresh()
+                nonRootStatusRepository.refresh()
+                usageRevision++
+                if (repository.getGlobalSettings().diagnosticsEnabled) {
+                    diagnosticsRepository.append(
+                        "INFO",
+                        context.packageName,
+                        "PROTECTION_STATUS_REFRESH_REQUESTED",
+                        "mode=${repository.getGlobalSettings().protectionMode}",
+                    )
+                }
+            },
+            onRequestScope = { packages -> scopeReminderPackages = packages },
+            onRestorePermissionPrompts = {
+                context.getSharedPreferences("ui", Context.MODE_PRIVATE).edit()
+                    .remove(NON_ROOT_REPAIR_SUPPRESSED_SIGNATURES_KEY)
+                    .remove(NON_ROOT_REPAIR_LAST_SHOWN_SIGNATURE_KEY)
+                    .remove(NON_ROOT_REPAIR_LAST_SHOWN_AT_KEY)
+                    .commit()
+                Toast.makeText(
+                    context,
+                    localizedText(context, "权限提醒已恢复", "Permission reminders restored"),
+                    Toast.LENGTH_SHORT,
+                ).show()
+                diagnosticsRepository.append(
+                    "INFO",
+                    context.packageName,
+                    "PERMISSION_REPAIR_PROMPT_ACTION",
+                    "action=restore",
+                )
+            },
+            onOpenOemCompatibilitySettings = {
+                val result = OemCompatibilityNavigator.open(context)
+                diagnosticsRepository.append(
+                    if (result.destination == OemCompatibilityDestination.FAILED) "ERROR" else "INFO",
+                    context.packageName,
+                    if (result.destination == OemCompatibilityDestination.FAILED) {
+                        "OEM_COMPATIBILITY_SETTINGS_FAILED"
+                    } else {
+                        "OEM_COMPATIBILITY_SETTINGS_OPENED"
+                    },
+                    "destination=${result.destination}, component=${result.component}, error=${result.error}",
+                )
+                if (result.destination == OemCompatibilityDestination.APP_DETAILS) {
+                    Toast.makeText(
+                        context,
+                        localizedText(
+                            context,
+                            "未找到厂商专用入口，请检查后台弹出、自启动和电池无限制",
+                            "No OEM-specific page was found. Check background pop-ups, auto-start, and unrestricted battery use.",
+                        ),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            },
             onSave = saveSettings@{ settings ->
                 val previousSettings = repository.getGlobalSettings().copy(
                     launcherIconHidden = LauncherIconController.isHidden(context),
@@ -781,6 +1322,7 @@ private fun TimeLimiterScreen(
                             hidden = settings.launcherIconHidden,
                         )
                     }.getOrElse { error ->
+                        onThemeChanged(previousSettings.themeMode, previousSettings.themeColor)
                         Toast.makeText(
                             context,
                             localizedText(
@@ -794,6 +1336,7 @@ private fun TimeLimiterScreen(
                     }
                 }
                 if (!repository.saveGlobalSettings(settings)) {
+                    onThemeChanged(previousSettings.themeMode, previousSettings.themeColor)
                     if (iconResult != null) {
                         runCatching {
                             LauncherIconController.setHidden(
@@ -813,16 +1356,50 @@ private fun TimeLimiterScreen(
                     ).show()
                     return@saveSettings
                 }
+                val savedSettings = repository.getGlobalSettings()
+                if (savedSettings.protectionMode != previousSettings.protectionMode) {
+                    if (savedSettings.diagnosticsEnabled) {
+                        diagnosticsRepository.append(
+                            "INFO",
+                            context.packageName,
+                            "PROTECTION_MODE_TRANSITION_STARTED",
+                            "from=${previousSettings.protectionMode} to=${savedSettings.protectionMode} generation=${savedSettings.protectionModeGeneration}",
+                        )
+                    }
+                    TimeStopAccessibilityService.notifyProtectionModeChanged(
+                        savedSettings.protectionMode,
+                        savedSettings.protectionModeGeneration,
+                    )
+                    if (savedSettings.diagnosticsEnabled) {
+                        diagnosticsRepository.append(
+                            "INFO",
+                            context.packageName,
+                            "PROTECTION_MODE_TRANSITION_COMPLETED",
+                            "mode=${savedSettings.protectionMode} generation=${savedSettings.protectionModeGeneration} source=settings",
+                        )
+                    }
+                    Toast.makeText(
+                        context,
+                        localizedText(
+                            context,
+                            "保护模式已切换；下一次打开目标应用时由新模式接管",
+                            "Protection mode changed. The new mode will take over the next time a target app is opened.",
+                        ),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
                 if (settings.diagnosticsEnabled) {
                     diagnosticsRepository.append(
                         "INFO",
                         context.packageName,
                         "SETTINGS_SAVED",
-                        "warning=${settings.exitWarningEnabled}, fullScreen=${settings.fullScreenExitWarningEnabled}, vibration=${settings.exitWarningVibrationEnabled}, language=${settings.languageMode}, extension=${settings.extensionSeconds}s, enforcement=${settings.limitEnforcementMode}, diagnostics=${settings.diagnosticsEnabled}, iconHidden=${settings.launcherIconHidden}, usageStats=${settings.usageStatsEnabled}",
+                        "warning=${settings.exitWarningEnabled}, fullScreen=${settings.fullScreenExitWarningEnabled}, vibration=${settings.exitWarningVibrationEnabled}, language=${settings.languageMode}, theme=${settings.themeMode}/${settings.themeColor}, quotes=${settings.timeQuotesEnabled}/${settings.builtInTimeQuotesEnabled}/${settings.customTimeQuotes.size}, autoUpdate=${settings.automaticUpdateCheckEnabled}, protectionMode=${savedSettings.protectionMode}, protectionModeGeneration=${savedSettings.protectionModeGeneration}, nonRootCompatibility=${settings.nonRootCompatibilityMode}, extension=${settings.extensionSeconds}s, enforcement=${settings.limitEnforcementMode}, diagnostics=${settings.diagnosticsEnabled}, iconHidden=${settings.launcherIconHidden}, usageStats=${settings.usageStatsEnabled}",
                     )
                 }
                 usageRevision++
+                nonRootStatusRepository.refresh()
                 showSettings = false
+                onThemeChanged(settings.themeMode, settings.themeColor)
                 if (settings.languageMode != previousSettings.languageMode) {
                     val manualRecreate = AppLocaleController.apply(context, settings.languageMode)
                     if (manualRecreate) (context as? Activity)?.recreate()
@@ -962,7 +1539,7 @@ private fun TimeLimiterScreen(
                         if (requestablePackages.isNotEmpty()) {
                             "检测到这些应用尚未加入时停的 LSPosed 作用域。可以向框架申请加入，确认后请强制停止并重新打开目标应用。"
                         } else {
-                            "当前框架无法直接确认这些应用的作用域，或 Hook 版本仍待验证。请在 LSPosed 中检查作用域，再强制停止并重新打开目标应用。"
+                            "当前框架连接已变化，暂时无法申请作用域。请稍后重试或在 LSPosed 中手动检查。"
                         },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -981,6 +1558,14 @@ private fun TimeLimiterScreen(
                                     errorMessage,
                                 ->
                                 scopeRequestInProgress = false
+                                if (repository.getGlobalSettings().diagnosticsEnabled) {
+                                    diagnosticsRepository.append(
+                                        if (errorMessage == null) "INFO" else "WARN",
+                                        context.packageName,
+                                        "PROTECTION_REPAIR_SCOPE_RESULT",
+                                        "requested=${requestablePackages.size} approved=${approved.size} error=${errorMessage.orEmpty().take(160)}",
+                                    )
+                                }
                                 if (errorMessage != null) {
                                     Toast.makeText(
                                         context,
@@ -1043,26 +1628,201 @@ private fun TimeLimiterScreen(
                     context.getSharedPreferences("ui", Context.MODE_PRIVATE)
                         .edit()
                         .putBoolean(FEATURE_INTRO_DISABLED_KEY, true)
-                        .apply()
+                        .commit()
                 }
                 showFeatureIntro = false
             },
         )
-    } else if (showBetaInvite) {
+    } else if (showBetaInvite && !showNonRootRepairPrompt && !showSetupGuide) {
         BetaInviteDialog(
-            onClose = { doNotShowAgain, joinGroup ->
-                if (doNotShowAgain) {
-                    context.getSharedPreferences("ui", Context.MODE_PRIVATE)
-                        .edit()
-                        .putBoolean(BETA_INVITE_DISABLED_KEY, true)
-                        .apply()
-                }
+            onClose = { joinGroup ->
+                context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+                    .edit()
+                    .putInt(BETA_INVITE_LAST_VERSION_KEY, BuildConfig.VERSION_CODE)
+                    .commit()
                 showBetaInvite = false
                 if (joinGroup) openQqGroup(context)
             },
         )
+    } else if (showNonRootRepairPrompt) {
+        val primaryIssue = NonRootPermissionPolicy.primaryIssue(nonRootPermissionIssues)
+        val basicProtectionAvailable =
+            NonRootPermissionPolicy.basicProtectionAvailable(nonRootPermissionIssues)
+        AlertDialog(
+            onDismissRequest = {
+                if (suppressCurrentPermissionIssue && currentPermissionPromptSignature.isNotBlank()) {
+                    val uiPrefs = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+                    uiPrefs.edit().putStringSet(
+                        NON_ROOT_REPAIR_SUPPRESSED_SIGNATURES_KEY,
+                        PermissionRepairPromptPolicy.addSuppressed(
+                            uiPrefs.getStringSet(
+                                NON_ROOT_REPAIR_SUPPRESSED_SIGNATURES_KEY,
+                                emptySet(),
+                            ).orEmpty(),
+                            currentPermissionPromptSignature,
+                        ),
+                    ).commit()
+                }
+                showNonRootRepairPrompt = false
+            },
+            title = { Text("保护权限需要处理") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (
+                        NonRootPermissionIssue.ACCESSIBILITY_DISABLED in
+                        nonRootPermissionIssues
+                    ) {
+                        Text("• 时停无障碍服务尚未启用")
+                    }
+                    if (
+                        NonRootPermissionIssue.ACCESSIBILITY_DISCONNECTED in
+                        nonRootPermissionIssues
+                    ) {
+                        Text("• 无障碍已开启，但服务尚未连接")
+                    }
+                    if (
+                        NonRootPermissionIssue.USAGE_ACCESS_MISSING in
+                        nonRootPermissionIssues
+                    ) {
+                        Text("• 使用情况访问权限尚未授予")
+                    }
+                    if (
+                        NonRootPermissionIssue.SHIZUKU_PERMISSION_REQUIRED in
+                        nonRootPermissionIssues
+                    ) {
+                        Text("• Shizuku 尚未授权，强制退出不可用")
+                    }
+                    if (
+                        NonRootPermissionIssue.SHIZUKU_UNAVAILABLE in
+                        nonRootPermissionIssues
+                    ) {
+                        Text("• Shizuku 未安装或服务尚未运行")
+                    }
+                    if (
+                        NonRootPermissionIssue.SHIZUKU_FAILED in
+                        nonRootPermissionIssues
+                    ) {
+                        Text("• Shizuku 连接失败")
+                    }
+                    Text(
+                        if (basicProtectionAvailable) {
+                            "普通保护仍会使用独立限制页，但在问题解决前不能通过 Shizuku 强制退出。"
+                        } else {
+                            "必要权限缺失时，普通保护不会生效。请完成授权后重新打开目标应用。"
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth().clickable {
+                            suppressCurrentPermissionIssue = !suppressCurrentPermissionIssue
+                        },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(
+                            checked = suppressCurrentPermissionIssue,
+                            onCheckedChange = { suppressCurrentPermissionIssue = it },
+                        )
+                        Text("不再显示此类问题")
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (
+                            suppressCurrentPermissionIssue &&
+                            currentPermissionPromptSignature.isNotBlank()
+                        ) {
+                            val uiPrefs = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+                            uiPrefs.edit().putStringSet(
+                                NON_ROOT_REPAIR_SUPPRESSED_SIGNATURES_KEY,
+                                PermissionRepairPromptPolicy.addSuppressed(
+                                    uiPrefs.getStringSet(
+                                        NON_ROOT_REPAIR_SUPPRESSED_SIGNATURES_KEY,
+                                        emptySet(),
+                                    ).orEmpty(),
+                                    currentPermissionPromptSignature,
+                                ),
+                            ).commit()
+                        }
+                        if (currentSettings.diagnosticsEnabled) {
+                            diagnosticsRepository.append(
+                                "INFO",
+                                context.packageName,
+                                "PERMISSION_REPAIR_PROMPT_ACTION",
+                                "action=repair issue=$primaryIssue suppressed=$suppressCurrentPermissionIssue",
+                            )
+                        }
+                        showNonRootRepairPrompt = false
+                        when (primaryIssue) {
+                            NonRootPermissionIssue.ACCESSIBILITY_DISABLED ->
+                                nonRootStatusRepository.openAccessibilitySettings()
+                            NonRootPermissionIssue.ACCESSIBILITY_DISCONNECTED ->
+                                nonRootStatusRepository.openAccessibilitySettings()
+                            NonRootPermissionIssue.USAGE_ACCESS_MISSING ->
+                                deviceUsageStatsRepository.openUsageAccessSettings()
+                            NonRootPermissionIssue.SHIZUKU_PERMISSION_REQUIRED ->
+                                nonRootStatusRepository.requestShizukuPermission()
+                            NonRootPermissionIssue.SHIZUKU_UNAVAILABLE,
+                            NonRootPermissionIssue.SHIZUKU_FAILED,
+                            -> openUrl(context, "https://shizuku.rikka.app/guide/setup/")
+                            null -> Unit
+                        }
+                    },
+                ) {
+                    Text(
+                        when (primaryIssue) {
+                            NonRootPermissionIssue.ACCESSIBILITY_DISABLED ->
+                                "启用无障碍"
+                            NonRootPermissionIssue.ACCESSIBILITY_DISCONNECTED ->
+                                "检查无障碍连接"
+                            NonRootPermissionIssue.USAGE_ACCESS_MISSING ->
+                                "授予使用情况访问"
+                            NonRootPermissionIssue.SHIZUKU_PERMISSION_REQUIRED ->
+                                "请求 Shizuku 授权"
+                            NonRootPermissionIssue.SHIZUKU_UNAVAILABLE,
+                            NonRootPermissionIssue.SHIZUKU_FAILED,
+                            -> "查看 Shizuku 设置指南"
+                            null -> "我知道了"
+                        },
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    if (
+                        suppressCurrentPermissionIssue &&
+                        currentPermissionPromptSignature.isNotBlank()
+                    ) {
+                        val uiPrefs = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+                        uiPrefs.edit().putStringSet(
+                            NON_ROOT_REPAIR_SUPPRESSED_SIGNATURES_KEY,
+                            PermissionRepairPromptPolicy.addSuppressed(
+                                uiPrefs.getStringSet(
+                                    NON_ROOT_REPAIR_SUPPRESSED_SIGNATURES_KEY,
+                                    emptySet(),
+                                ).orEmpty(),
+                                currentPermissionPromptSignature,
+                            ),
+                        ).commit()
+                    }
+                    if (currentSettings.diagnosticsEnabled) {
+                        diagnosticsRepository.append(
+                            "INFO",
+                            context.packageName,
+                            "PERMISSION_REPAIR_PROMPT_ACTION",
+                            "action=later suppressed=$suppressCurrentPermissionIssue",
+                        )
+                    }
+                    showNonRootRepairPrompt = false
+                }) {
+                    Text("稍后处理")
+                }
+            },
+        )
     } else if (showSetupGuide) {
         SetupGuideDialog(
+            nonRootModeEnabled = nonRootModeEnabled,
             onDismiss = {
                 showSetupGuide = false
             },
@@ -1070,15 +1830,12 @@ private fun TimeLimiterScreen(
     } else if (showDonationPrompt) {
         DonationPromptDialog(
             onSupport = {
+                acknowledgeDonationPrompt(context)
                 showDonationPrompt = false
                 showDonation = true
             },
-            onLater = { showDonationPrompt = false },
-            onNeverShowAgain = {
-                context.getSharedPreferences("ui", Context.MODE_PRIVATE)
-                    .edit()
-                    .putBoolean(DONATION_PROMPT_DISABLED_KEY, true)
-                    .apply()
+            onLater = {
+                acknowledgeDonationPrompt(context)
                 showDonationPrompt = false
             },
         )
@@ -1097,8 +1854,6 @@ private fun HomeDashboard(
     modifier: Modifier,
     enabledCount: Int,
     todayTotalMillis: Long,
-    hookStates: List<ManagedAppHookState>,
-    frameworkConnected: Boolean,
     statsEnabled: Boolean,
     usageAccessGranted: Boolean,
     onRequestUsageAccess: () -> Unit,
@@ -1107,88 +1862,11 @@ private fun HomeDashboard(
     onOpenGuide: () -> Unit,
     onOpenLogs: () -> Unit,
 ) {
-    val readyCount = hookStates.count(XposedStatusPolicy::isScopeReady)
-        .coerceAtMost(enabledCount)
-    val pendingCount = (enabledCount - readyCount).coerceAtLeast(0)
-    val missingScopeCount = hookStates.count { it == ManagedAppHookState.NOT_IN_SCOPE }
-    val abnormalCount = hookStates.count {
-        it == ManagedAppHookState.RUNNING_STALE ||
-            it == ManagedAppHookState.RUNNING_FAILED
-    }
-    val runningCount = hookStates.count { it == ManagedAppHookState.RUNNING_CURRENT }
-    val allReady = enabledCount > 0 && pendingCount == 0
-    val statusTitle = when {
-        enabledCount == 0 -> "未启用管控"
-        missingScopeCount > 0 -> "$missingScopeCount 个应用未加入作用域"
-        abnormalCount > 0 -> "Hook 状态异常"
-        runningCount > 0 -> "Hook 正在运行"
-        allReady && frameworkConnected -> "作用域已配置"
-        allReady -> "Hook 已验证"
-        readyCount > 0 -> "已就绪 $readyCount / $enabledCount 个应用"
-        frameworkConnected -> "等待目标应用启动"
-        else -> "兼容模式，等待 Hook 验证"
-    }
-    val statusDescription = when {
-        enabledCount == 0 -> "请先选择需要管控的应用"
-        missingScopeCount > 0 -> "请将缺失的应用加入时停作用域"
-        abnormalCount > 0 -> "请强制停止目标应用并重新打开，以加载当前模块版本"
-        runningCount > 0 -> "$runningCount 个目标应用进程已回传当前 Hook 状态"
-        allReady && frameworkConnected -> "$enabledCount 个管控应用均已加入作用域"
-        allReady -> "$enabledCount 个管控应用均已回传当前版本 Hook 记录"
-        frameworkConnected -> "仍有 $pendingCount 个应用启动后才能完成 Hook 验证"
-        else -> "当前框架不支持直接读取作用域，将在目标应用启动后验证"
-    }
-    val healthy = allReady
-    val warning = enabledCount > 0 && !allReady
     LazyColumn(
         modifier = modifier,
         contentPadding = androidx.compose.foundation.layout.PaddingValues(20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth().clickable {
-                    if (enabledCount == 0) onManageApps() else onOpenGuide()
-                },
-                colors = CardDefaults.cardColors(
-                    containerColor = when {
-                        healthy -> Color(0xFFE0F4E8)
-                        warning -> Color(0xFFFFE9C7)
-                        else -> Color(0xFFE9DDFB)
-                    },
-                ),
-                shape = RoundedCornerShape(28.dp),
-            ) {
-                Column(
-                    modifier = Modifier.padding(28.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Surface(
-                        color = when {
-                            healthy -> Color(0xFF19734A)
-                            warning -> Color(0xFFB54708)
-                            else -> Color(0xFF351078)
-                        },
-                        shape = CircleShape,
-                    ) {
-                        Text(
-                            if (healthy) "✓" else if (warning) "!" else "◆",
-                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
-                            color = Color.White,
-                            style = MaterialTheme.typography.headlineMedium,
-                            fontWeight = FontWeight.Bold,
-                        )
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    Text(statusTitle, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                    Text(
-                        statusDescription,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-        }
         if (statsEnabled && !usageAccessGranted) {
             item {
                 UsageAccessCard(onRequestUsageAccess)
@@ -1202,7 +1880,7 @@ private fun HomeDashboard(
                 DashboardMetricCard(
                     modifier = Modifier.weight(1f),
                     symbol = "◷",
-                    symbolColor = Color(0xFFF59E0B),
+                    symbolColor = MaterialTheme.colorScheme.tertiary,
                     value = formatDashboardDuration(todayTotalMillis),
                     label = "今日总使用",
                     onClick = onOpenStats,
@@ -1210,7 +1888,7 @@ private fun HomeDashboard(
                 DashboardMetricCard(
                     modifier = Modifier.weight(1f),
                     symbol = "▦",
-                    symbolColor = Color(0xFF3FA34D),
+                    symbolColor = MaterialTheme.colorScheme.primary,
                     value = "$enabledCount 个",
                     label = "管控应用数",
                     onClick = onManageApps,
@@ -1245,10 +1923,58 @@ private fun HomeDashboard(
     }
 }
 
+private fun protectionPresentationTitle(
+    context: Context,
+    presentation: ProtectionPresentationSnapshot,
+): String = when (presentation.state) {
+    ProtectionPresentationState.NO_TARGETS -> localizedText(context, "尚未配置管控应用", "No managed apps configured")
+    ProtectionPresentationState.XPOSED_SCOPE_READY -> localizedText(context, "LSPosed 作用域已就绪", "LSPosed scope is ready")
+    ProtectionPresentationState.XPOSED_HOOK_VERIFIED -> localizedText(context, "LSPosed Hook 已验证", "LSPosed Hook verified")
+    ProtectionPresentationState.XPOSED_WAITING_VERIFICATION -> localizedText(context, "LSPosed 模式已选择", "LSPosed mode selected")
+    ProtectionPresentationState.XPOSED_REPAIR_REQUIRED -> localizedText(context, "LSPosed 配置需要处理", "LSPosed configuration needs attention")
+    ProtectionPresentationState.ACCESSIBILITY_RUNNING -> localizedText(context, "普通保护运行中", "Basic protection is running")
+    ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_RUNNING -> localizedText(context, "普通保护 + Shizuku 强停增强", "Basic protection + Shizuku force-stop")
+    ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_FALLBACK -> localizedText(context, "普通保护运行中", "Basic protection is running")
+    ProtectionPresentationState.ACCESSIBILITY_NOT_READY -> localizedText(context, "普通保护尚未就绪", "Basic protection is not ready")
+}
+
+private fun protectionPresentationDetail(
+    context: Context,
+    presentation: ProtectionPresentationSnapshot,
+    frameworkConnected: Boolean,
+    snapshotStale: Boolean,
+): String = when (presentation.state) {
+    ProtectionPresentationState.NO_TARGETS -> localizedText(context, "保存规则后，这里会显示真实执行链路。", "The actual controller appears here after a rule is saved.")
+    ProtectionPresentationState.XPOSED_SCOPE_READY -> localizedText(context, "目标应用已加入作用域；无需先启动应用，打开后规则会生效。", "Targets are in scope and rules apply when opened.")
+    ProtectionPresentationState.XPOSED_HOOK_VERIFIED -> localizedText(context, "当前版本 Hook 已验证，普通保护不会重复接管。", "The current Hook is verified; basic protection will not take over.")
+    ProtectionPresentationState.XPOSED_WAITING_VERIFICATION -> localizedText(
+        context,
+        when {
+            snapshotStale -> "LSPosed 快照已过期，暂时无法直读；不会误报未加入作用域。"
+            !frameworkConnected -> "当前无法直读作用域；打开管控应用后可通过 Hook 心跳验证。"
+            else -> "等待作用域或 Hook 证据，当前状态未知，不代表未生效。"
+        },
+        when {
+            snapshotStale -> "The LSPosed snapshot is stale; scope is not reported missing."
+            !frameworkConnected -> "Scope cannot be read directly. Open a target app to verify via Hook heartbeat."
+            else -> "Waiting for scope or Hook evidence. This is unknown, not inactive."
+        },
+    )
+    ProtectionPresentationState.XPOSED_REPAIR_REQUIRED -> localizedText(context, "仅列出明确缺少作用域、旧版 Hook 或加载失败的应用。", "Only confirmed scope omissions, outdated Hooks, or load failures are listed.")
+    ProtectionPresentationState.ACCESSIBILITY_RUNNING -> localizedText(context, "无障碍识别前台，使用情况访问校准计时，到限使用独立限制页。", "Accessibility detects foreground apps, Usage Access calibrates timing, and limits use the standalone page.")
+    ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_RUNNING -> localizedText(context, "普通保护负责计时，Shizuku 已就绪并优先执行强停。", "Basic protection tracks time and Shizuku is ready to force-stop.")
+    ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_FALLBACK -> localizedText(context, "Shizuku 未就绪，基础计时仍生效；到限后回退独立限制页。", "Shizuku is not ready. Basic timing works and limits fall back to the standalone page.")
+    ProtectionPresentationState.ACCESSIBILITY_NOT_READY -> localizedText(context, "请完成无障碍连接和使用情况访问授权。", "Connect accessibility and grant Usage Access.")
+}
+
 @Composable
 private fun UsageAccessCard(onRequestUsageAccess: () -> Unit) {
+    val healthColors = LocalTimeStopExtendedColors.current
     Card(
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE9C7)),
+        colors = CardDefaults.cardColors(
+            containerColor = healthColors.warningContainer,
+            contentColor = healthColors.onWarningContainer,
+        ),
         shape = RoundedCornerShape(18.dp),
     ) {
         Column(
@@ -1257,7 +1983,7 @@ private fun UsageAccessCard(onRequestUsageAccess: () -> Unit) {
         ) {
             Text("需要使用情况访问权限", fontWeight = FontWeight.Bold)
             Text(
-                "授权后由 Android 系统提供今日使用时长，仅在打开时停时读取，不需要后台服务。",
+                "授权后由 Android 系统提供今日使用时长；统计页按需读取，普通保护仅在前台切换或额度校验时读取，不需要前台常驻服务。",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -1277,7 +2003,9 @@ private fun DashboardMetricCard(
 ) {
     Card(
         modifier = modifier.clickable(onClick = onClick),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFE9E7EC)),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        ),
         shape = RoundedCornerShape(24.dp),
     ) {
         Column(
@@ -1300,7 +2028,7 @@ private fun DashboardActionCard(
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
-        color = Color(0xFFE9E7EC),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
         shape = RoundedCornerShape(22.dp),
     ) {
         Row(
@@ -1308,7 +2036,11 @@ private fun DashboardActionCard(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(18.dp),
         ) {
-            Text(symbol, color = Color(0xFF6548B5), style = MaterialTheme.typography.headlineMedium)
+            Text(
+                symbol,
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.headlineMedium,
+            )
             Column {
                 Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Text(
@@ -1326,12 +2058,14 @@ private fun UsageStatisticsScreen(
     modifier: Modifier,
     apps: List<InstalledApp>,
     summaries: List<AppUsageSummary>,
+    todayTotalMillis: Long,
     controlledPackages: Set<String>,
     statsEnabled: Boolean,
     usageAccessGranted: Boolean,
     onRequestUsageAccess: () -> Unit,
     onClear: () -> Unit,
 ) {
+    val healthColors = LocalTimeStopExtendedColors.current
     val appByPackage = remember(apps) { apps.associateBy(InstalledApp::packageName) }
     val sorted = summaries.sortedWith(
         compareByDescending<AppUsageSummary> { it.packageName in controlledPackages }
@@ -1345,7 +2079,12 @@ private fun UsageStatisticsScreen(
     ) {
         if (!statsEnabled) {
             item {
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE9C7))) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = healthColors.warningContainer,
+                        contentColor = healthColors.onWarningContainer,
+                    ),
+                ) {
                     Text(
                         "使用统计展示已关闭；应用分组仍会保留共享额度所需的内部时长。",
                         modifier = Modifier.padding(16.dp),
@@ -1366,12 +2105,16 @@ private fun UsageStatisticsScreen(
                 Column {
                     Text("今日总使用", style = MaterialTheme.typography.bodyMedium)
                     Text(
-                        formatDashboardDuration(sorted.sumOf(AppUsageSummary::durationMillis)),
+                        formatDashboardDuration(todayTotalMillis),
                         style = MaterialTheme.typography.headlineMedium,
                         fontWeight = FontWeight.Bold,
                     )
                     Text(
-                        if (usageAccessGranted) "Android 系统按需读取 · 无后台服务" else "授权后显示系统使用时长",
+                        if (usageAccessGranted) {
+                            "Android 系统前台区间去重 · 无后台服务"
+                        } else {
+                            "授权后显示系统使用时长"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1385,14 +2128,12 @@ private fun UsageStatisticsScreen(
             items(sorted, key = AppUsageSummary::packageName) { summary ->
                 val app = appByPackage[summary.packageName]
                 val controlled = summary.packageName in controlledPackages
-                val staleHookReport = controlled &&
-                    HookCounterSyncPolicy.shouldShowReloadWarning(
-                        lastHookEventAtMillis = summary.lastHookEventAtMillis,
-                        hookVersionCode = summary.hookVersionCode,
-                        currentVersionCode = BuildConfig.VERSION_CODE,
-                    )
                 Surface(
-                    color = if (controlled) Color(0xFFF2F6FF) else Color.White,
+                    color = if (controlled) {
+                        healthColors.managedContainer
+                    } else {
+                        MaterialTheme.colorScheme.surface
+                    },
                     shape = RoundedCornerShape(18.dp),
                     tonalElevation = 1.dp,
                 ) {
@@ -1429,13 +2170,6 @@ private fun UsageStatisticsScreen(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            if (staleHookReport) {
-                                Text(
-                                    "Hook 计数来自旧版本，请强停并重新打开应用",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = Color(0xFFB54708),
-                                )
-                            }
                         }
                         Text(formatDashboardDuration(summary.durationMillis), fontWeight = FontWeight.Bold)
                     }
@@ -1454,6 +2188,14 @@ private fun formatDashboardDuration(durationMillis: Long): String {
     }
 }
 
+private fun elapsedTodayMillis(nowMillis: Long = System.currentTimeMillis()): Long {
+    val startOfDayMillis = LocalDate.now()
+        .atStartOfDay(ZoneId.systemDefault())
+        .toInstant()
+        .toEpochMilli()
+    return (nowMillis - startOfDayMillis).coerceAtLeast(0L)
+}
+
 private const val STATS_REFRESH_INTERVAL_MS = 15_000L
 
 @Composable
@@ -1461,16 +2203,24 @@ private fun SetupCard(
     onOpenGuide: () -> Unit,
     onOpenLogs: () -> Unit,
 ) {
+    val healthColors = LocalTimeStopExtendedColors.current
     Card(
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F0FF)),
+        colors = CardDefaults.cardColors(
+            containerColor = healthColors.infoContainer,
+            contentColor = healthColors.onInfoContainer,
+        ),
         shape = RoundedCornerShape(20.dp),
     ) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("需要 LSPosed", fontWeight = FontWeight.Bold, color = Color(0xFF154B99))
+            Text(
+                "需要 LSPosed",
+                fontWeight = FontWeight.Bold,
+                color = healthColors.onInfoContainer,
+            )
             Text(
                 "保存规则后，请在 LSPosed 中启用本模块并勾选目标应用。首次启用或修改作用域后，需要强制停止目标应用再打开。",
                 style = MaterialTheme.typography.bodyMedium,
-                color = Color(0xFF294D7A),
+                color = healthColors.onInfoContainer.copy(alpha = 0.82f),
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = onOpenGuide) { Text("配置要求") }
@@ -1490,19 +2240,28 @@ private fun GroupManagementScreen(
     onEdit: (AppGroup) -> Unit,
 ) {
     val appByPackage = remember(apps) { apps.associateBy(InstalledApp::packageName) }
+    val healthColors = LocalTimeStopExtendedColors.current
     LazyColumn(
         modifier = modifier,
         contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item {
-            Surface(color = Color(0xFFE8F0FF), shape = RoundedCornerShape(20.dp)) {
+            Surface(
+                color = healthColors.infoContainer,
+                contentColor = healthColors.onInfoContainer,
+                shape = RoundedCornerShape(20.dp),
+            ) {
                 Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("分组额度与规则", fontWeight = FontWeight.Bold, color = Color(0xFF154B99))
+                    Text(
+                        "分组额度与规则",
+                        fontWeight = FontWeight.Bold,
+                        color = healthColors.onInfoContainer,
+                    )
                     Text(
                         "可统一设置共享每日额度、单次打开、可用时段和共享冷却；加入后个人规则暂停，移出后恢复。",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color(0xFF294D7A),
+                        color = healthColors.onInfoContainer.copy(alpha = 0.82f),
                     )
                     Button(onClick = onAdd) { Text("新建分组") }
                 }
@@ -1534,7 +2293,11 @@ private fun GroupManagementScreen(
             }
             Surface(
                 modifier = Modifier.fillMaxWidth().clickable { onEdit(group) },
-                color = if (group.enabled) Color(0xFFF2F6FF) else Color.White,
+                color = if (group.enabled) {
+                    healthColors.managedContainer
+                } else {
+                    MaterialTheme.colorScheme.surface
+                },
                 shape = RoundedCornerShape(20.dp),
                 tonalElevation = 1.dp,
             ) {
@@ -1550,7 +2313,9 @@ private fun GroupManagementScreen(
                     if (group.dailyEnabled) {
                         Text(
                             "共享每日：已用 ${formatDashboardDuration(usedMillis)} / ${formatDashboardDuration(limitMillis)} · 剩余 ${formatDashboardDuration(remainingMillis)}",
-                            color = if (remainingMillis == 0L && group.enabled) Color(0xFFB42318)
+                            color = if (remainingMillis == 0L && group.enabled) {
+                                MaterialTheme.colorScheme.error
+                            }
                             else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -1882,13 +2647,19 @@ private fun AppRow(
     rule: AppRule,
     groupName: String?,
     hookState: ManagedAppHookState,
+    showHookIssue: Boolean,
     onClick: () -> Unit,
     onToggle: (Boolean) -> Unit,
 ) {
     val controlled = rule.enabled || rule.sessionPlanningEnabled || groupName != null
+    val healthColors = LocalTimeStopExtendedColors.current
     Surface(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
-        color = if (controlled) Color(0xFFF2F6FF) else Color.White,
+        color = if (controlled) {
+            healthColors.managedContainer
+        } else {
+            MaterialTheme.colorScheme.surface
+        },
         shape = RoundedCornerShape(18.dp),
         tonalElevation = 1.dp,
     ) {
@@ -1900,7 +2671,11 @@ private fun AppRow(
             Surface(
                 modifier = Modifier.size(44.dp),
                 shape = CircleShape,
-                color = if (controlled) Color(0xFF315EA8) else Color(0xFFE6E8EE),
+                color = if (controlled) {
+                    MaterialTheme.colorScheme.primaryContainer
+                } else {
+                    MaterialTheme.colorScheme.surfaceVariant
+                },
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     AppIcon(app = app)
@@ -1926,7 +2701,7 @@ private fun AppRow(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    if (controlled) HookStatusBadge(hookState)
+                    if (controlled && showHookIssue) HookStatusBadge(hookState)
                     Text(
                         if (controlled) {
                             listOfNotNull(
@@ -1957,30 +2732,31 @@ private fun AppRow(
 
 @Composable
 private fun HookStatusBadge(state: ManagedAppHookState) {
+    val healthColors = LocalTimeStopExtendedColors.current
     val label = when (state) {
         ManagedAppHookState.NOT_IN_SCOPE -> "未加入作用域"
         ManagedAppHookState.IN_SCOPE_IDLE -> "已在作用域"
-        ManagedAppHookState.RUNNING_CURRENT -> "Hook 运行中"
-        ManagedAppHookState.RUNNING_STALE -> "Hook 待重载"
-        ManagedAppHookState.RUNNING_FAILED -> "Hook 异常"
-        ManagedAppHookState.LEGACY_VERIFIED -> "Hook 已验证"
-        ManagedAppHookState.COMPATIBILITY_PENDING -> "待 Hook 验证"
+        ManagedAppHookState.RUNNING_CURRENT -> "运行中"
+        ManagedAppHookState.RUNNING_STALE -> "需要重启"
+        ManagedAppHookState.RUNNING_FAILED -> "运行异常"
+        ManagedAppHookState.LEGACY_VERIFIED -> "运行中"
+        ManagedAppHookState.COMPATIBILITY_PENDING -> "等待验证"
     }
-    val background = when (state) {
+    val badgeColors = when (state) {
         ManagedAppHookState.RUNNING_CURRENT,
         ManagedAppHookState.LEGACY_VERIFIED,
-        -> Color(0xFF237A45)
-        ManagedAppHookState.IN_SCOPE_IDLE -> Color(0xFF315EA8)
+        -> healthColors.success to healthColors.onSuccess
+        ManagedAppHookState.IN_SCOPE_IDLE -> healthColors.info to healthColors.onInfo
         ManagedAppHookState.NOT_IN_SCOPE,
         ManagedAppHookState.COMPATIBILITY_PENDING,
-        -> Color(0xFFB54708)
+        -> healthColors.warning to healthColors.onWarning
         ManagedAppHookState.RUNNING_STALE,
         ManagedAppHookState.RUNNING_FAILED,
-        -> Color(0xFFB42318)
+        -> MaterialTheme.colorScheme.error to MaterialTheme.colorScheme.onError
     }
     Surface(
-        color = background,
-        contentColor = Color.White,
+        color = badgeColors.first,
+        contentColor = badgeColors.second,
         shape = RoundedCornerShape(999.dp),
     ) {
         Text(
@@ -1995,8 +2771,8 @@ private fun HookStatusBadge(state: ManagedAppHookState) {
 @Composable
 private fun ManagedBadge(label: String = "管控中") {
     Surface(
-        color = Color(0xFF315EA8),
-        contentColor = Color.White,
+        color = MaterialTheme.colorScheme.primary,
+        contentColor = MaterialTheme.colorScheme.onPrimary,
         shape = RoundedCornerShape(999.dp),
     ) {
         Text(
@@ -2057,7 +2833,7 @@ private fun FeatureIntroDialog(onClose: (doNotShowAgain: Boolean) -> Unit) {
                 eyebrow = "精细管控",
                 title = "把使用边界设清楚",
                 description = "每日累计、单次打开、可用时段和退出后冷却可以独立开启，也可以组合生效。",
-                highlights = listOf("任一规则先到即执行退出", "管理应用被清理后规则仍由 Hook 执行"),
+                highlights = listOf("任一规则先到即执行退出", "管理应用被清理后规则仍可继续执行"),
             ),
             FeatureIntroPage(
                 eyebrow = "本次计划",
@@ -2073,9 +2849,12 @@ private fun FeatureIntroDialog(onClose: (doNotShowAgain: Boolean) -> Unit) {
             ),
             FeatureIntroPage(
                 eyebrow = "开始之前",
-                title = "确认 LSPosed 作用域",
-                description = "启用时停模块后，需要把每个受管控应用加入模块作用域，并强制停止后重新打开。",
-                highlights = listOf("统计页按需读取系统使用时长", "诊断日志可检查 HOOK_READY 与限制事件"),
+                title = "选择适合你的保护方式",
+                description = "有 LSPosed 时可加入模块作用域获得更稳定的进程内管控；未 Root 设备也可启用普通保护。",
+                highlights = listOf(
+                    "普通保护需要无障碍服务与使用情况访问",
+                    "Shizuku 可选增强只负责到限强停",
+                ),
             ),
         )
     }
@@ -2210,13 +2989,12 @@ private fun FeatureIntroDialog(onClose: (doNotShowAgain: Boolean) -> Unit) {
 
 @Composable
 private fun BetaInviteDialog(
-    onClose: (doNotShowAgain: Boolean, joinGroup: Boolean) -> Unit,
+    onClose: (joinGroup: Boolean) -> Unit,
 ) {
     val context = LocalContext.current
-    var doNotShowAgain by rememberSaveable { mutableStateOf(false) }
 
     AlertDialog(
-        onDismissRequest = { onClose(doNotShowAgain, false) },
+        onDismissRequest = { onClose(false) },
         title = {
             Text(
                 localizedText(
@@ -2265,28 +3043,19 @@ private fun BetaInviteDialog(
                         )
                     }
                 }
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { doNotShowAgain = !doNotShowAgain },
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Checkbox(
-                        checked = doNotShowAgain,
-                        onCheckedChange = { doNotShowAgain = it },
-                    )
-                    Text(
-                        localizedText(
-                            context,
-                            "不再提示",
-                            "Do not show again",
-                        ),
-                    )
-                }
+                Text(
+                    localizedText(
+                        context,
+                        "本版本仅提示一次，下次更新后会再次展示。",
+                        "Shown once for this version and again after the next update.",
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         },
         confirmButton = {
-            Button(onClick = { onClose(doNotShowAgain, true) }) {
+            Button(onClick = { onClose(true) }) {
                 Text(
                     localizedText(
                         context,
@@ -2297,7 +3066,7 @@ private fun BetaInviteDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = { onClose(doNotShowAgain, false) }) {
+            TextButton(onClick = { onClose(false) }) {
                 Text(
                     localizedText(
                         context,
@@ -2311,19 +3080,28 @@ private fun BetaInviteDialog(
 }
 
 @Composable
-private fun SetupGuideDialog(onDismiss: () -> Unit) {
+private fun SetupGuideDialog(
+    nonRootModeEnabled: Boolean,
+    onDismiss: () -> Unit,
+) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("运行前需要完成") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("本版本不需要相机、存储、通知等 Android 运行时权限。")
-                Text("1. 手机已 Root，并安装可用的 LSPosed。")
-                Text("2. 在 LSPosed 中启用“时停”模块。")
-                Text("3. 在模块作用域中勾选需要限制的目标应用。")
-                Text("4. 保存规则后，强制停止目标应用并重新打开。")
+                if (nonRootModeEnabled) {
+                    Text("普通保护需要启用时停无障碍服务，并授予使用情况访问权限。")
+                    Text("Shizuku 是可选增强，仅负责到限后强停第三方应用；不可用时自动回退独立限制页。")
+                } else {
+                    Text("启用时停模块，将目标应用加入作用域，保存规则后强停并重开目标应用。")
+                    Text("只有检测到应用未加入作用域或运行异常时，时停才会显示修复提示。")
+                }
                 Text(
-                    "若诊断日志没有 HOOK_READY，说明 Hook 没有进入目标进程，请先检查第 2、3 项。",
+                    if (nonRootModeEnabled) {
+                        "普通保护不会读取页面文字或输入内容，也不会持续轮询；关闭权限、停止或卸载时停后无法继续保护。"
+                    } else {
+                        "规则保存后由目标应用执行；若实际未生效，请在诊断日志中检查运行状态。"
+                    },
                     color = MaterialTheme.colorScheme.primary,
                 )
             }
@@ -2336,8 +3114,18 @@ private fun SetupGuideDialog(onDismiss: () -> Unit) {
 @Composable
 private fun SettingsDialog(
     initialSettings: GlobalSettings,
+    xposedAvailable: Boolean,
     usageAccessGranted: Boolean,
+    accessibilityEnabled: Boolean,
+    accessibilityRuntimeState: AccessibilityRuntimeState,
+    nonRootHealthSnapshot: NonRootHealthSnapshot,
+    shizukuState: ShizukuExecutionState,
+    protectionPresentation: ProtectionPresentationSnapshot,
+    xposedTargets: List<TargetProtectionStatus>,
+    xposedFrameworkConnected: Boolean,
+    xposedSnapshotStale: Boolean,
     onDismiss: () -> Unit,
+    onThemePreviewChange: (AppThemeMode, AppThemeColor) -> Unit,
     onDonate: () -> Unit,
     onCheckUpdates: () -> Unit,
     onAbout: () -> Unit,
@@ -2345,8 +3133,23 @@ private fun SettingsDialog(
     onFeedback: () -> Unit,
     onCopyRecoveryCommand: () -> Unit,
     onRequestUsageAccess: () -> Unit,
+    onRequestAccessibility: () -> Unit,
+    onRequestShizukuPermission: () -> Unit,
+    onOpenShizukuGuide: () -> Unit,
+    onOpenAppSystemSettings: () -> Unit,
+    onRefreshProtectionStatus: () -> Unit,
+    onRequestScope: (Set<String>) -> Unit,
+    onRestorePermissionPrompts: () -> Unit,
+    onOpenOemCompatibilitySettings: () -> Unit,
     onSave: (GlobalSettings) -> Unit,
 ) {
+    val context = LocalContext.current
+    var protectionMode by remember { mutableStateOf(initialSettings.protectionMode) }
+    var nonRootCompatibilityMode by remember {
+        mutableStateOf(initialSettings.nonRootCompatibilityMode)
+    }
+    var pendingProtectionMode by remember { mutableStateOf<ProtectionMode?>(null) }
+    var showAccessibilityDisclosure by remember { mutableStateOf(false) }
     var warningEnabled by remember { mutableStateOf(initialSettings.exitWarningEnabled) }
     var fullScreenWarningEnabled by remember {
         mutableStateOf(initialSettings.fullScreenExitWarningEnabled)
@@ -2355,6 +3158,18 @@ private fun SettingsDialog(
         mutableStateOf(initialSettings.exitWarningVibrationEnabled)
     }
     var languageMode by remember { mutableStateOf(initialSettings.languageMode) }
+    var themeMode by remember { mutableStateOf(initialSettings.themeMode) }
+    var themeColor by remember { mutableStateOf(initialSettings.themeColor) }
+    var timeQuotesEnabled by remember { mutableStateOf(initialSettings.timeQuotesEnabled) }
+    var builtInTimeQuotesEnabled by remember {
+        mutableStateOf(initialSettings.builtInTimeQuotesEnabled)
+    }
+    var customTimeQuotesText by remember {
+        mutableStateOf(TimeQuotePolicy.encode(initialSettings.customTimeQuotes))
+    }
+    var automaticUpdateCheckEnabled by remember {
+        mutableStateOf(initialSettings.automaticUpdateCheckEnabled)
+    }
     var diagnosticsEnabled by remember { mutableStateOf(initialSettings.diagnosticsEnabled) }
     var launcherIconHidden by remember { mutableStateOf(initialSettings.launcherIconHidden) }
     var usageStatsEnabled by remember { mutableStateOf(initialSettings.usageStatsEnabled) }
@@ -2365,6 +3180,29 @@ private fun SettingsDialog(
         mutableStateOf((initialSettings.extensionSeconds / 60L).coerceAtLeast(1L).toString())
     }
     val parsedMinutes = extensionMinutes.toLongOrNull()?.takeIf { it in 1L..60L }
+    val healthColors = LocalTimeStopExtendedColors.current
+    val settingsVisibility = ProtectionSettingsPolicy.resolve(
+        xposedAvailable = xposedAvailable,
+        nonRootEnabled = protectionMode.usesNonRoot,
+        shizukuSelected = protectionMode.usesShizuku,
+        launcherIconHidden = launcherIconHidden,
+    )
+    val displayedProtectionPresentation = if (
+        protectionMode == initialSettings.protectionMode
+    ) {
+        protectionPresentation
+    } else {
+        ProtectionPresentationPolicy.resolve(
+            selectedMode = protectionMode,
+            targets = xposedTargets,
+            accessibilityState = accessibilityRuntimeState,
+            usageAccessGranted = usageAccessGranted,
+            shizukuState = shizukuState,
+        )
+    }
+    val missingScopePackages = xposedTargets.filter {
+        it.scopeState == ScopeState.NOT_IN_SCOPE
+    }.mapTo(linkedSetOf(), TargetProtectionStatus::packageName)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -2375,114 +3213,683 @@ private fun SettingsDialog(
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 item {
-                    SettingsSectionTitle("提醒与延时")
+                    SettingsSectionTitle("保护方式")
                 }
                 item {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("达到限制后", fontWeight = FontWeight.Medium)
                         Text(
-                            "强制退出用于硬限制；独立休息页可暂停目标界面，冷静后继续",
+                            localizedText(
+                                context,
+                                "所有管控应用统一使用所选链路，模式之间不会自动混合接管。",
+                                "All managed apps use the selected controller. Modes never take over from one another automatically.",
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        ProtectionMode.values().forEach { mode ->
+                            val label = when (mode) {
+                                ProtectionMode.XPOSED -> "LSPosed"
+                                ProtectionMode.ACCESSIBILITY -> "普通保护"
+                                ProtectionMode.ACCESSIBILITY_SHIZUKU ->
+                                    "普通保护 + Shizuku"
+                            }
+                            val description = when (mode) {
+                                ProtectionMode.XPOSED -> "由目标应用内 Hook 精确计时并执行限制"
+                                ProtectionMode.ACCESSIBILITY ->
+                                    "无障碍识别前台，UsageStats 校准，到限显示独立限制页"
+                                ProtectionMode.ACCESSIBILITY_SHIZUKU ->
+                                    "普通保护计时，到限优先通过 Shizuku 强停"
+                            }
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    if (mode.usesNonRoot) {
+                                        val accepted = context.getSharedPreferences(
+                                            "ui",
+                                            Context.MODE_PRIVATE,
+                                        ).getBoolean(NON_ROOT_DISCLOSURE_ACCEPTED_KEY, false)
+                                        if (!accepted) {
+                                            pendingProtectionMode = mode
+                                            showAccessibilityDisclosure = true
+                                        } else {
+                                            protectionMode = mode
+                                        }
+                                    } else {
+                                        protectionMode = mode
+                                    }
+                                },
+                                color = if (protectionMode == mode) {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceContainer
+                                },
+                                shape = RoundedCornerShape(14.dp),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        if (protectionMode == mode) "●" else "○",
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                    Column(Modifier.weight(1f)) {
+                                        Text(label, fontWeight = FontWeight.SemiBold)
+                                        Text(description, style = MaterialTheme.typography.bodySmall)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                item {
+                    val healthy = displayedProtectionPresentation.severity ==
+                        ProtectionPresentationSeverity.HEALTHY
+                    Surface(
+                        color = if (healthy) {
+                            healthColors.successContainer
+                        } else {
+                            healthColors.warningContainer
+                        },
+                        contentColor = if (healthy) {
+                            healthColors.onSuccessContainer
+                        } else {
+                            healthColors.onWarningContainer
+                        },
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(7.dp),
+                        ) {
+                            Text(
+                                protectionPresentationTitle(
+                                    context,
+                                    displayedProtectionPresentation,
+                                ),
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                protectionPresentationDetail(
+                                    context,
+                                    displayedProtectionPresentation,
+                                    xposedFrameworkConnected,
+                                    xposedSnapshotStale,
+                                ),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                TextButton(onClick = onRefreshProtectionStatus) {
+                                    Text("刷新状态")
+                                }
+                                if (
+                                    protectionMode == ProtectionMode.XPOSED &&
+                                    missingScopePackages.isNotEmpty()
+                                ) {
+                                    TextButton(
+                                        onClick = {
+                                            onRequestScope(
+                                                missingScopePackages,
+                                            )
+                                        },
+                                    ) {
+                                        Text(
+                                            if (xposedFrameworkConnected) {
+                                                "请求加入作用域"
+                                            } else {
+                                                "查看作用域提示"
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                            if (
+                                displayedProtectionPresentation.explicitIssuePackages.isNotEmpty()
+                            ) {
+                                Text(
+                                    localizedText(
+                                        context,
+                                        "明确异常：${displayedProtectionPresentation.explicitIssuePackages.size} 个应用",
+                                        "Confirmed issues: ${displayedProtectionPresentation.explicitIssuePackages.size} apps",
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Text(
+                                    displayedProtectionPresentation.explicitIssuePackages
+                                        .sorted()
+                                        .take(3)
+                                        .joinToString("\n"),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 3,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+                }
+                if (protectionMode.usesNonRoot) {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    localizedText(
+                                        context,
+                                        "增强兼容检测",
+                                        "Enhanced compatibility detection",
+                                    ),
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    localizedText(
+                                        context,
+                                        "仅在部分系统漏发窗口事件时开启；增加包名级内容变化事件，但仍不读取页面节点、文字或输入内容。",
+                                        "Use only when the system misses window events. It adds package-only content-change events without reading nodes, text, or input.",
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            Switch(
+                                checked =
+                                    nonRootCompatibilityMode ==
+                                        NonRootCompatibilityMode.ENHANCED_EVENTS,
+                                onCheckedChange = { enabled ->
+                                    nonRootCompatibilityMode = if (enabled) {
+                                        NonRootCompatibilityMode.ENHANCED_EVENTS
+                                    } else {
+                                        NonRootCompatibilityMode.STANDARD
+                                    }
+                                },
+                            )
+                        }
+                    }
+                    item {
+                        Surface(
+                            color = if (accessibilityEnabled && usageAccessGranted) {
+                                healthColors.successContainer
+                            } else {
+                                healthColors.warningContainer
+                            },
+                            contentColor = if (accessibilityEnabled && usageAccessGranted) {
+                                healthColors.onSuccessContainer
+                            } else {
+                                healthColors.onWarningContainer
+                            },
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Text(
+                                    when (accessibilityRuntimeState) {
+                                        AccessibilityRuntimeState.DISABLED ->
+                                            localizedText(context, "无障碍服务尚未启用", "Accessibility service is disabled")
+                                        AccessibilityRuntimeState.ENABLED_DISCONNECTED ->
+                                            localizedText(context, "无障碍已开启，但服务尚未连接", "Accessibility is enabled, but the service is not connected")
+                                        AccessibilityRuntimeState.CONNECTED ->
+                                            localizedText(context, "无障碍服务已连接运行", "Accessibility service is connected and running")
+                                    },
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    if (usageAccessGranted) {
+                                        localizedText(context, "使用情况访问已授予", "Usage Access is granted")
+                                    } else {
+                                        localizedText(context, "使用情况访问尚未授予", "Usage Access is not granted")
+                                    },
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    localizedText(
+                                        context,
+                                        "只读取当前前台应用包名，不读取页面节点、文字或输入内容；达到限制时显示独立限制页，启动失败才返回桌面。",
+                                        "Only the foreground package name is used. Page nodes, text, and input are never read. Limits use the standalone restriction page and return Home only if it cannot open.",
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Text(
+                                    localizedText(
+                                        context,
+                                        if (
+                                            nonRootHealthSnapshot.lastForegroundAcceptedAtMillis > 0L
+                                        ) {
+                                            "最近识别：${foregroundSourceLabel(context, nonRootHealthSnapshot.lastForegroundSource)}"
+                                        } else {
+                                            "最近识别：等待目标应用事件"
+                                        },
+                                        if (
+                                            nonRootHealthSnapshot.lastForegroundAcceptedAtMillis > 0L
+                                        ) {
+                                            "Last detection: ${foregroundSourceLabel(context, nonRootHealthSnapshot.lastForegroundSource)}"
+                                        } else {
+                                            "Last detection: waiting for a target-app event"
+                                        },
+                                    ),
+                                    color = MaterialTheme.colorScheme.primary,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Text(
+                                    localizedText(
+                                        context,
+                                        "界面状态：${nonRootHealthSnapshot.uiState.name}",
+                                        "UI state: ${nonRootHealthSnapshot.uiState.name}",
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    if (
+                                        accessibilityRuntimeState !=
+                                        AccessibilityRuntimeState.CONNECTED
+                                    ) {
+                                        TextButton(onClick = {
+                                            val accepted = context.getSharedPreferences(
+                                                "ui",
+                                                Context.MODE_PRIVATE,
+                                            ).getBoolean(
+                                                NON_ROOT_DISCLOSURE_ACCEPTED_KEY,
+                                                false,
+                                            )
+                                            if (accepted) {
+                                                onRequestAccessibility()
+                                            } else {
+                                                showAccessibilityDisclosure = true
+                                            }
+                                        }) {
+                                            Text(
+                                                if (
+                                                    accessibilityRuntimeState ==
+                                                    AccessibilityRuntimeState.DISABLED
+                                                ) {
+                                                    localizedText(context, "启用无障碍", "Enable accessibility")
+                                                } else {
+                                                    localizedText(context, "检查无障碍连接", "Check accessibility connection")
+                                                },
+                                            )
+                                        }
+                                    }
+                                    if (!usageAccessGranted) {
+                                        TextButton(onClick = onRequestUsageAccess) {
+                                            Text(localizedText(context, "授予使用情况访问", "Grant Usage Access"))
+                                        }
+                                    }
+                                    TextButton(onClick = onOpenAppSystemSettings) {
+                                        Text("自启动与电池设置")
+                                    }
+                                    TextButton(onClick = onRestorePermissionPrompts) {
+                                        Text("恢复权限提醒")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    item {
+                        val compatibility = nonRootHealthSnapshot.breakPageCompatibility
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Text("独立限制页兼容性", fontWeight = FontWeight.Medium)
+                                Text(
+                                    if (compatibility.lastFailureAtMillis > 0L) {
+                                        localizedText(
+                                            context,
+                                            "最近失败：${formatWallClock(compatibility.lastFailureAtMillis)} · ${compatibility.lastFailureStage} · ${compatibility.lastFailureManufacturer}",
+                                            "Latest failure: ${formatWallClock(compatibility.lastFailureAtMillis)} · ${compatibility.lastFailureStage} · ${compatibility.lastFailureManufacturer}",
+                                        )
+                                    } else {
+                                        localizedText(
+                                            context,
+                                            "暂未检测到限制页被系统拦截",
+                                            "No restriction-page blocking has been detected.",
+                                        )
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                if (compatibility.lastFailureDetail.isNotBlank()) {
+                                    Text(
+                                        compatibility.lastFailureDetail,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                Text(
+                                    localizedText(
+                                        context,
+                                        "若到限后不能打开限制页，请检查后台弹出界面、自启动和电池无限制。",
+                                        "If the page cannot open at the limit, check background pop-ups, auto-start, and unrestricted battery use.",
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                TextButton(onClick = onOpenOemCompatibilitySettings) {
+                                    Text("打开兼容设置")
+                                }
+                            }
+                        }
+                    }
+                    if (settingsVisibility.showShizukuDetails) {
+                        item {
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                shape = RoundedCornerShape(12.dp),
+                            ) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Text(
+                                        when (shizukuState) {
+                                            ShizukuExecutionState.READY ->
+                                                "Shizuku 已连接并授权"
+                                            ShizukuExecutionState.CONNECTING ->
+                                                "正在连接 Shizuku"
+                                            ShizukuExecutionState.PERMISSION_REQUIRED ->
+                                                "Shizuku 等待授权"
+                                            ShizukuExecutionState.UNAVAILABLE ->
+                                                "未检测到运行中的 Shizuku"
+                                            ShizukuExecutionState.FAILED ->
+                                                "Shizuku 连接失败"
+                                            ShizukuExecutionState.DISABLED ->
+                                                "保存设置后启用 Shizuku 强制退出"
+                                        },
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                    Text(
+                                        "强停会丢失目标应用当前页面；Shizuku 非 Root 模式通常需要在重启后重新启动。",
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                    if (shizukuState != ShizukuExecutionState.READY) {
+                                        FlowRow(
+                                            horizontalArrangement =
+                                                Arrangement.spacedBy(8.dp),
+                                        ) {
+                                            TextButton(onClick = onRequestShizukuPermission) {
+                                                Text("请求 Shizuku 授权")
+                                            }
+                                            if (
+                                                shizukuState ==
+                                                ShizukuExecutionState.UNAVAILABLE ||
+                                                shizukuState ==
+                                                ShizukuExecutionState.FAILED
+                                            ) {
+                                                TextButton(onClick = onOpenShizukuGuide) {
+                                                    Text("安装与启动指南")
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                item { HorizontalDivider() }
+                item {
+                    SettingsSectionTitle("外观")
+                }
+                item {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("颜色主题", fontWeight = FontWeight.Medium)
+                        Text(
+                            "所有管理页、管控弹窗和限制页同步使用",
                             style = MaterialTheme.typography.bodySmall,
                         )
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FilterChip(
-                                selected = limitEnforcementMode ==
-                                    LimitEnforcementMode.FORCE_EXIT,
-                                onClick = {
-                                    limitEnforcementMode = LimitEnforcementMode.FORCE_EXIT
-                                },
-                                label = { Text("强制退出（默认）") },
-                            )
-                            FilterChip(
-                                selected = limitEnforcementMode ==
-                                    LimitEnforcementMode.EXTERNAL_BREAK_PAGE,
-                                onClick = {
-                                    limitEnforcementMode =
-                                        LimitEnforcementMode.EXTERNAL_BREAK_PAGE
-                                },
-                                label = { Text("独立休息页") },
-                            )
+                            AppThemeColor.entries.forEach { color ->
+                                FilterChip(
+                                    selected = themeColor == color,
+                                    onClick = {
+                                        themeColor = color
+                                        onThemePreviewChange(themeMode, color)
+                                    },
+                                    label = {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        ) {
+                                            Surface(
+                                                modifier = Modifier.size(14.dp),
+                                                shape = CircleShape,
+                                                color = themePreviewColor(color),
+                                            ) {}
+                                            Text(
+                                                when (color) {
+                                                    AppThemeColor.GREEN -> "健康绿"
+                                                    AppThemeColor.BLUE -> "宁静蓝"
+                                                    AppThemeColor.PURPLE -> "专注紫"
+                                                },
+                                            )
+                                        }
+                                    },
+                                )
+                            }
                         }
-                        if (
-                            limitEnforcementMode ==
-                            LimitEnforcementMode.EXTERNAL_BREAK_PAGE
+                        Text("明暗模式", fontWeight = FontWeight.Medium)
+                        Text(
+                            "选择舒适的浅色或深色界面",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            AppThemeMode.entries.forEach { mode ->
+                                FilterChip(
+                                    selected = themeMode == mode,
+                                    onClick = {
+                                        themeMode = mode
+                                        onThemePreviewChange(mode, themeColor)
+                                    },
+                                    label = {
+                                        Text(
+                                            when (mode) {
+                                                AppThemeMode.SYSTEM -> "跟随系统"
+                                                AppThemeMode.LIGHT -> "浅色"
+                                                AppThemeMode.DARK -> "深色"
+                                            },
+                                        )
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+                item {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
-                            Text(
-                                "达到限制后会打开时停的独立休息页，使目标界面自然暂停，并尝试暂停常见的 MediaPlayer、ExoPlayer/Media3 和网页音视频。部分系统可能询问是否允许打开时停；自研播放器、后台服务和游戏引擎可能继续运行。休息页不提供延时，主页与最近任务仍可使用；单次额度需配合冷却，结束后自动继续。切换执行方式后，请强停并重开管控应用。",
-                                color = MaterialTheme.colorScheme.primary,
-                                style = MaterialTheme.typography.bodySmall,
+                            Column(Modifier.weight(1f)) {
+                                Text("时间短句", fontWeight = FontWeight.Medium)
+                                Text(
+                                    "在计划、全屏提醒和独立限制页显示",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            Switch(
+                                checked = timeQuotesEnabled,
+                                onCheckedChange = { timeQuotesEnabled = it },
                             )
+                        }
+                        if (timeQuotesEnabled) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Text("使用内置短句")
+                                Switch(
+                                    checked = builtInTimeQuotesEnabled,
+                                    onCheckedChange = { builtInTimeQuotesEnabled = it },
+                                )
+                            }
+                            TextField(
+                                value = customTimeQuotesText,
+                                onValueChange = {
+                                    customTimeQuotesText = it
+                                        .lineSequence()
+                                        .take(TimeQuotePolicy.MAX_CUSTOM_QUOTES)
+                                        .joinToString("\n")
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                label = { Text("自定义短句（每行一句）") },
+                                supportingText = {
+                                    val count = TimeQuotePolicy.parseCustomQuotes(
+                                        customTimeQuotesText,
+                                    ).size
+                                    Text(
+                                        "$count/${TimeQuotePolicy.MAX_CUSTOM_QUOTES} 句，" +
+                                            "每句最多${TimeQuotePolicy.MAX_QUOTE_CODE_POINTS}字",
+                                    )
+                                },
+                                minLines = 3,
+                                maxLines = 6,
+                            )
+                            if (
+                                !builtInTimeQuotesEnabled &&
+                                TimeQuotePolicy.parseCustomQuotes(customTimeQuotesText).isEmpty()
+                            ) {
+                                Text(
+                                    "当前没有可显示的短句",
+                                    color = MaterialTheme.colorScheme.primary,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
                         }
                     }
                 }
-                item {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text("退出前提醒", fontWeight = FontWeight.Medium)
-                            Text("到期前 5 秒在屏幕顶部显示倒计时", style = MaterialTheme.typography.bodySmall)
-                        }
-                        Switch(
-                            checked = warningEnabled,
-                            onCheckedChange = { warningEnabled = it },
-                        )
+                if (settingsVisibility.showXposedExecution) {
+                    item { HorizontalDivider() }
+                    item {
+                        SettingsSectionTitle("LSPosed 提醒与退出")
                     }
-                }
-                item {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text("全屏退出提醒", fontWeight = FontWeight.Medium)
+                    item {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("LSPosed 到限方式", fontWeight = FontWeight.Medium)
                             Text(
-                                "开启后倒计时覆盖当前应用；关闭时显示顶部圆角提醒",
+                                "只影响已被 Hook 接管的目标应用",
                                 style = MaterialTheme.typography.bodySmall,
                             )
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                FilterChip(
+                                    selected = limitEnforcementMode ==
+                                        LimitEnforcementMode.FORCE_EXIT,
+                                    onClick = {
+                                        limitEnforcementMode =
+                                            LimitEnforcementMode.FORCE_EXIT
+                                    },
+                                    label = { Text("强制退出（默认）") },
+                                )
+                                FilterChip(
+                                    selected = limitEnforcementMode ==
+                                        LimitEnforcementMode.EXTERNAL_BREAK_PAGE,
+                                    onClick = {
+                                        limitEnforcementMode =
+                                            LimitEnforcementMode.EXTERNAL_BREAK_PAGE
+                                    },
+                                    label = { Text("独立休息页") },
+                                )
+                            }
+                            if (
+                                limitEnforcementMode ==
+                                LimitEnforcementMode.EXTERNAL_BREAK_PAGE
+                            ) {
+                                Text(
+                                    "达到限制后打开独立休息页，使目标界面自然暂停，并尽力暂停常见媒体。休息页不提供延时；单次额度配合冷却时，结束后可继续原页面。切换方式后请强停并重开目标应用。",
+                                    color = MaterialTheme.colorScheme.primary,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
                         }
-                        Switch(
-                            checked = fullScreenWarningEnabled,
-                            onCheckedChange = { fullScreenWarningEnabled = it },
+                    }
+                }
+                if (settingsVisibility.showHookReminderSettings) {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("退出前提醒", fontWeight = FontWeight.Medium)
+                                Text(
+                                    "Hook 目标到期前 5 秒显示倒计时",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            Switch(
+                                checked = warningEnabled,
+                                onCheckedChange = { warningEnabled = it },
+                            )
+                        }
+                    }
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("全屏退出提醒", fontWeight = FontWeight.Medium)
+                                Text(
+                                    "开启后倒计时覆盖 Hook 目标；关闭时显示顶部圆角提醒",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            Switch(
+                                checked = fullScreenWarningEnabled,
+                                onCheckedChange = { fullScreenWarningEnabled = it },
+                                enabled = warningEnabled,
+                            )
+                        }
+                    }
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("长震动提醒", fontWeight = FontWeight.Medium)
+                                Text(
+                                    "Hook 退出倒计时出现时震动一次",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            Switch(
+                                checked = vibrationEnabled,
+                                onCheckedChange = { vibrationEnabled = it },
+                                enabled = warningEnabled,
+                            )
+                        }
+                    }
+                    item {
+                        TextField(
+                            value = extensionMinutes,
+                            onValueChange = {
+                                extensionMinutes = it.filter(Char::isDigit).take(2)
+                            },
+                            label = { Text("每次点击延时（分钟）") },
+                            supportingText = {
+                                Text("仅对 Hook 提醒生效；可设置 1–60 分钟")
+                            },
+                            keyboardOptions =
+                                KeyboardOptions(keyboardType = KeyboardType.Number),
+                            isError = extensionMinutes.isNotEmpty() &&
+                                parsedMinutes == null,
                             enabled = warningEnabled,
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
-                }
-                item {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text("长震动提醒", fontWeight = FontWeight.Medium)
-                            Text(
-                                "退出倒计时出现时震动一次",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                        Switch(
-                            checked = vibrationEnabled,
-                            onCheckedChange = { vibrationEnabled = it },
-                            enabled = warningEnabled,
-                        )
-                    }
-                }
-                item {
-                    TextField(
-                        value = extensionMinutes,
-                        onValueChange = { extensionMinutes = it.filter(Char::isDigit).take(2) },
-                        label = { Text("每次点击延时（分钟）") },
-                        supportingText = { Text("可设置 1–60 分钟；每次点击都会追加") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        isError = extensionMinutes.isNotEmpty() && parsedMinutes == null,
-                        enabled = warningEnabled,
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
                 }
                 item { HorizontalDivider() }
                 item {
@@ -2510,7 +3917,16 @@ private fun SettingsDialog(
                 if (usageStatsEnabled) {
                     item {
                         Surface(
-                            color = if (usageAccessGranted) Color(0xFFE0F4E8) else Color(0xFFFFE9C7),
+                            color = if (usageAccessGranted) {
+                                healthColors.successContainer
+                            } else {
+                                healthColors.warningContainer
+                            },
+                            contentColor = if (usageAccessGranted) {
+                                healthColors.onSuccessContainer
+                            } else {
+                                healthColors.onWarningContainer
+                            },
                             shape = RoundedCornerShape(12.dp),
                         ) {
                             Row(
@@ -2543,7 +3959,10 @@ private fun SettingsDialog(
                     ) {
                         Column(Modifier.weight(1f)) {
                             Text("诊断日志", fontWeight = FontWeight.Medium)
-                            Text("记录 Hook、计时、延时和退出事件", style = MaterialTheme.typography.bodySmall)
+                            Text(
+                                "记录管控引擎、包名、时间戳和限制事件；仅在你主动反馈时导出",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
                         }
                         Switch(
                             checked = diagnosticsEnabled,
@@ -2578,29 +3997,49 @@ private fun SettingsDialog(
                         }
                     }
                 }
-                item {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text("隐藏桌面图标", fontWeight = FontWeight.Medium)
-                            Text(
-                                "隐藏后仍可从 LSPosed 模块页打开设置",
-                                style = MaterialTheme.typography.bodySmall,
+                if (settingsVisibility.showLauncherIconControl) {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    if (settingsVisibility.launcherControlIsRecoveryOnly) {
+                                        "恢复桌面图标"
+                                    } else {
+                                        "隐藏桌面图标"
+                                    },
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    if (settingsVisibility.launcherControlIsRecoveryOnly) {
+                                        "当前无法确认 LSPosed 设置入口，请恢复图标避免无法打开时停"
+                                    } else {
+                                        "仅在 LSPosed 设置入口可用时提供；隐藏后从模块页打开"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            Switch(
+                                checked = launcherIconHidden,
+                                onCheckedChange = { hidden ->
+                                    if (!settingsVisibility.launcherControlIsRecoveryOnly ||
+                                        !hidden
+                                    ) {
+                                        launcherIconHidden = hidden
+                                    }
+                                },
                             )
                         }
-                        Switch(
-                            checked = launcherIconHidden,
-                            onCheckedChange = { launcherIconHidden = it },
-                        )
                     }
                 }
-                if (launcherIconHidden) {
+                if (launcherIconHidden && settingsVisibility.showLauncherIconControl) {
                     item {
                         Surface(
-                            color = Color(0xFFFFE9E7),
+                            color = healthColors.dangerContainer,
+                            contentColor = healthColors.onDangerContainer,
                             shape = RoundedCornerShape(12.dp),
                         ) {
                             Column(
@@ -2608,13 +4047,17 @@ private fun SettingsDialog(
                                 verticalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
                                 Text(
-                                    "隐藏后，桌面缓存图标可能短暂残留且无法点击，刷新后会消失。可从 LSPosed 模块页，或“系统设置 → 应用 → 时停 → 应用内设置”进入；也可连接电脑执行：",
-                                    color = Color(0xFF8C1D18),
+                                    if (settingsVisibility.launcherControlIsRecoveryOnly) {
+                                        "当前未检测到可用的 LSPosed 设置入口，请关闭上方开关恢复桌面图标；也可连接电脑执行："
+                                    } else {
+                                        "隐藏后桌面缓存图标可能短暂残留。可从 LSPosed 模块页进入；也可连接电脑执行："
+                                    },
+                                    color = healthColors.onDangerContainer,
                                     style = MaterialTheme.typography.bodySmall,
                                 )
                                 Text(
                                     LauncherIconController.RECOVERY_COMMAND,
-                                    color = Color(0xFF5F1411),
+                                    color = healthColors.onDangerContainer.copy(alpha = 0.82f),
                                     style = MaterialTheme.typography.labelSmall,
                                 )
                                 TextButton(onClick = onCopyRecoveryCommand) {
@@ -2635,6 +4078,25 @@ private fun SettingsDialog(
                         action = "检查 ›",
                         onClick = onCheckUpdates,
                     )
+                }
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("自动检查更新", fontWeight = FontWeight.Medium)
+                            Text(
+                                "打开时停时按需检查，新版发布后主动提醒",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        Switch(
+                            checked = automaticUpdateCheckEnabled,
+                            onCheckedChange = { automaticUpdateCheckEnabled = it },
+                        )
+                    }
                 }
                 item {
                     SettingsEntry(
@@ -2680,6 +4142,16 @@ private fun SettingsDialog(
                             fullScreenExitWarningEnabled = fullScreenWarningEnabled,
                             exitWarningVibrationEnabled = vibrationEnabled,
                             languageMode = languageMode,
+                            themeMode = themeMode,
+                            themeColor = themeColor,
+                            timeQuotesEnabled = timeQuotesEnabled,
+                            builtInTimeQuotesEnabled = builtInTimeQuotesEnabled,
+                            customTimeQuotes = TimeQuotePolicy.parseCustomQuotes(
+                                customTimeQuotesText,
+                            ),
+                            automaticUpdateCheckEnabled = automaticUpdateCheckEnabled,
+                            protectionMode = protectionMode,
+                            nonRootCompatibilityMode = nonRootCompatibilityMode,
                             extensionSeconds = (parsedMinutes ?: 5L) * 60L,
                             limitEnforcementMode = limitEnforcementMode,
                             diagnosticsEnabled = diagnosticsEnabled,
@@ -2693,6 +4165,81 @@ private fun SettingsDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
+
+    if (showAccessibilityDisclosure) {
+        AlertDialog(
+            onDismissRequest = {
+                showAccessibilityDisclosure = false
+                pendingProtectionMode = null
+            },
+            title = {
+                Text(
+                    localizedText(
+                        context,
+                        "无障碍服务用途说明",
+                        "Accessibility service disclosure",
+                    ),
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        localizedText(
+                            context,
+                            "时停使用无障碍服务识别当前前台应用，并在用户保存的时间规则触发时显示计划选择浮层或独立限制页；限制页启动失败时返回桌面。",
+                            "Time Stop uses accessibility events to identify the foreground app and show the saved session-plan picker or restriction page. It returns Home only if the restriction page cannot open.",
+                        ),
+                    )
+                    Text(
+                        localizedText(
+                            context,
+                            "标准模式只接收窗口变化；可选增强兼容模式还接收包名级内容变化事件。两种模式都不会读取页面节点、文字、账号、输入内容或通知，也不会上传无障碍事件。",
+                            "Standard mode receives window changes only. Optional enhanced compatibility mode also receives package-only content-change events. Neither mode reads nodes, text, accounts, input, or notifications, and accessibility events are never uploaded.",
+                        ),
+                    )
+                    Text(
+                        localizedText(
+                            context,
+                            "普通保护属于自我时间管理。你可以随时在系统设置中关闭服务；关闭后非 Root 管控将停止。",
+                            "Basic protection is intended for self-management. You can disable the service in system settings at any time; non-root protection then stops.",
+                        ),
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+                            .edit()
+                            .putBoolean(NON_ROOT_DISCLOSURE_ACCEPTED_KEY, true)
+                            .commit()
+                        showAccessibilityDisclosure = false
+                        protectionMode = pendingProtectionMode ?: ProtectionMode.ACCESSIBILITY
+                        pendingProtectionMode = null
+                        onRequestAccessibility()
+                    },
+                ) {
+                    Text(
+                        localizedText(
+                            context,
+                            "同意并前往启用",
+                            "Agree and enable",
+                        ),
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showAccessibilityDisclosure = false
+                        pendingProtectionMode = null
+                    },
+                ) {
+                    Text(localizedText(context, "暂不开启", "Not now"))
+                }
+            },
+        )
+    }
 }
 
 @Composable
@@ -2703,6 +4250,12 @@ private fun SettingsSectionTitle(title: String) {
         fontWeight = FontWeight.Bold,
         style = MaterialTheme.typography.titleSmall,
     )
+}
+
+private fun themePreviewColor(color: AppThemeColor): Color = when (color) {
+    AppThemeColor.GREEN -> Color(0xFF276B4E)
+    AppThemeColor.BLUE -> Color(0xFF315F91)
+    AppThemeColor.PURPLE -> Color(0xFF6B4EA0)
 }
 
 @Composable
@@ -2797,7 +4350,7 @@ private fun FeedbackOptionsDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    "请选择反馈方式。邮件反馈会附带设备信息和诊断日志，QQ群适合交流和参与内测。",
+                    "请选择反馈方式。邮件反馈会附带设备型号、包名、时间戳和诊断日志，仅在你主动发送时离开设备；QQ群适合交流和参与内测。",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 OutlinedButton(
@@ -2830,7 +4383,6 @@ private enum class DonationChannel {
 private fun DonationPromptDialog(
     onSupport: () -> Unit,
     onLater: () -> Unit,
-    onNeverShowAgain: () -> Unit,
 ) {
     val context = LocalContext.current
     AlertDialog(
@@ -2865,8 +4417,8 @@ private fun DonationPromptDialog(
                 Text(
                     localizedText(
                         context,
-                        "捐助完全自愿，不捐助也不会影响任何功能。",
-                        "Donations are entirely optional and never affect app features.",
+                        "捐助完全自愿，不捐助也不会影响任何功能。本版本仅提示一次。",
+                        "Donations are entirely optional and never affect app features. This appears once per version.",
                     ),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -2879,13 +4431,8 @@ private fun DonationPromptDialog(
             }
         },
         dismissButton = {
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                TextButton(onClick = onNeverShowAgain) {
-                    Text(localizedText(context, "不再提示", "Do not show again"))
-                }
-                TextButton(onClick = onLater) {
-                    Text(localizedText(context, "稍后再说", "Maybe later"))
-                }
+            TextButton(onClick = onLater) {
+                Text(localizedText(context, "稍后再说", "Maybe later"))
             }
         },
     )
@@ -3143,11 +4690,28 @@ private fun openQqGroup(context: Context) {
 private const val QQ_GROUP_NUMBER = "1009712674"
 private val QQ_PACKAGES = listOf("com.tencent.mobileqq", "com.tencent.tim")
 private const val FEATURE_INTRO_DISABLED_KEY = "feature_intro_disabled"
-private const val BETA_INVITE_DISABLED_KEY = "beta_invite_disabled"
-private const val DONATION_FIRST_USE_DAY_KEY = "donation_first_use_epoch_day"
-private const val DONATION_LAST_PROMPT_DAY_KEY = "donation_last_prompt_epoch_day"
-private const val DONATION_LAUNCHES_SINCE_PROMPT_KEY = "donation_launches_since_prompt"
-private const val DONATION_PROMPT_DISABLED_KEY = "donation_prompt_disabled"
+private const val PROTECTION_DEGRADED_SIGNATURE_KEY = "protection_degraded_signature"
+private const val NON_ROOT_REPAIR_SUPPRESSED_SIGNATURES_KEY =
+    "non_root_repair_suppressed_signatures"
+private const val NON_ROOT_REPAIR_LAST_SHOWN_SIGNATURE_KEY =
+    "non_root_repair_last_shown_signature"
+private const val NON_ROOT_REPAIR_LAST_SHOWN_AT_KEY =
+    "non_root_repair_last_shown_at"
+private const val BETA_INVITE_LAST_VERSION_KEY = "beta_invite_last_version"
+private const val NON_ROOT_DISCLOSURE_ACCEPTED_KEY =
+    "non_root_accessibility_disclosure_accepted"
+private const val DONATION_PROMPT_LAST_VERSION_KEY = "donation_prompt_last_version"
+private const val AUTOMATIC_UPDATE_LAST_CHECK_AT_KEY = "automatic_update_last_check_at"
+private const val AUTOMATIC_UPDATE_LAST_PROMPT_VERSION_KEY =
+    "automatic_update_last_prompt_version"
+private const val AUTOMATIC_UPDATE_LAST_PROMPT_AT_KEY = "automatic_update_last_prompt_at"
+
+private fun acknowledgeDonationPrompt(context: Context) {
+    context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+        .edit()
+        .putInt(DONATION_PROMPT_LAST_VERSION_KEY, BuildConfig.VERSION_CODE)
+        .commit()
+}
 
 private fun localizedText(context: Context, chinese: String, english: String): String {
     val mode = RuleRepository(context).getGlobalSettings().languageMode
@@ -3156,6 +4720,23 @@ private fun localizedText(context: Context, chinese: String, english: String): S
     } else {
         chinese
     }
+}
+
+private fun foregroundSourceLabel(
+    context: Context,
+    source: ForegroundSignalSource?,
+): String = when (source) {
+    ForegroundSignalSource.ACCESSIBILITY_WINDOW_STATE ->
+        localizedText(context, "窗口状态事件", "window-state event")
+    ForegroundSignalSource.ACCESSIBILITY_WINDOWS_CHANGED ->
+        localizedText(context, "窗口列表事件", "windows-changed event")
+    ForegroundSignalSource.ACCESSIBILITY_CONTENT_COMPAT ->
+        localizedText(context, "增强兼容事件", "enhanced compatibility event")
+    ForegroundSignalSource.USAGE_STATS_RECOVERY ->
+        localizedText(context, "系统使用记录恢复", "UsageStats recovery")
+    ForegroundSignalSource.USAGE_STATS_RECONCILE ->
+        localizedText(context, "系统使用记录纠偏", "UsageStats reconciliation")
+    null -> localizedText(context, "未知", "unknown")
 }
 
 @Composable
@@ -3170,7 +4751,7 @@ private fun DiagnosticLogDialog(
         title = { Text("诊断日志（${logs.size}）") },
         text = {
             if (logs.isEmpty()) {
-                Text("暂无日志。打开一次已配置的目标应用；若仍为空，请检查 LSPosed 是否启用模块及目标应用作用域。")
+                Text("暂无日志。请打开一次已配置的目标应用；若仍为空，请检查当前保护方式的权限与配置。")
             } else {
                 LazyColumn(
                     modifier = Modifier.fillMaxWidth().heightIn(max = 480.dp),
@@ -3235,6 +4816,7 @@ private fun RuleDialog(
         (!perLaunchEnabled || parsedPerLaunchMinutes != null) &&
         (!cooldownEnabled || parsedCooldownMinutes != null) &&
         scheduleValid
+    val healthColors = LocalTimeStopExtendedColors.current
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -3248,14 +4830,15 @@ private fun RuleDialog(
                 if (app.isSystemApp) {
                     item {
                         Surface(
-                            color = Color(0xFFFFE9C7),
+                            color = healthColors.warningContainer,
+                            contentColor = healthColors.onWarningContainer,
                             shape = RoundedCornerShape(12.dp),
                         ) {
                             Text(
                                 "这是系统应用。达到限制时只关闭应用界面，不结束系统进程，以避免影响桌面或系统稳定性。",
                                 modifier = Modifier.padding(12.dp),
                                 style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF7A4B00),
+                                color = healthColors.onWarningContainer,
                             )
                         }
                     }
@@ -3437,6 +5020,7 @@ private fun ScheduleEditor(
     onModeChange: (ScheduleMode) -> Unit,
     onWindowsChange: (List<ScheduleWindow>) -> Unit,
 ) {
+    val healthColors = LocalTimeStopExtendedColors.current
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -3462,10 +5046,10 @@ private fun ScheduleEditor(
                         )
                     },
                     colors = FilterChipDefaults.filterChipColors(
-                        containerColor = Color(0xFFE5E7EB),
-                        labelColor = Color(0xFF6B7280),
-                        selectedContainerColor = Color(0xFF19734A),
-                        selectedLabelColor = Color.White,
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                        labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        selectedContainerColor = healthColors.success,
+                        selectedLabelColor = healthColors.onSuccess,
                     ),
                 )
                 val blockSelected = mode == ScheduleMode.BLOCK_DURING
@@ -3479,10 +5063,10 @@ private fun ScheduleEditor(
                         )
                     },
                     colors = FilterChipDefaults.filterChipColors(
-                        containerColor = Color(0xFFE5E7EB),
-                        labelColor = Color(0xFF6B7280),
-                        selectedContainerColor = Color(0xFFB3261E),
-                        selectedLabelColor = Color.White,
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                        labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        selectedContainerColor = MaterialTheme.colorScheme.error,
+                        selectedLabelColor = MaterialTheme.colorScheme.onError,
                     ),
                 )
             }
@@ -3545,8 +5129,11 @@ private fun ScheduleWindowEditor(
     onDelete: () -> Unit,
 ) {
     val context = LocalContext.current
+    val themeState = LocalTimeStopThemeState.current
     Card(
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFF2F4F8)),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        ),
         shape = RoundedCornerShape(14.dp),
     ) {
         Column(
@@ -3582,10 +5169,10 @@ private fun ScheduleWindowEditor(
                             )
                         },
                         colors = FilterChipDefaults.filterChipColors(
-                            containerColor = Color(0xFFE2E4E8),
-                            labelColor = Color(0xFF7A7F89),
-                            selectedContainerColor = Color(0xFF315EA8),
-                            selectedLabelColor = Color.White,
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            selectedContainerColor = MaterialTheme.colorScheme.primary,
+                            selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
                         ),
                     )
                 }
@@ -3596,7 +5183,7 @@ private fun ScheduleWindowEditor(
             ) {
                 OutlinedButton(
                     onClick = {
-                        showTimePicker(context, window.startMinute) { minute ->
+                        showTimePicker(context, themeState.color, themeState.dark, window.startMinute) { minute ->
                             onChange(window.copy(startMinute = minute))
                         }
                     },
@@ -3604,7 +5191,7 @@ private fun ScheduleWindowEditor(
                 ) { Text("开始 ${formatMinuteOfDay(window.startMinute)}") }
                 OutlinedButton(
                     onClick = {
-                        showTimePicker(context, window.endMinute) { minute ->
+                        showTimePicker(context, themeState.color, themeState.dark, window.endMinute) { minute ->
                             onChange(window.copy(endMinute = minute))
                         }
                     },
@@ -3632,9 +5219,35 @@ private fun ScheduleWindowEditor(
     }
 }
 
-private fun showTimePicker(context: Context, initialMinute: Int, onSelected: (Int) -> Unit) {
-    TimePickerDialog(
+private fun showTimePicker(
+    context: Context,
+    themeColor: AppThemeColor,
+    dark: Boolean,
+    initialMinute: Int,
+    onSelected: (Int) -> Unit,
+) {
+    val themedContext = ContextThemeWrapper(
         context,
+        when (themeColor) {
+            AppThemeColor.GREEN -> if (dark) {
+                R.style.Theme_AppTimeLimiter_TimePicker_Green_Dark
+            } else {
+                R.style.Theme_AppTimeLimiter_TimePicker_Green_Light
+            }
+            AppThemeColor.BLUE -> if (dark) {
+                R.style.Theme_AppTimeLimiter_TimePicker_Blue_Dark
+            } else {
+                R.style.Theme_AppTimeLimiter_TimePicker_Blue_Light
+            }
+            AppThemeColor.PURPLE -> if (dark) {
+                R.style.Theme_AppTimeLimiter_TimePicker_Purple_Dark
+            } else {
+                R.style.Theme_AppTimeLimiter_TimePicker_Purple_Light
+            }
+        },
+    )
+    TimePickerDialog(
+        themedContext,
         { _, hour, minute -> onSelected(hour * 60 + minute) },
         initialMinute / 60,
         initialMinute % 60,
@@ -3691,6 +5304,10 @@ private fun ThresholdEditor(
         )
     }
 }
+
+private fun formatWallClock(timestampMillis: Long): String =
+    java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+        .format(java.util.Date(timestampMillis))
 
 private fun formatDuration(seconds: Long): String =
     if (seconds < 60L) "$seconds 秒" else "${seconds / 60L} 分钟"
@@ -3754,17 +5371,4 @@ private fun currentSupportedLanguage(): SupportedLanguage {
     } else {
         SupportedLanguage.ENGLISH
     }
-}
-
-@Composable
-private fun AppTimeLimiterTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = androidx.compose.material3.lightColorScheme(
-            primary = Color(0xFF315EA8),
-            secondary = Color(0xFF536F9E),
-            surface = Color.White,
-            background = Color(0xFFF7F8FC),
-        ),
-        content = content,
-    )
 }

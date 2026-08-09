@@ -39,7 +39,11 @@ class DeviceUsageStatsRepository(context: Context) {
     }
 
     fun todayUsageSummaries(packageNames: Collection<String>): Map<String, CalculatedUsageSummary> {
-        if (packageNames.isEmpty() || !hasUsageAccess()) return emptyMap()
+        return todayUsageSnapshot(packageNames).summaries
+    }
+
+    fun todayUsageSnapshot(packageNames: Collection<String>): CalculatedUsageSnapshot {
+        if (packageNames.isEmpty() || !hasUsageAccess()) return CalculatedUsageSnapshot()
         val now = System.currentTimeMillis()
         val today = LocalDate.now()
         val tracked = packageNames.toSet()
@@ -49,17 +53,17 @@ class DeviceUsageStatsRepository(context: Context) {
                 it.day == today &&
                     it.packageNames == tracked &&
                     nowElapsed - it.measuredAtElapsedMillis <= PROVIDER_CACHE_MS
-            }?.let { return it.summaries }
+            }?.let { return it.snapshot }
         }
         val startOfDay = today
             .atStartOfDay(ZoneId.systemDefault())
             .toInstant()
             .toEpochMilli()
         val manager = appContext.getSystemService(UsageStatsManager::class.java)
-            ?: return emptyMap()
+            ?: return CalculatedUsageSnapshot()
         val usageEvents = runCatching {
             manager.queryEvents((startOfDay - EVENT_LOOKBACK_MS).coerceAtLeast(0L), now)
-        }.getOrElse { return emptyMap() }
+        }.getOrElse { return CalculatedUsageSnapshot() }
         val transitions = buildList<UsageTimelineEvent> {
             val event = UsageEvents.Event()
             while (usageEvents.hasNextEvent()) {
@@ -88,16 +92,16 @@ class DeviceUsageStatsRepository(context: Context) {
                 }
             }
         }
-        val summaries = UsageEventDurationCalculator.calculateSummaries(
+        val snapshot = UsageEventDurationCalculator.calculateSnapshot(
             tracked,
             startOfDay,
             now,
             transitions,
         )
         synchronized(this) {
-            summariesCache = CachedSummaries(today, tracked, nowElapsed, summaries)
+            summariesCache = CachedSummaries(today, tracked, nowElapsed, snapshot)
         }
-        return summaries
+        return snapshot
     }
 
     fun todayDurations(packageNames: Collection<String>): Map<String, Long> =
@@ -121,6 +125,99 @@ class DeviceUsageStatsRepository(context: Context) {
         return duration
     }
 
+    /**
+     * One-shot recovery used when the accessibility service is recreated. This is not polled.
+     * A later accessibility window event remains authoritative.
+     */
+    fun currentForegroundPackage(): String? {
+        return currentForegroundSnapshot()?.packageName
+    }
+
+    fun currentForegroundSnapshot(): ForegroundUsageSnapshot? {
+        if (!hasUsageAccess()) return null
+        val manager = appContext.getSystemService(UsageStatsManager::class.java) ?: return null
+        val now = System.currentTimeMillis()
+        // Include the previous day so an Activity that stayed resumed across midnight can still
+        // be reconstructed after Android recreates the accessibility service.
+        val recoveryStart = LocalDate.now()
+            .minusDays(1L)
+            .atStartOfDay(ZoneId.systemDefault())
+            .toInstant()
+            .toEpochMilli()
+        val events = runCatching {
+            manager.queryEvents(recoveryStart.coerceAtLeast(0L), now)
+        }.getOrNull() ?: return null
+        var current: ForegroundUsageSnapshot? = null
+        var interactive = true
+        val event = UsageEvents.Event()
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            @Suppress("DEPRECATION")
+            when (event.eventType) {
+                UsageEvents.Event.MOVE_TO_FOREGROUND -> {
+                    current = event.packageName?.takeIf(String::isNotBlank)?.let {
+                        ForegroundUsageSnapshot(it, event.timeStamp)
+                    }
+                }
+                UsageEvents.Event.MOVE_TO_BACKGROUND -> {
+                    if (current?.packageName == event.packageName) current = null
+                }
+                else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    when (event.eventType) {
+                        UsageEvents.Event.SCREEN_INTERACTIVE -> interactive = true
+                        UsageEvents.Event.SCREEN_NON_INTERACTIVE -> {
+                            interactive = false
+                            current = null
+                        }
+                    }
+                }
+            }
+        }
+        return current?.takeIf { interactive }
+    }
+
+    /**
+     * A bounded one-shot query for reconciling a recent accessibility foreground signal.
+     * A null result means no recent transition was available and must not clear a valid signal.
+     */
+    fun recentForegroundSnapshot(
+        lookbackMillis: Long = RECENT_FOREGROUND_LOOKBACK_MS,
+    ): ForegroundUsageSnapshot? {
+        if (!hasUsageAccess()) return null
+        val manager = appContext.getSystemService(UsageStatsManager::class.java) ?: return null
+        val now = System.currentTimeMillis()
+        val start = (now - lookbackMillis.coerceIn(1_000L, EVENT_LOOKBACK_MS))
+            .coerceAtLeast(0L)
+        val events = runCatching { manager.queryEvents(start, now) }.getOrNull() ?: return null
+        var current: ForegroundUsageSnapshot? = null
+        var interactive = true
+        val event = UsageEvents.Event()
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            @Suppress("DEPRECATION")
+            when (event.eventType) {
+                UsageEvents.Event.MOVE_TO_FOREGROUND -> {
+                    current = event.packageName?.takeIf(String::isNotBlank)?.let {
+                        ForegroundUsageSnapshot(it, event.timeStamp)
+                    }
+                }
+                UsageEvents.Event.MOVE_TO_BACKGROUND -> {
+                    if (current?.packageName == event.packageName) current = null
+                }
+                else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    when (event.eventType) {
+                        UsageEvents.Event.SCREEN_INTERACTIVE -> interactive = true
+                        UsageEvents.Event.SCREEN_NON_INTERACTIVE -> {
+                            interactive = false
+                            current = null
+                        }
+                    }
+                }
+            }
+        }
+        return current?.takeIf { interactive }
+    }
+
     fun openUsageAccessSettings() {
         val packagePage = Intent(
             Settings.ACTION_USAGE_ACCESS_SETTINGS,
@@ -135,6 +232,7 @@ class DeviceUsageStatsRepository(context: Context) {
     private companion object {
         const val EVENT_LOOKBACK_MS = 24L * 60L * 60L * 1000L
         const val PROVIDER_CACHE_MS = 5_000L
+        const val RECENT_FOREGROUND_LOOKBACK_MS = 15_000L
     }
 
     private data class CachedDuration(
@@ -147,6 +245,11 @@ class DeviceUsageStatsRepository(context: Context) {
         val day: LocalDate,
         val packageNames: Set<String>,
         val measuredAtElapsedMillis: Long,
-        val summaries: Map<String, CalculatedUsageSummary>,
+        val snapshot: CalculatedUsageSnapshot,
     )
 }
+
+data class ForegroundUsageSnapshot(
+    val packageName: String,
+    val observedAtMillis: Long,
+)

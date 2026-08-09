@@ -21,6 +21,8 @@ data class XposedFrameworkSnapshot(
     val apiVersion: Int = 0,
     val scopePackages: Set<String> = emptySet(),
     val runningTargets: List<XposedRunningTarget> = emptyList(),
+    val capturedAtMillis: Long = 0L,
+    val stale: Boolean = false,
     val errorMessage: String? = null,
 )
 

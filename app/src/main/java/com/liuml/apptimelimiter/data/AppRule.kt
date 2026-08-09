@@ -16,6 +16,36 @@ enum class AppLanguageMode {
     ENGLISH,
 }
 
+enum class AppThemeMode {
+    SYSTEM,
+    LIGHT,
+    DARK,
+}
+
+enum class AppThemeColor {
+    GREEN,
+    BLUE,
+    PURPLE,
+}
+
+enum class NonRootCompatibilityMode {
+    STANDARD,
+    ENHANCED_EVENTS,
+}
+
+enum class ProtectionMode {
+    XPOSED,
+    ACCESSIBILITY,
+    ACCESSIBILITY_SHIZUKU,
+    ;
+
+    val usesNonRoot: Boolean
+        get() = this != XPOSED
+
+    val usesShizuku: Boolean
+        get() = this == ACCESSIBILITY_SHIZUKU
+}
+
 enum class LimitEnforcementMode {
     FORCE_EXIT,
     EXTERNAL_BREAK_PAGE,
@@ -91,6 +121,16 @@ data class GlobalSettings(
     val fullScreenExitWarningEnabled: Boolean = false,
     val exitWarningVibrationEnabled: Boolean = false,
     val languageMode: AppLanguageMode = AppLanguageMode.SYSTEM,
+    val themeMode: AppThemeMode = AppThemeMode.SYSTEM,
+    val themeColor: AppThemeColor = AppThemeColor.GREEN,
+    val timeQuotesEnabled: Boolean = true,
+    val builtInTimeQuotesEnabled: Boolean = true,
+    val customTimeQuotes: List<String> = emptyList(),
+    val automaticUpdateCheckEnabled: Boolean = true,
+    val protectionMode: ProtectionMode = ProtectionMode.XPOSED,
+    val protectionModeGeneration: Long = 1L,
+    val nonRootCompatibilityMode: NonRootCompatibilityMode =
+        NonRootCompatibilityMode.STANDARD,
     val extensionSeconds: Long = 5 * 60L,
     val diagnosticsEnabled: Boolean = true,
     val launcherIconHidden: Boolean = false,

@@ -2,4 +2,6 @@
 <resources>
     <string name="app_name">Time Stop</string>
     <string name="module_description">Limit foreground app usage and exit when a limit is reached</string>
+    <string name="non_root_accessibility_label">Time Stop basic protection</string>
+    <string name="non_root_accessibility_description">Detects only the current foreground app package and applies your time rules by returning Home or showing a restriction message. It does not read page text or input.</string>
 </resources>

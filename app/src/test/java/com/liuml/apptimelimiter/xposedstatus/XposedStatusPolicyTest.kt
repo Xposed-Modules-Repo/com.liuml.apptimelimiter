@@ -72,6 +72,22 @@ class XposedStatusPolicyTest {
     }
 
     @Test
+    fun staleScopeSnapshotIsUnknownInsteadOfMissingScope() {
+        val staleSnapshot = XposedFrameworkSnapshot(
+            connected = false,
+            apiVersion = 102,
+            scopePackages = setOf(PACKAGE),
+            capturedAtMillis = 1234L,
+            stale = true,
+            errorMessage = "service disconnected",
+        )
+        assertEquals(
+            ManagedAppHookState.COMPATIBILITY_PENDING,
+            XposedStatusPolicy.resolve(PACKAGE, staleSnapshot, 0, 20),
+        )
+    }
+
+    @Test
     fun processMatchingDoesNotConfuseSimilarPackageNames() {
         assertTrue(XposedStatusPolicy.processBelongsToPackage(PACKAGE, PACKAGE))
         assertTrue(XposedStatusPolicy.processBelongsToPackage("$PACKAGE:push", PACKAGE))

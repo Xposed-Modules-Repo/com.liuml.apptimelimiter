@@ -48,4 +48,20 @@ class RuleSnapshotSelectionPolicyTest {
             ),
         )
     }
+
+    @Test
+    fun `newer shared cooldown is not hidden by an older local cache`() {
+        assertTrue(
+            RuleSnapshotSelectionPolicy.shouldUseSharedCooldown(
+                sharedEndsAtMillis = 20_000L,
+                cachedEndsAtMillis = 10_000L,
+            ),
+        )
+        assertFalse(
+            RuleSnapshotSelectionPolicy.shouldUseSharedCooldown(
+                sharedEndsAtMillis = 10_000L,
+                cachedEndsAtMillis = 20_000L,
+            ),
+        )
+    }
 }

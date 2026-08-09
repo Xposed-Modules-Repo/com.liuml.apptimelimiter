@@ -17,6 +17,10 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import com.liuml.apptimelimiter.data.AppThemeColor
+import com.liuml.apptimelimiter.data.AppThemeMode
+import com.liuml.apptimelimiter.ui.TargetUiColors
+import com.liuml.apptimelimiter.ui.TargetUiPalette
 import kotlin.math.max
 
 internal enum class WarningBannerKind {
@@ -56,10 +60,16 @@ internal class TopWarningBanner private constructor(
             remainingMillis: Long,
             maxProgressMillis: Long,
             fullScreen: Boolean = false,
+            themeMode: AppThemeMode = AppThemeMode.SYSTEM,
+            themeColor: AppThemeColor = AppThemeColor.GREEN,
+            quote: String? = null,
             actionLabel: String? = null,
             onAction: (() -> Unit)? = null,
+            exitLabel: String? = null,
+            onExit: (() -> Unit)? = null,
         ): TopWarningBanner {
             val decor = activity.window.decorView as ViewGroup
+            val colors = TargetUiPalette.resolve(activity, themeMode, themeColor)
             val density = activity.resources.displayMetrics.density
             fun dp(value: Int): Int = (value * density + 0.5f).toInt()
 
@@ -71,10 +81,10 @@ internal class TopWarningBanner private constructor(
                     dp(if (fullScreen) FULL_SCREEN_PADDING_DP else 8),
                 )
                 background = roundedBackground(
-                    color = BANNER_BACKGROUND,
+                    color = if (fullScreen) colors.background else colors.primaryContainer,
                     radius = dp(if (fullScreen) 0 else 20).toFloat(),
                     strokeWidth = if (fullScreen) 0 else dp(1),
-                    strokeColor = if (fullScreen) Color.TRANSPARENT else BANNER_BORDER,
+                    strokeColor = if (fullScreen) Color.TRANSPARENT else colors.outline,
                 )
                 elevation = if (fullScreen) 0f else dp(12).toFloat()
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
@@ -101,14 +111,14 @@ internal class TopWarningBanner private constructor(
                 isFocusable = false
             }
             val titleView = TextView(activity).apply {
-                setTextColor(Color.WHITE)
+                setTextColor(if (fullScreen) colors.textPrimary else colors.onPrimaryContainer)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, if (fullScreen) 28f else 15f)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 maxLines = if (fullScreen) 2 else 1
                 gravity = if (fullScreen) Gravity.CENTER else Gravity.NO_GRAVITY
             }
             val messageView = TextView(activity).apply {
-                setTextColor(BANNER_SECONDARY_TEXT)
+                setTextColor(colors.textSecondary)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, if (fullScreen) 16f else 12.5f)
                 maxLines = if (fullScreen) 3 else 2
                 gravity = if (fullScreen) Gravity.CENTER else Gravity.NO_GRAVITY
@@ -128,6 +138,28 @@ internal class TopWarningBanner private constructor(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                 ),
             )
+            if (fullScreen && !quote.isNullOrBlank()) {
+                textColumn.addView(
+                    TextView(activity).apply {
+                        text = "“$quote”"
+                        setTextColor(colors.textSecondary)
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                        gravity = Gravity.CENTER
+                        maxLines = 2
+                        setPadding(dp(14), dp(9), dp(14), dp(9))
+                        background = roundedBackground(
+                            color = colors.surfaceContainer,
+                            radius = dp(16).toFloat(),
+                            strokeWidth = 0,
+                            strokeColor = Color.TRANSPARENT,
+                        )
+                    },
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ).apply { topMargin = dp(18) },
+                )
+            }
             contentRow.addView(
                 textColumn,
                 if (fullScreen) {
@@ -144,15 +176,35 @@ internal class TopWarningBanner private constructor(
                 },
             )
 
-            if (!fullScreen && actionLabel != null && onAction != null) {
+            if (!fullScreen && (exitLabel != null || actionLabel != null)) {
+                val actionColumn = LinearLayout(activity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                if (exitLabel != null && onExit != null) {
+                    actionColumn.addView(
+                        actionTextView(activity, exitLabel, prominent = false, colors = colors, dp = ::dp).apply {
+                            setOnClickListener { onExit() }
+                        },
+                    )
+                }
+                if (actionLabel != null && onAction != null) {
+                    actionColumn.addView(
+                        actionTextView(activity, actionLabel, prominent = true, colors = colors, dp = ::dp).apply {
+                            setOnClickListener { onAction() }
+                        },
+                        LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ).apply { marginStart = dp(8) },
+                    )
+                }
                 contentRow.addView(
-                    actionTextView(activity, actionLabel, prominent = true, dp = ::dp).apply {
-                        setOnClickListener { onAction() }
-                    },
+                    actionColumn,
                     LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ).apply { marginStart = dp(12) },
+                    ).apply { marginStart = dp(10) },
                 )
             }
 
@@ -163,8 +215,8 @@ internal class TopWarningBanner private constructor(
             ).apply {
                 isIndeterminate = false
                 max = maxProgressMillis.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
-                progressTintList = ColorStateList.valueOf(Color.WHITE)
-                progressBackgroundTintList = ColorStateList.valueOf(PROGRESS_BACKGROUND)
+                progressTintList = ColorStateList.valueOf(colors.primary)
+                progressBackgroundTintList = ColorStateList.valueOf(colors.outline)
                 isClickable = false
                 isFocusable = false
             }
@@ -199,7 +251,7 @@ internal class TopWarningBanner private constructor(
                     setOnClickListener { onAction() }
                 }
                 actionHitTarget.addView(
-                    actionTextView(activity, actionLabel, prominent = false, dp = ::dp),
+                    actionTextView(activity, actionLabel, prominent = false, colors = colors, dp = ::dp),
                     FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT,
                         dp(FULL_SCREEN_ACTION_VISUAL_HEIGHT_DP),
@@ -212,6 +264,30 @@ internal class TopWarningBanner private constructor(
                         ViewGroup.LayoutParams.WRAP_CONTENT,
                         dp(FULL_SCREEN_ACTION_TOUCH_DP),
                         Gravity.TOP or Gravity.END,
+                    ),
+                )
+            }
+            if (fullScreen && exitLabel != null && onExit != null) {
+                val exitHitTarget = FrameLayout(activity).apply {
+                    isClickable = true
+                    isFocusable = true
+                    contentDescription = exitLabel
+                    setOnClickListener { onExit() }
+                }
+                exitHitTarget.addView(
+                    actionTextView(activity, exitLabel, prominent = false, colors = colors, dp = ::dp),
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        dp(FULL_SCREEN_ACTION_VISUAL_HEIGHT_DP),
+                        Gravity.CENTER,
+                    ),
+                )
+                root.addView(
+                    exitHitTarget,
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        dp(FULL_SCREEN_ACTION_TOUCH_DP),
+                        Gravity.TOP or Gravity.START,
                     ),
                 )
             }
@@ -277,20 +353,21 @@ internal class TopWarningBanner private constructor(
             activity: Activity,
             label: String,
             prominent: Boolean,
+            colors: TargetUiColors,
             dp: (Int) -> Int,
         ) = TextView(activity).apply {
             text = label
-            setTextColor(if (prominent) Color.BLACK else Color.WHITE)
+            setTextColor(if (prominent) colors.onPrimary else colors.onPrimaryContainer)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, if (prominent) 13f else 12f)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             gravity = Gravity.CENTER
             minWidth = dp(if (prominent) 0 else 56)
             setPadding(dp(if (prominent) 13 else 10), 0, dp(if (prominent) 13 else 10), 0)
             background = roundedBackground(
-                color = if (prominent) Color.WHITE else FULL_SCREEN_ACTION_BACKGROUND,
+                color = if (prominent) colors.primary else colors.primaryContainer,
                 radius = dp(if (prominent) 14 else 18).toFloat(),
                 strokeWidth = if (prominent) 0 else dp(1),
-                strokeColor = if (prominent) Color.TRANSPARENT else FULL_SCREEN_ACTION_BORDER,
+                strokeColor = if (prominent) Color.TRANSPARENT else colors.outline,
             )
             isClickable = false
             isFocusable = false
@@ -419,11 +496,5 @@ internal class TopWarningBanner private constructor(
         private const val FULL_SCREEN_PADDING_DP = 20
         private const val FULL_SCREEN_ACTION_VISUAL_HEIGHT_DP = 36
         private const val FULL_SCREEN_ACTION_TOUCH_DP = 48
-        private const val BANNER_BACKGROUND = 0xF20A0A0A.toInt()
-        private const val BANNER_BORDER = 0x3DFFFFFF
-        private const val BANNER_SECONDARY_TEXT = 0xC7FFFFFF.toInt()
-        private const val PROGRESS_BACKGROUND = 0x33FFFFFF
-        private const val FULL_SCREEN_ACTION_BACKGROUND = 0x66000000
-        private const val FULL_SCREEN_ACTION_BORDER = 0x66FFFFFF
     }
 }

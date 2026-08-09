@@ -9,8 +9,13 @@ import com.liuml.apptimelimiter.core.SharedCooldownPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownRecord
 import com.liuml.apptimelimiter.core.CooldownPolicy
 import com.liuml.apptimelimiter.core.LimitEnforcementPolicy
+import com.liuml.apptimelimiter.core.MonotonicVersionPolicy
+import com.liuml.apptimelimiter.core.PackageNamePolicy
+import com.liuml.apptimelimiter.core.ProtectionModePolicy
 import com.liuml.apptimelimiter.core.RuleStorageBootstrapAction
 import com.liuml.apptimelimiter.core.RuleStorageBootstrapPolicy
+import com.liuml.apptimelimiter.core.TimeQuotePolicy
+import com.liuml.apptimelimiter.core.ThemeColorPolicy
 import com.liuml.apptimelimiter.ipc.RuleContract
 import com.liuml.apptimelimiter.core.GroupMembershipPolicy
 import java.io.File
@@ -22,60 +27,105 @@ class RuleRepository(context: Context) {
         STORAGE_LIFECYCLE_PREFS_NAME,
         Context.MODE_PRIVATE,
     )
-    private val prefs = openPreferences().also(::prepareRuleStorage)
+    private val sharedStore = openSharedPreferences()
+    private val sharedPrefs = sharedStore.preferences
+    private val primaryPrefs = appContext.getSharedPreferences(
+        PRIMARY_PREFS_NAME,
+        Context.MODE_PRIVATE,
+    )
+    private val prefs = prepareRuleStorage()
 
     @SuppressLint("WorldReadableFiles")
-    private fun openPreferences(): SharedPreferences = try {
+    private fun openSharedPreferences(): SharedPreferenceStore = try {
         // LSPosed API 93+ redirects this to its protected cross-process preference area.
         // Hooked apps can then read rules with XSharedPreferences even if this app is stopped.
-        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_WORLD_READABLE)
+        SharedPreferenceStore(
+            preferences = appContext.getSharedPreferences(
+                PREFS_NAME,
+                Context.MODE_WORLD_READABLE,
+            ),
+            frameworkBacked = true,
+        )
     } catch (_: SecurityException) {
         // Keeps the UI usable on unsupported frameworks; the ContentProvider remains available.
-        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        SharedPreferenceStore(
+            preferences = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE),
+            frameworkBacked = false,
+        )
     }
 
-    private fun prepareRuleStorage(sharedPreferences: SharedPreferences) {
+    private fun prepareRuleStorage(): SharedPreferences {
         synchronized(STORAGE_LIFECYCLE_LOCK) {
             val privateMarkerPresent = lifecyclePrefs.getBoolean(
                 KEY_PRIVATE_STORAGE_INITIALIZED,
                 false,
             )
-            val sharedMarkerPresent = sharedPreferences.getBoolean(
-                KEY_SHARED_STORAGE_INITIALIZED,
+            val sharedMarkerPresent = runCatching {
+                sharedPrefs.getBoolean(
+                    KEY_SHARED_STORAGE_INITIALIZED,
+                    false,
+                )
+            }.getOrDefault(false)
+            val primaryMarkerPresent = primaryPrefs.getBoolean(
+                KEY_PRIMARY_STORAGE_INITIALIZED,
                 false,
             )
+            if (
+                !primaryMarkerPresent &&
+                privateMarkerPresent &&
+                !sharedStore.frameworkBacked
+            ) {
+                // An existing legacy install may have its real rule file in LSPosed's protected
+                // mirror. Disabling the module makes MODE_WORLD_READABLE fall back to a different
+                // private file. Keep that file usable for this process, but do not promote or
+                // mirror it until LSPosed is available again, otherwise an empty fallback could
+                // overwrite the user's real rules.
+                return sharedPrefs
+            }
             val action = RuleStorageBootstrapPolicy.action(
                 privateMarkerPresent = privateMarkerPresent,
                 sharedMarkerPresent = sharedMarkerPresent,
+                primaryMarkerPresent = primaryMarkerPresent,
             )
-            if (action == RuleStorageBootstrapAction.KEEP) return
-            val previousGeneration = sharedPreferences.getLong(KEY_RULESET_GENERATION, 0L)
-            val nextGeneration = maxOf(
-                System.currentTimeMillis(),
-                if (previousGeneration == Long.MAX_VALUE) {
-                    Long.MAX_VALUE
-                } else {
-                    previousGeneration + 1L
-                },
-            )
-            val editor = sharedPreferences.edit()
-            if (action == RuleStorageBootstrapAction.RESET_AFTER_DATA_CLEAR) {
-                editor.clear()
+            if (action != RuleStorageBootstrapAction.KEEP) {
+                val previousGeneration = maxOf(
+                    primaryPrefs.getLong(KEY_RULESET_GENERATION, 0L),
+                    runCatching {
+                        sharedPrefs.getLong(KEY_RULESET_GENERATION, 0L)
+                    }.getOrDefault(0L),
+                )
+                val nextGeneration = MonotonicVersionPolicy.next(
+                    previousVersion = previousGeneration,
+                    wallClockMillis = System.currentTimeMillis(),
+                )
+                val editor = primaryPrefs.edit().clear()
+                if (action == RuleStorageBootstrapAction.ADOPT_EXISTING) {
+                    runCatching { copyPreferences(sharedPrefs, editor) }
+                }
+                check(
+                    editor
+                        .putBoolean(KEY_PRIMARY_STORAGE_INITIALIZED, true)
+                        .putBoolean(KEY_SHARED_STORAGE_INITIALIZED, true)
+                        .putLong(KEY_RULESET_GENERATION, nextGeneration)
+                        .commit(),
+                ) {
+                    "Failed to initialize the private rule store"
+                }
             }
-            val sharedPersisted = editor
-                .putBoolean(KEY_SHARED_STORAGE_INITIALIZED, true)
-                .putLong(KEY_RULESET_GENERATION, nextGeneration)
-                .commit()
-            if (sharedPersisted) {
+            check(
                 lifecyclePrefs.edit()
                     .putBoolean(KEY_PRIVATE_STORAGE_INITIALIZED, true)
-                    .commit()
-                makePreferencesReadable()
+                    .commit(),
+            ) {
+                "Failed to persist the private rule lifecycle marker"
             }
+            syncSharedMirrorLocked(primaryPrefs)
+            return primaryPrefs
         }
     }
 
     fun getRule(packageName: String): AppRule {
+        if (!PackageNamePolicy.isValid(packageName)) return AppRule(packageName = packageName)
         val prefix = prefix(packageName)
         val legacyEnabled = prefs.getBoolean("${prefix}enabled", false)
         val legacyLimitSeconds = prefs.getLong("${prefix}limit_seconds", DEFAULT_LIMIT_SECONDS)
@@ -136,6 +186,10 @@ class RuleRepository(context: Context) {
     }
 
     fun save(rule: AppRule): Boolean {
+        if (
+            !PackageNamePolicy.isValid(rule.packageName) ||
+            rule.packageName == appContext.packageName
+        ) return false
         val scheduleWindows = rule.scheduleWindows
             .filter(ScheduleWindow::isValid)
             .take(ScheduleCodec.MAX_WINDOWS)
@@ -152,7 +206,10 @@ class RuleRepository(context: Context) {
         packages += rule.packageName
         val prefix = prefix(rule.packageName)
         val previousVersion = prefs.getLong("${prefix}version", 0L)
-        val nextVersion = maxOf(System.currentTimeMillis(), previousVersion + 1L)
+        val nextVersion = MonotonicVersionPolicy.next(
+            previousVersion = previousVersion,
+            wallClockMillis = System.currentTimeMillis(),
+        )
         val persisted = prefs.edit()
             .putStringSet(KEY_PACKAGES, packages)
             .putBoolean(
@@ -201,7 +258,12 @@ class RuleRepository(context: Context) {
     }
 
     fun configuredPackages(): Set<String> =
-        prefs.getStringSet(KEY_PACKAGES, emptySet()).orEmpty().toSet()
+        prefs.getStringSet(KEY_PACKAGES, emptySet())
+            .orEmpty()
+            .asSequence()
+            .filter(PackageNamePolicy::isValid)
+            .filterNot { it == appContext.packageName }
+            .toSet()
 
     fun rulesetGeneration(): Long = prefs.getLong(KEY_RULESET_GENERATION, 0L)
 
@@ -255,7 +317,8 @@ class RuleRepository(context: Context) {
             ).coerceIn(MIN_COOLDOWN_SECONDS, MAX_COOLDOWN_SECONDS),
             packageNames = prefs.getStringSet("${prefix}packages", emptySet())
                 .orEmpty()
-                .filter(String::isNotBlank)
+                .filter(PackageNamePolicy::isValid)
+                .filterNot { it == appContext.packageName }
                 .take(MAX_GROUP_MEMBERS)
                 .toSet(),
             version = prefs.getLong("${prefix}version", 0L),
@@ -263,6 +326,7 @@ class RuleRepository(context: Context) {
     }
 
     fun groupForPackage(packageName: String): AppGroup? {
+        if (!PackageNamePolicy.isValid(packageName)) return null
         val groupId = prefs.getString("$KEY_PACKAGE_GROUP_PREFIX$packageName", null)
             ?: return null
         return getGroup(groupId)?.takeIf { packageName in it.packageNames }
@@ -276,11 +340,14 @@ class RuleRepository(context: Context) {
         if (groupId.isBlank() || groupId.length > MAX_GROUP_ID_LENGTH ||
             groupId.any { !it.isLetterOrDigit() && it != '-' && it != '_' }
         ) return false
+        if (
+            group.packageNames.size > MAX_GROUP_MEMBERS ||
+            group.packageNames.any {
+                !PackageNamePolicy.isValid(it) || it == appContext.packageName
+            }
+        ) return false
         val members = group.packageNames
             .asSequence()
-            .filter(String::isNotBlank)
-            .filterNot { it == appContext.packageName }
-            .take(MAX_GROUP_MEMBERS)
             .toSet()
         val hasConflict = GroupMembershipPolicy.hasConflict(
             targetGroupId = groupId,
@@ -310,7 +377,10 @@ class RuleRepository(context: Context) {
             )
         ) return false
         val previousVersion = prefs.getLong("${prefix}version", 0L)
-        val nextVersion = maxOf(System.currentTimeMillis(), previousVersion + 1L)
+        val nextVersion = MonotonicVersionPolicy.next(
+            previousVersion = previousVersion,
+            wallClockMillis = System.currentTimeMillis(),
+        )
         val groupIds = prefs.getStringSet(KEY_GROUP_IDS, emptySet()).orEmpty().toMutableSet()
         if (groupId !in groupIds && groupIds.size >= MAX_GROUPS) return false
         groupIds.add(groupId)
@@ -448,6 +518,10 @@ class RuleRepository(context: Context) {
         val prefix = groupPrefix(groupId)
         val groupIds = prefs.getStringSet(KEY_GROUP_IDS, emptySet()).orEmpty().toMutableSet()
             .apply { remove(groupId) }
+        val removalVersion = MonotonicVersionPolicy.next(
+            previousVersion = existing.version,
+            wallClockMillis = System.currentTimeMillis(),
+        )
         val editor = prefs.edit().putStringSet(KEY_GROUP_IDS, groupIds)
         existing.packageNames.forEach { packageName ->
             if (prefs.getString("$KEY_PACKAGE_GROUP_PREFIX$packageName", null) == groupId) {
@@ -455,7 +529,7 @@ class RuleRepository(context: Context) {
             }
             editor.putLong(
                 "$KEY_PACKAGE_GROUP_VERSION_PREFIX$packageName",
-                maxOf(System.currentTimeMillis(), existing.version + 1L),
+                removalVersion,
             )
         }
         prefs.all.keys.filter { it.startsWith(prefix) }.forEach(editor::remove)
@@ -464,7 +538,9 @@ class RuleRepository(context: Context) {
         return persisted
     }
 
-    fun getGlobalSettings(): GlobalSettings = GlobalSettings(
+    fun getGlobalSettings(): GlobalSettings {
+        val protectionMode = readProtectionMode()
+        return GlobalSettings(
         exitWarningEnabled = prefs.getBoolean(KEY_EXIT_WARNING_ENABLED, true),
         fullScreenExitWarningEnabled = prefs.getBoolean(
             KEY_FULL_SCREEN_EXIT_WARNING_ENABLED,
@@ -477,6 +553,30 @@ class RuleRepository(context: Context) {
         languageMode = prefs.getString(KEY_LANGUAGE_MODE, AppLanguageMode.SYSTEM.name)
             ?.let { runCatching { AppLanguageMode.valueOf(it) }.getOrNull() }
             ?: AppLanguageMode.SYSTEM,
+        themeMode = prefs.getString(KEY_THEME_MODE, AppThemeMode.SYSTEM.name)
+            ?.let { runCatching { AppThemeMode.valueOf(it) }.getOrNull() }
+            ?: AppThemeMode.SYSTEM,
+        themeColor = ThemeColorPolicy.parse(prefs.getString(KEY_THEME_COLOR, null)),
+        timeQuotesEnabled = prefs.getBoolean(KEY_TIME_QUOTES_ENABLED, true),
+        builtInTimeQuotesEnabled = prefs.getBoolean(KEY_BUILT_IN_TIME_QUOTES_ENABLED, true),
+        customTimeQuotes = TimeQuotePolicy.parseCustomQuotes(
+            prefs.getString(KEY_CUSTOM_TIME_QUOTES, "").orEmpty(),
+        ),
+        automaticUpdateCheckEnabled = prefs.getBoolean(
+            KEY_AUTOMATIC_UPDATE_CHECK_ENABLED,
+            true,
+        ),
+        protectionMode = protectionMode,
+        protectionModeGeneration = prefs.getLong(
+            KEY_PROTECTION_MODE_GENERATION,
+            DEFAULT_PROTECTION_MODE_GENERATION,
+        ).coerceAtLeast(DEFAULT_PROTECTION_MODE_GENERATION),
+        nonRootCompatibilityMode = prefs.getString(
+            KEY_NON_ROOT_COMPATIBILITY_MODE,
+            NonRootCompatibilityMode.STANDARD.name,
+        )?.let {
+            runCatching { NonRootCompatibilityMode.valueOf(it) }.getOrNull()
+        } ?: NonRootCompatibilityMode.STANDARD,
         extensionSeconds = prefs.getLong(KEY_EXTENSION_SECONDS, DEFAULT_EXTENSION_SECONDS)
             .coerceIn(MIN_EXTENSION_SECONDS, MAX_EXTENSION_SECONDS),
         diagnosticsEnabled = prefs.getBoolean(KEY_DIAGNOSTICS_ENABLED, true),
@@ -485,9 +585,21 @@ class RuleRepository(context: Context) {
         limitEnforcementMode = LimitEnforcementPolicy.parseMode(
             prefs.getString(KEY_LIMIT_ENFORCEMENT_MODE, null),
         ),
-    )
+        )
+    }
 
     fun saveGlobalSettings(settings: GlobalSettings): Boolean {
+        val previousMode = readProtectionMode()
+        val previousGeneration = prefs.getLong(
+            KEY_PROTECTION_MODE_GENERATION,
+            DEFAULT_PROTECTION_MODE_GENERATION,
+        ).coerceAtLeast(DEFAULT_PROTECTION_MODE_GENERATION)
+        val protectionModeGeneration = ProtectionModePolicy.nextGeneration(
+            previousMode = previousMode,
+            requestedMode = settings.protectionMode,
+            previousGeneration = maxOf(previousGeneration, settings.protectionModeGeneration),
+            wallClockMillis = System.currentTimeMillis(),
+        )
         val persisted = prefs.edit()
             .putBoolean(KEY_EXIT_WARNING_ENABLED, settings.exitWarningEnabled)
             .putBoolean(
@@ -499,6 +611,34 @@ class RuleRepository(context: Context) {
                 settings.exitWarningVibrationEnabled,
             )
             .putString(KEY_LANGUAGE_MODE, settings.languageMode.name)
+            .putString(KEY_THEME_MODE, settings.themeMode.name)
+            .putString(KEY_THEME_COLOR, settings.themeColor.name)
+            .putBoolean(KEY_TIME_QUOTES_ENABLED, settings.timeQuotesEnabled)
+            .putBoolean(
+                KEY_BUILT_IN_TIME_QUOTES_ENABLED,
+                settings.builtInTimeQuotesEnabled,
+            )
+            .putString(
+                KEY_CUSTOM_TIME_QUOTES,
+                TimeQuotePolicy.encode(settings.customTimeQuotes),
+            )
+            .putBoolean(
+                KEY_AUTOMATIC_UPDATE_CHECK_ENABLED,
+                settings.automaticUpdateCheckEnabled,
+            )
+            .putString(KEY_PROTECTION_MODE, settings.protectionMode.name)
+            .putLong(KEY_PROTECTION_MODE_GENERATION, protectionModeGeneration)
+            // Keep the previous booleans mirrored for downgrade compatibility. The enum remains
+            // authoritative and prevents contradictory combinations in current code.
+            .putBoolean(KEY_NON_ROOT_PROTECTION_ENABLED, settings.protectionMode.usesNonRoot)
+            .putString(
+                KEY_NON_ROOT_COMPATIBILITY_MODE,
+                settings.nonRootCompatibilityMode.name,
+            )
+            .putBoolean(
+                KEY_SHIZUKU_ENHANCEMENT_ENABLED,
+                settings.protectionMode.usesShizuku,
+            )
             .putLong(
                 KEY_EXTENSION_SECONDS,
                 settings.extensionSeconds.coerceIn(MIN_EXTENSION_SECONDS, MAX_EXTENSION_SECONDS),
@@ -512,6 +652,12 @@ class RuleRepository(context: Context) {
         return persisted
     }
 
+    private fun readProtectionMode(): ProtectionMode = ProtectionModePolicy.parse(
+        storedValue = prefs.getString(KEY_PROTECTION_MODE, null),
+        legacyNonRootEnabled = prefs.getBoolean(KEY_NON_ROOT_PROTECTION_ENABLED, false),
+        legacyShizukuEnabled = prefs.getBoolean(KEY_SHIZUKU_ENHANCEMENT_ENABLED, false),
+    )
+
     fun grantRuleAccess(packageName: String) {
         runCatching {
             appContext.grantUriPermission(
@@ -523,6 +669,32 @@ class RuleRepository(context: Context) {
     }
 
     private fun makePreferencesReadable() {
+        synchronized(STORAGE_LIFECYCLE_LOCK) {
+            if (prefs === primaryPrefs) {
+                syncSharedMirrorLocked(primaryPrefs)
+            } else {
+                makeLegacyPreferencesReadable()
+            }
+        }
+    }
+
+    private fun syncSharedMirrorLocked(source: SharedPreferences) {
+        val primarySnapshot = source.all
+        val sharedSnapshot = runCatching { sharedPrefs.all }.getOrNull()
+        if (sharedSnapshot == primarySnapshot) {
+            makeLegacyPreferencesReadable()
+            return
+        }
+        val synchronized = runCatching {
+            val editor = sharedPrefs.edit().clear()
+            copyPreferences(primarySnapshot, editor)
+            editor.commit()
+        }.getOrDefault(false)
+        if (!synchronized) return
+        makeLegacyPreferencesReadable()
+    }
+
+    private fun makeLegacyPreferencesReadable() {
         // Legacy Xposed's XSharedPreferences reads this file from hooked processes.
         // Re-apply permissions after every commit because Android may replace the XML file.
         val dataDir = File(appContext.applicationInfo.dataDir)
@@ -532,6 +704,30 @@ class RuleRepository(context: Context) {
         sharedPrefsDir.setReadable(true, false)
         sharedPrefsDir.setExecutable(true, false)
         prefsFile.setReadable(true, false)
+    }
+
+    private fun copyPreferences(
+        source: SharedPreferences,
+        editor: SharedPreferences.Editor,
+    ) = copyPreferences(source.all, editor)
+
+    private fun copyPreferences(
+        values: Map<String, *>,
+        editor: SharedPreferences.Editor,
+    ) {
+        values.forEach { (key, value) ->
+            when (value) {
+                is Boolean -> editor.putBoolean(key, value)
+                is Float -> editor.putFloat(key, value)
+                is Int -> editor.putInt(key, value)
+                is Long -> editor.putLong(key, value)
+                is String -> editor.putString(key, value)
+                is Set<*> -> editor.putStringSet(
+                    key,
+                    value.filterIsInstance<String>().toSet(),
+                )
+            }
+        }
     }
 
     private fun prefix(packageName: String) = "rule.$packageName."
@@ -553,6 +749,8 @@ class RuleRepository(context: Context) {
         private val STORAGE_LIFECYCLE_LOCK = Any()
         private const val STORAGE_LIFECYCLE_PREFS_NAME = "storage_lifecycle"
         private const val KEY_PRIVATE_STORAGE_INITIALIZED = "initialized"
+        private const val PRIMARY_PREFS_NAME = "rules_manager"
+        private const val KEY_PRIMARY_STORAGE_INITIALIZED = "storage.primary_initialized"
         const val KEY_SHARED_STORAGE_INITIALIZED = "storage.initialized"
         const val KEY_RULESET_GENERATION = "storage.ruleset_generation"
         const val PREFS_NAME = "rules"
@@ -575,6 +773,21 @@ class RuleRepository(context: Context) {
         const val KEY_EXIT_WARNING_VIBRATION_ENABLED =
             "global.exit_warning_vibration_enabled"
         const val KEY_LANGUAGE_MODE = "global.language_mode"
+        const val KEY_THEME_MODE = "global.theme_mode"
+        const val KEY_THEME_COLOR = "global.theme_color"
+        const val KEY_TIME_QUOTES_ENABLED = "global.time_quotes_enabled"
+        const val KEY_BUILT_IN_TIME_QUOTES_ENABLED = "global.built_in_time_quotes_enabled"
+        const val KEY_CUSTOM_TIME_QUOTES = "global.custom_time_quotes"
+        const val KEY_AUTOMATIC_UPDATE_CHECK_ENABLED =
+            "global.automatic_update_check_enabled"
+        const val KEY_PROTECTION_MODE = "global.protection_mode"
+        const val KEY_PROTECTION_MODE_GENERATION = "global.protection_mode_generation"
+        const val KEY_NON_ROOT_PROTECTION_ENABLED =
+            "global.non_root_protection_enabled"
+        const val KEY_NON_ROOT_COMPATIBILITY_MODE =
+            "global.non_root_compatibility_mode"
+        const val KEY_SHIZUKU_ENHANCEMENT_ENABLED =
+            "global.shizuku_enhancement_enabled"
         const val KEY_EXTENSION_SECONDS = "global.extension_seconds"
         const val KEY_DIAGNOSTICS_ENABLED = "global.diagnostics_enabled"
         const val KEY_LAUNCHER_ICON_HIDDEN = "global.launcher_icon_hidden"
@@ -586,5 +799,11 @@ class RuleRepository(context: Context) {
         const val MAX_COOLDOWN_SECONDS = 24L * 60L * 60L
         const val MIN_EXTENSION_SECONDS = 60L
         const val MAX_EXTENSION_SECONDS = 60L * 60L
+        const val DEFAULT_PROTECTION_MODE_GENERATION = 1L
     }
+
+    private data class SharedPreferenceStore(
+        val preferences: SharedPreferences,
+        val frameworkBacked: Boolean,
+    )
 }

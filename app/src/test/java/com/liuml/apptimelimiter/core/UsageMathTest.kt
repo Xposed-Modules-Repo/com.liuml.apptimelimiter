@@ -17,6 +17,15 @@ class UsageMathTest {
     }
 
     @Test
+    fun `remaining time cannot wrap around on saturated counters`() {
+        assertEquals(
+            0L,
+            UsageMath.remainingMillis(10_000L, Long.MAX_VALUE, Long.MAX_VALUE),
+        )
+        assertEquals(10_000L, UsageMath.remainingMillis(10_000L, -1L, -1L))
+    }
+
+    @Test
     fun `limit is reached exactly at boundary`() {
         assertFalse(UsageMath.isLimitReached(10_000L, 7_000L, 2_999L))
         assertTrue(UsageMath.isLimitReached(10_000L, 7_000L, 3_000L))
@@ -32,6 +41,21 @@ class UsageMathTest {
     fun `each extension is added but capped`() {
         assertEquals(600_000L, UsageMath.addExtensionMillis(300_000L, 300_000L, 900_000L))
         assertEquals(900_000L, UsageMath.addExtensionMillis(800_000L, 300_000L, 900_000L))
+        assertEquals(
+            Long.MAX_VALUE,
+            UsageMath.addExtensionMillis(
+                Long.MAX_VALUE - 5L,
+                10L,
+                Long.MAX_VALUE,
+            ),
+        )
+    }
+
+    @Test
+    fun `duration reporting covers personal statistics and shared daily quotas`() {
+        assertTrue(UsageReportingPolicy.shouldReportDuration(true, false))
+        assertTrue(UsageReportingPolicy.shouldReportDuration(false, true))
+        assertFalse(UsageReportingPolicy.shouldReportDuration(false, false))
     }
 
     @Test

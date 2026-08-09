@@ -5,10 +5,12 @@ import android.net.Uri
 object RuleContract {
     const val AUTHORITY = "com.liuml.apptimelimiter.rules"
     val CONTENT_URI: Uri = Uri.parse("content://$AUTHORITY")
+    val HOOK_STATUS_URI: Uri = Uri.withAppendedPath(CONTENT_URI, "hook-status")
 
     const val METHOD_GET_RULE = "get_rule"
     const val METHOD_APPEND_LOG = "append_log"
     const val METHOD_RECORD_USAGE = "record_usage"
+    const val METHOD_REPORT_HOOK_STATUS = "report_hook_status"
     const val METHOD_VIBRATE_WARNING = "vibrate_warning"
     const val METHOD_CLAIM_GROUP_COOLDOWN = "claim_group_cooldown"
     const val METHOD_CREATE_BREAK_SESSION = "create_break_session"
@@ -34,10 +36,18 @@ object RuleContract {
     const val KEY_FULL_SCREEN_EXIT_WARNING_ENABLED = "full_screen_exit_warning_enabled"
     const val KEY_EXIT_WARNING_VIBRATION_ENABLED = "exit_warning_vibration_enabled"
     const val KEY_LANGUAGE_MODE = "language_mode"
+    const val KEY_THEME_MODE = "theme_mode"
+    const val KEY_THEME_COLOR = "theme_color"
+    const val KEY_TIME_QUOTES_ENABLED = "time_quotes_enabled"
+    const val KEY_BUILT_IN_TIME_QUOTES_ENABLED = "built_in_time_quotes_enabled"
+    const val KEY_CUSTOM_TIME_QUOTES = "custom_time_quotes"
     const val KEY_EXTENSION_SECONDS = "extension_seconds"
     const val KEY_DIAGNOSTICS_ENABLED = "diagnostics_enabled"
     const val KEY_USAGE_STATS_ENABLED = "usage_stats_enabled"
     const val KEY_LIMIT_ENFORCEMENT_MODE = "limit_enforcement_mode"
+    const val KEY_PROTECTION_MODE = "protection_mode"
+    const val KEY_PROTECTION_MODE_GENERATION = "protection_mode_generation"
+    const val KEY_HOOK_MODE_GENERATION = "hook_mode_generation"
     const val KEY_SYSTEM_TODAY_USED_MS = "system_today_used_ms"
     const val KEY_SYSTEM_USAGE_MEASURED_AT_ELAPSED_MS =
         "system_usage_measured_at_elapsed_ms"
@@ -68,6 +78,8 @@ object RuleContract {
     const val KEY_INCIDENT_OCCURRED_AT_MS = "incident_occurred_at_ms"
     const val KEY_BREAK_SESSION_TOKEN = "break_session_token"
     const val KEY_BREAK_SESSION_EXPIRES_AT_MS = "break_session_expires_at_ms"
+    const val KEY_BREAK_SESSION_NON_ROOT = "break_session_non_root"
+    const val KEY_REQUEST_NON_ROOT_RULE_SNAPSHOT = "request_non_root_rule_snapshot"
     const val KEY_DURATION_MS = "duration_ms"
     const val KEY_DAY_TOKEN = "day_token"
     const val KEY_LAUNCH_INCREMENT = "launch_increment"

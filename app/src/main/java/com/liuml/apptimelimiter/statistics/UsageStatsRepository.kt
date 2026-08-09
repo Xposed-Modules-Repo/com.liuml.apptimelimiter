@@ -11,6 +11,7 @@ data class AppUsageSummary(
     val lastUsedAtMillis: Long,
     val lastHookEventAtMillis: Long = 0L,
     val hookVersionCode: Int = 0,
+    val hookModeGeneration: Long = 0L,
 )
 
 class UsageStatsRepository(context: Context) {
@@ -25,6 +26,7 @@ class UsageStatsRepository(context: Context) {
         launchIncrement: Int,
         limitHitIncrement: Int,
         hookVersionCode: Int,
+        hookModeGeneration: Long = 0L,
         dayToken: String? = null,
     ): Boolean {
         if (packageName.isBlank()) return false
@@ -33,7 +35,7 @@ class UsageStatsRepository(context: Context) {
             val prefix = "$day.$packageName."
             // ContentProvider calls can cold-start this process for a single short write.
             // Commit synchronously so Android cannot kill the process before apply() flushes it.
-            prefs.edit()
+            val editor = prefs.edit()
                 .putLong(
                     "${prefix}duration_ms",
                     safeAdd(
@@ -56,9 +58,16 @@ class UsageStatsRepository(context: Context) {
                     ),
                 )
                 .putLong("${prefix}last_used_at", System.currentTimeMillis())
-                .putLong("heartbeat.$packageName", System.currentTimeMillis())
-                .putInt("hook_version.$packageName", hookVersionCode.coerceAtLeast(0))
-                .commit()
+            if (hookVersionCode > 0) {
+                editor
+                    .putLong("heartbeat.$packageName", System.currentTimeMillis())
+                    .putInt("hook_version.$packageName", hookVersionCode)
+                    .putLong(
+                        "hook_mode_generation.$packageName",
+                        hookModeGeneration.coerceAtLeast(0L),
+                    )
+            }
+            editor.commit()
         }
     }
 
@@ -70,8 +79,15 @@ class UsageStatsRepository(context: Context) {
             launchCount = prefs.getInt("${prefix}launches", 0).coerceAtLeast(0),
             limitHitCount = prefs.getInt("${prefix}limit_hits", 0).coerceAtLeast(0),
             lastUsedAtMillis = prefs.getLong("${prefix}last_used_at", 0L).coerceAtLeast(0L),
-            lastHookEventAtMillis = prefs.getLong("${prefix}last_used_at", 0L).coerceAtLeast(0L),
+            lastHookEventAtMillis = prefs.getLong(
+                "heartbeat.$packageName",
+                0L,
+            ).coerceAtLeast(0L),
             hookVersionCode = prefs.getInt("hook_version.$packageName", 0).coerceAtLeast(0),
+            hookModeGeneration = prefs.getLong(
+                "hook_mode_generation.$packageName",
+                0L,
+            ).coerceAtLeast(0L),
         )
     }
 
@@ -87,6 +103,27 @@ class UsageStatsRepository(context: Context) {
     ): Set<String> = packageNames.filterTo(mutableSetOf()) { packageName ->
         prefs.getLong("heartbeat.$packageName", 0L) > 0L &&
             prefs.getInt("hook_version.$packageName", 0) >= minimumVersionCode
+    }
+
+    fun hookHeartbeatMillis(packageName: String): Long =
+        prefs.getLong("heartbeat.$packageName", 0L).coerceAtLeast(0L)
+
+    fun recordHookHeartbeat(
+        packageName: String,
+        hookVersionCode: Int,
+        hookModeGeneration: Long,
+    ): Boolean {
+        if (packageName.isBlank() || hookVersionCode <= 0) return false
+        return synchronized(LOCK) {
+            prefs.edit()
+                .putLong("heartbeat.$packageName", System.currentTimeMillis())
+                .putInt("hook_version.$packageName", hookVersionCode)
+                .putLong(
+                    "hook_mode_generation.$packageName",
+                    hookModeGeneration.coerceAtLeast(0L),
+                )
+                .commit()
+        }
     }
 
     fun clearAll() {

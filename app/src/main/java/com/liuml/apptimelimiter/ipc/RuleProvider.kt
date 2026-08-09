@@ -15,8 +15,11 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Base64
 import com.liuml.apptimelimiter.core.BreakSessionPolicy
+import com.liuml.apptimelimiter.core.ProtectionExecutionPolicy
 import com.liuml.apptimelimiter.core.GroupUsagePolicy
 import com.liuml.apptimelimiter.core.SharedCooldownClaimStatus
+import com.liuml.apptimelimiter.core.TimeQuotePolicy
+import com.liuml.apptimelimiter.core.UsageReportingPolicy
 import com.liuml.apptimelimiter.data.LimitEnforcementMode
 import com.liuml.apptimelimiter.data.RuleRepository
 import com.liuml.apptimelimiter.data.ScheduleCodec
@@ -59,6 +62,16 @@ class RuleProvider : ContentProvider() {
                     ?.takeIf { it.enabled && it.packageNames.isNotEmpty() }
                 val personalRuleActive = assignedGroup == null
                 val settings = ruleRepository.getGlobalSettings()
+                val trustedNonRootRequest =
+                    Binder.getCallingUid() == Process.myUid() &&
+                        extras?.getBoolean(
+                            RuleContract.KEY_REQUEST_NON_ROOT_RULE_SNAPSHOT,
+                            false,
+                        ) == true
+                val ruleSnapshotMayExecute = ProtectionExecutionPolicy.ruleSnapshotMayExecute(
+                    mode = settings.protectionMode,
+                    trustedNonRootRequest = trustedNonRootRequest,
+                )
                 val expiredGroupCooldown = assignedGroup?.let {
                     ruleRepository.consumeExpiredGroupCooldown(it.id)
                 }
@@ -115,27 +128,37 @@ class RuleProvider : ContentProvider() {
                     ?.let { ruleRepository.getGroupCooldownRecord(it.id) }
                 Bundle().apply {
                     putBoolean(RuleContract.KEY_OK, true)
+                    putString(RuleContract.KEY_PROTECTION_MODE, settings.protectionMode.name)
+                    putLong(
+                        RuleContract.KEY_PROTECTION_MODE_GENERATION,
+                        settings.protectionModeGeneration,
+                    )
                     putBoolean(
                         RuleContract.KEY_ENABLED,
-                        if (personalRuleActive) rule.enabled else group != null,
+                        ruleSnapshotMayExecute &&
+                            if (personalRuleActive) rule.enabled else group != null,
                     )
                     putBoolean(
                         RuleContract.KEY_SESSION_PLANNING_ENABLED,
-                        personalRuleActive && rule.sessionPlanningEnabled,
+                        ruleSnapshotMayExecute &&
+                            personalRuleActive && rule.sessionPlanningEnabled,
                     )
                     putBoolean(
                         RuleContract.KEY_DAILY_ENABLED,
-                        personalRuleActive && rule.dailyEnabled,
+                        ruleSnapshotMayExecute &&
+                            personalRuleActive && rule.dailyEnabled,
                     )
                     putLong(RuleContract.KEY_DAILY_LIMIT_SECONDS, rule.dailyLimitSeconds)
                     putBoolean(
                         RuleContract.KEY_PER_LAUNCH_ENABLED,
-                        personalRuleActive && rule.perLaunchEnabled,
+                        ruleSnapshotMayExecute &&
+                            personalRuleActive && rule.perLaunchEnabled,
                     )
                     putLong(RuleContract.KEY_PER_LAUNCH_LIMIT_SECONDS, rule.perLaunchLimitSeconds)
                     putBoolean(
                         RuleContract.KEY_SCHEDULE_ENABLED,
-                        personalRuleActive && rule.scheduleEnabled,
+                        ruleSnapshotMayExecute &&
+                            personalRuleActive && rule.scheduleEnabled,
                     )
                     putString(RuleContract.KEY_SCHEDULE_MODE, rule.scheduleMode.name)
                     putString(
@@ -144,7 +167,8 @@ class RuleProvider : ContentProvider() {
                     )
                     putBoolean(
                         RuleContract.KEY_COOLDOWN_ENABLED,
-                        personalRuleActive && rule.cooldownEnabled,
+                        ruleSnapshotMayExecute &&
+                            personalRuleActive && rule.cooldownEnabled,
                     )
                     putLong(RuleContract.KEY_COOLDOWN_SECONDS, rule.cooldownSeconds)
                     putLong(RuleContract.KEY_VERSION, rule.version)
@@ -162,6 +186,20 @@ class RuleProvider : ContentProvider() {
                         settings.exitWarningVibrationEnabled,
                     )
                     putString(RuleContract.KEY_LANGUAGE_MODE, settings.languageMode.name)
+                    putString(RuleContract.KEY_THEME_MODE, settings.themeMode.name)
+                    putString(RuleContract.KEY_THEME_COLOR, settings.themeColor.name)
+                    putBoolean(
+                        RuleContract.KEY_TIME_QUOTES_ENABLED,
+                        settings.timeQuotesEnabled,
+                    )
+                    putBoolean(
+                        RuleContract.KEY_BUILT_IN_TIME_QUOTES_ENABLED,
+                        settings.builtInTimeQuotesEnabled,
+                    )
+                    putString(
+                        RuleContract.KEY_CUSTOM_TIME_QUOTES,
+                        TimeQuotePolicy.encode(settings.customTimeQuotes),
+                    )
                     putLong(RuleContract.KEY_EXTENSION_SECONDS, settings.extensionSeconds)
                     putBoolean(RuleContract.KEY_DIAGNOSTICS_ENABLED, settings.diagnosticsEnabled)
                     putBoolean(RuleContract.KEY_USAGE_STATS_ENABLED, settings.usageStatsEnabled)
@@ -175,7 +213,11 @@ class RuleProvider : ContentProvider() {
                         usageLookup.measuredAtElapsedMillis,
                     )
                     putBoolean(RuleContract.KEY_SYSTEM_USAGE_PENDING, usageLookup.refreshPending)
-                    putBoolean(RuleContract.KEY_GROUP_ENABLED, group != null)
+                    putBoolean(
+                        RuleContract.KEY_GROUP_ENABLED,
+                        ruleSnapshotMayExecute &&
+                            group != null,
+                    )
                     putString(RuleContract.KEY_GROUP_ID, assignedGroup?.id.orEmpty())
                     putString(RuleContract.KEY_GROUP_NAME, assignedGroup?.name.orEmpty())
                     putBoolean(
@@ -244,6 +286,13 @@ class RuleProvider : ContentProvider() {
                 val packageName = arg.orEmpty()
                 if (!isCallerAllowed(packageName)) return denied()
                 if (!isConfiguredPackage(ruleRepository, packageName)) return denied()
+                if (
+                    !ProtectionExecutionPolicy.acceptHookSideEffect(
+                        ruleRepository.getGlobalSettings().protectionMode,
+                    )
+                ) {
+                    return denied()
+                }
                 val group = ruleRepository.groupForPackage(packageName)
                     ?.takeIf { it.enabled && packageName in it.packageNames }
                     ?: return denied()
@@ -320,10 +369,22 @@ class RuleProvider : ContentProvider() {
                 val packageName = arg.orEmpty()
                 if (!isCallerAllowed(packageName)) return denied()
                 if (!isConfiguredPackage(ruleRepository, packageName)) return denied()
-                if (
-                    ruleRepository.getGlobalSettings().limitEnforcementMode !=
-                    LimitEnforcementMode.EXTERNAL_BREAK_PAGE
-                ) return denied()
+                val settings = ruleRepository.getGlobalSettings()
+                val nonRootRequest = extras?.getBoolean(
+                    RuleContract.KEY_BREAK_SESSION_NON_ROOT,
+                    false,
+                ) == true
+                if (nonRootRequest) {
+                    if (
+                        Binder.getCallingUid() != Process.myUid() ||
+                        !ProtectionExecutionPolicy.nonRootMayExecute(settings.protectionMode)
+                    ) return denied()
+                } else if (
+                    !ProtectionExecutionPolicy.acceptHookSideEffect(settings.protectionMode) ||
+                    settings.limitEnforcementMode != LimitEnforcementMode.EXTERNAL_BREAK_PAGE
+                ) {
+                    return denied()
+                }
                 val nowMillis = System.currentTimeMillis()
                 val token = generateBreakSessionToken()
                 val expiresAtMillis = synchronized(breakSessionLock) {
@@ -395,6 +456,9 @@ class RuleProvider : ContentProvider() {
                 val packageName = arg.orEmpty()
                 if (!isCallerAllowed(packageName)) return denied()
                 if (!isConfiguredPackage(ruleRepository, packageName)) return denied()
+                if (!ruleRepository.getGlobalSettings().diagnosticsEnabled) {
+                    return Bundle().apply { putBoolean(RuleContract.KEY_OK, true) }
+                }
                 DiagnosticsRepository(appContext).append(
                     level = extras?.getString(RuleContract.KEY_LEVEL)
                         .orEmpty()
@@ -417,22 +481,80 @@ class RuleProvider : ContentProvider() {
                 val packageName = arg.orEmpty()
                 if (!isCallerAllowed(packageName)) return denied()
                 if (!isConfiguredPackage(ruleRepository, packageName)) return denied()
+                val settings = ruleRepository.getGlobalSettings()
+                val groupDailyEnabled = ruleRepository.groupForPackage(packageName)
+                    ?.let { it.enabled && packageName in it.packageNames && it.dailyEnabled }
+                    ?: false
+                val durationAllowed = UsageReportingPolicy.shouldReportDuration(
+                    usageStatsEnabled = settings.usageStatsEnabled,
+                    groupDailyEnabled = groupDailyEnabled,
+                )
+                val hookVersionCode = extras?.getInt(
+                    RuleContract.KEY_HOOK_VERSION_CODE,
+                    0,
+                )?.coerceIn(0, MAX_HOOK_VERSION_CODE) ?: 0
+                if (
+                    hookVersionCode > 0 &&
+                    !ProtectionExecutionPolicy.acceptHookSideEffect(settings.protectionMode)
+                ) return denied()
                 val persisted = UsageStatsRepository(appContext).record(
                     packageName = packageName,
-                    durationMillis = (extras?.getLong(RuleContract.KEY_DURATION_MS, 0L) ?: 0L)
-                        .coerceIn(0L, MAX_REPORTED_DURATION_MS),
-                    launchIncrement = (extras?.getInt(RuleContract.KEY_LAUNCH_INCREMENT, 0) ?: 0)
-                        .coerceIn(0, MAX_COUNTER_INCREMENT),
-                    limitHitIncrement = extras?.getInt(
-                        RuleContract.KEY_LIMIT_HIT_INCREMENT,
-                        0,
-                    )?.coerceIn(0, MAX_COUNTER_INCREMENT) ?: 0,
-                    hookVersionCode = extras?.getInt(
-                        RuleContract.KEY_HOOK_VERSION_CODE,
-                        0,
-                    )?.coerceIn(0, MAX_HOOK_VERSION_CODE) ?: 0,
+                    durationMillis = if (durationAllowed) {
+                        (extras?.getLong(RuleContract.KEY_DURATION_MS, 0L) ?: 0L)
+                            .coerceIn(0L, MAX_REPORTED_DURATION_MS)
+                    } else {
+                        0L
+                    },
+                    launchIncrement = if (settings.usageStatsEnabled) {
+                        (extras?.getInt(RuleContract.KEY_LAUNCH_INCREMENT, 0) ?: 0)
+                            .coerceIn(0, MAX_COUNTER_INCREMENT)
+                    } else {
+                        0
+                    },
+                    limitHitIncrement = if (settings.usageStatsEnabled) {
+                        extras?.getInt(
+                            RuleContract.KEY_LIMIT_HIT_INCREMENT,
+                            0,
+                        )?.coerceIn(0, MAX_COUNTER_INCREMENT) ?: 0
+                    } else {
+                        0
+                    },
+                    hookVersionCode = hookVersionCode,
+                    hookModeGeneration = extras?.getLong(
+                        RuleContract.KEY_HOOK_MODE_GENERATION,
+                        0L,
+                    )?.coerceAtLeast(0L) ?: 0L,
                     dayToken = extras?.getString(RuleContract.KEY_DAY_TOKEN),
                 )
+                if (persisted && hookVersionCode > 0) {
+                    appContext.contentResolver.notifyChange(
+                        RuleContract.HOOK_STATUS_URI,
+                        null,
+                    )
+                }
+                Bundle().apply { putBoolean(RuleContract.KEY_OK, persisted) }
+            }
+
+            RuleContract.METHOD_REPORT_HOOK_STATUS -> {
+                val packageName = arg.orEmpty()
+                if (!isCallerAllowed(packageName)) return denied()
+                if (!isConfiguredPackage(ruleRepository, packageName)) return denied()
+                val hookVersionCode = extras?.getInt(
+                    RuleContract.KEY_HOOK_VERSION_CODE,
+                    0,
+                )?.coerceIn(1, MAX_HOOK_VERSION_CODE) ?: return denied()
+                val modeGeneration = extras.getLong(
+                    RuleContract.KEY_HOOK_MODE_GENERATION,
+                    0L,
+                ).coerceAtLeast(0L)
+                val persisted = UsageStatsRepository(appContext).recordHookHeartbeat(
+                    packageName = packageName,
+                    hookVersionCode = hookVersionCode,
+                    hookModeGeneration = modeGeneration,
+                )
+                if (persisted) {
+                    appContext.contentResolver.notifyChange(RuleContract.HOOK_STATUS_URI, null)
+                }
                 Bundle().apply { putBoolean(RuleContract.KEY_OK, persisted) }
             }
 
@@ -440,6 +562,13 @@ class RuleProvider : ContentProvider() {
                 val packageName = arg.orEmpty()
                 if (!isCallerAllowed(packageName)) return denied()
                 if (!isConfiguredPackage(ruleRepository, packageName)) return denied()
+                val settings = ruleRepository.getGlobalSettings()
+                if (
+                    !ProtectionExecutionPolicy.acceptHookSideEffect(settings.protectionMode) ||
+                    !settings.exitWarningVibrationEnabled
+                ) {
+                    return Bundle().apply { putBoolean(RuleContract.KEY_OK, false) }
+                }
                 Bundle().apply {
                     putBoolean(
                         RuleContract.KEY_OK,
@@ -486,21 +615,23 @@ class RuleProvider : ContentProvider() {
         val today = LocalDate.now()
         val nowElapsed = SystemClock.elapsedRealtime()
         val snapshot = synchronized(usageCacheLock) { usageSnapshot }
-        val available = snapshot != null &&
-            snapshot.day == today &&
-            snapshot.packageNames.containsAll(requiredPackages)
-        val fresh = available &&
-            nowElapsed - snapshot!!.measuredAtElapsedMillis <= SYSTEM_USAGE_REFRESH_INTERVAL_MS
+        val availableSnapshot = snapshot?.takeIf {
+            it.day == today &&
+                it.packageNames.containsAll(requiredPackages)
+        }
+        val fresh = availableSnapshot != null &&
+            nowElapsed - availableSnapshot.measuredAtElapsedMillis <=
+            SYSTEM_USAGE_REFRESH_INTERVAL_MS
         if (!fresh) {
             val packagesToRefresh = repository.configuredPackages()
                 .ifEmpty { requiredPackages }
                 .toSet()
             requestSystemUsageRefresh(usageRepository, packagesToRefresh)
         }
-        return if (available) {
+        return if (availableSnapshot != null) {
             SystemUsageLookup(
-                durations = snapshot!!.durations,
-                measuredAtElapsedMillis = snapshot.measuredAtElapsedMillis,
+                durations = availableSnapshot.durations,
+                measuredAtElapsedMillis = availableSnapshot.measuredAtElapsedMillis,
                 available = true,
                 refreshPending = !fresh,
             )

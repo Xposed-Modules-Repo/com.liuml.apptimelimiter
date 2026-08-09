@@ -11,6 +11,7 @@ class RuleStorageBootstrapPolicyTest {
             RuleStorageBootstrapPolicy.action(
                 privateMarkerPresent = false,
                 sharedMarkerPresent = false,
+                primaryMarkerPresent = false,
             ),
         )
     }
@@ -22,17 +23,31 @@ class RuleStorageBootstrapPolicyTest {
             RuleStorageBootstrapPolicy.action(
                 privateMarkerPresent = false,
                 sharedMarkerPresent = true,
+                primaryMarkerPresent = false,
             ),
         )
     }
 
     @Test
-    fun `matching markers keep the current rules`() {
+    fun `existing primary store stays authoritative when framework mirror disappears`() {
         assertEquals(
             RuleStorageBootstrapAction.KEEP,
             RuleStorageBootstrapPolicy.action(
                 privateMarkerPresent = true,
+                sharedMarkerPresent = false,
+                primaryMarkerPresent = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `existing primary store repairs an interrupted lifecycle marker write`() {
+        assertEquals(
+            RuleStorageBootstrapAction.KEEP,
+            RuleStorageBootstrapPolicy.action(
+                privateMarkerPresent = false,
                 sharedMarkerPresent = true,
+                primaryMarkerPresent = true,
             ),
         )
     }

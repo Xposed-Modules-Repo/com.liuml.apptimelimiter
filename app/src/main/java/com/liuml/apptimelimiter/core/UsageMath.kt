@@ -1,8 +1,14 @@
 package com.liuml.apptimelimiter.core
 
 object UsageMath {
-    fun remainingMillis(limitMillis: Long, committedMillis: Long, activeSegmentMillis: Long): Long =
-        (limitMillis - committedMillis - activeSegmentMillis).coerceAtLeast(0L)
+    fun remainingMillis(limitMillis: Long, committedMillis: Long, activeSegmentMillis: Long): Long {
+        val limit = limitMillis.coerceAtLeast(0L)
+        val committed = committedMillis.coerceAtLeast(0L)
+        val active = activeSegmentMillis.coerceAtLeast(0L)
+        if (committed >= limit) return 0L
+        val afterCommitted = limit - committed
+        return if (active >= afterCommitted) 0L else afterCommitted - active
+    }
 
     fun isLimitReached(limitMillis: Long, committedMillis: Long, activeSegmentMillis: Long): Boolean =
         remainingMillis(limitMillis, committedMillis, activeSegmentMillis) == 0L
@@ -10,8 +16,12 @@ object UsageMath {
     fun warningDelayMillis(remainingMillis: Long, warningLeadMillis: Long): Long =
         (remainingMillis - warningLeadMillis).coerceAtLeast(0L)
 
-    fun addExtensionMillis(currentMillis: Long, perClickMillis: Long, maximumMillis: Long): Long =
-        (currentMillis + perClickMillis).coerceAtMost(maximumMillis)
+    fun addExtensionMillis(currentMillis: Long, perClickMillis: Long, maximumMillis: Long): Long {
+        val maximum = maximumMillis.coerceAtLeast(0L)
+        val current = currentMillis.coerceIn(0L, maximum)
+        val increment = perClickMillis.coerceAtLeast(0L)
+        return if (increment >= maximum - current) maximum else current + increment
+    }
 
     fun earliestRemainingMillis(remainingValues: Iterable<Long>): Long? =
         remainingValues.minOrNull()?.coerceAtLeast(0L)
@@ -47,4 +57,15 @@ object UsageMath {
             systemUsageMillis + increment
         }
     }
+}
+
+object UsageReportingPolicy {
+    /**
+     * Duration samples are needed for the user-visible module statistics and for group daily
+     * accounting. Heartbeats and launch/limit counters are still sent separately.
+     */
+    fun shouldReportDuration(
+        usageStatsEnabled: Boolean,
+        groupDailyEnabled: Boolean,
+    ): Boolean = usageStatsEnabled || groupDailyEnabled
 }

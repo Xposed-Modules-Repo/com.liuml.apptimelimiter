@@ -65,7 +65,7 @@ class UsageEventDurationCalculatorTest {
     }
 
     @Test
-    fun `screen off interval is excluded while app remains foreground`() {
+    fun `screen off clears foreground until a new resume event arrives`() {
         val result = UsageEventDurationCalculator.calculate(
             packageNames = listOf("video.app"),
             startMillis = 1_000L,
@@ -78,7 +78,47 @@ class UsageEventDurationCalculatorTest {
             ),
         )
 
-        assertEquals(2_500L, result["video.app"])
+        assertEquals(1_500L, result["video.app"])
+    }
+
+    @Test
+    fun `screen off clears stale foreground packages instead of reviving all on wake`() {
+        val result = UsageEventDurationCalculator.calculate(
+            packageNames = listOf("first.app", "second.app"),
+            startMillis = 0L,
+            endMillis = 100_000L,
+            transitions = listOf(
+                UsageTransition("first.app", 10_000L, true),
+                // Simulate a vendor ROM omitting first.app's pause event.
+                UsageTransition("second.app", 20_000L, true),
+                ScreenInteractiveTransition(30_000L, false),
+                ScreenInteractiveTransition(50_000L, true),
+                UsageTransition("second.app", 55_000L, true),
+                UsageTransition("second.app", 80_000L, false),
+            ),
+        )
+
+        assertEquals(20_000L, result["first.app"])
+        assertEquals(35_000L, result["second.app"])
+    }
+
+    @Test
+    fun `total duration uses the union of overlapping app intervals`() {
+        val result = UsageEventDurationCalculator.calculateSnapshot(
+            packageNames = listOf("first.app", "second.app"),
+            startMillis = 0L,
+            endMillis = 10_000L,
+            transitions = listOf(
+                UsageTransition("first.app", 1_000L, true),
+                UsageTransition("second.app", 2_000L, true),
+                UsageTransition("second.app", 4_000L, false),
+                UsageTransition("first.app", 5_000L, false),
+            ),
+        )
+
+        assertEquals(4_000L, result.summaries["first.app"]?.durationMillis)
+        assertEquals(2_000L, result.summaries["second.app"]?.durationMillis)
+        assertEquals(4_000L, result.totalDurationMillis)
     }
 
     @Test

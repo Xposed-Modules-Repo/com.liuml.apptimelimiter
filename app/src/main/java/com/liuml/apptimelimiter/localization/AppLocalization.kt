@@ -162,6 +162,10 @@ object UiText {
         }
         Regex("^(\\d+) 秒$").matchEntire(source)?.let { return "${it.groupValues[1]} sec" }
         Regex("^(\\d+) 分钟$").matchEntire(source)?.let { return "${it.groupValues[1]} min" }
+        Regex("^(\\d+)/(\\d+) 句，每句最多(\\d+)字$").matchEntire(source)?.let {
+            return "${it.groupValues[1]}/${it.groupValues[2]} lines, " +
+                "up to ${it.groupValues[3]} characters each"
+        }
         Regex("^每日 (.+)$").matchEntire(source)?.let { return "Daily ${it.groupValues[1]}" }
         Regex("^单次 (.+)$").matchEntire(source)?.let { return "Per launch ${it.groupValues[1]}" }
         Regex("^冷却 (.+)$").matchEntire(source)?.let { return "Cooldown ${it.groupValues[1]}" }
@@ -186,6 +190,9 @@ object UiText {
         }
         Regex("^(.+)（个人设置已暂停）$").matchEntire(source)?.let {
             return "${it.groupValues[1]} (personal settings paused)"
+        }
+        Regex("^(.+)（已停用）$").matchEntire(source)?.let {
+            return "${it.groupValues[1]} (disabled)"
         }
         Regex("^加入 QQ 群：(.+)$").matchEntire(source)?.let {
             return "Join QQ group: ${it.groupValues[1]}"
@@ -222,12 +229,228 @@ object UiText {
         "应用使用时长管控" to "App usage time control",
         "展示今日使用过的全部应用" to "All apps used today",
         "设置" to "Settings",
+        "保护方式" to "Protection method",
+        "保护状态" to "Protection status",
+        "刷新状态" to "Refresh status",
+        "查看作用域提示" to "View scope guide",
+        "恢复权限提醒" to "Restore permission reminders",
+        "权限提醒已恢复" to "Permission reminders restored",
+        "不再显示此类问题" to "Do not show this type of issue again",
+        "独立限制页兼容性" to "Standalone restriction-page compatibility",
+        "打开兼容设置" to "Open compatibility settings",
+        "返回" to "Back",
+        "一键修复" to "Quick repairs",
+        "开启无障碍" to "Enable accessibility",
+        "Shizuku 指南" to "Shizuku guide",
+        "请求加入作用域" to "Request scope",
+        "检查作用域" to "Check scope",
+        "仅看需修复" to "Needs attention only",
+        "正常" to "Healthy",
+        "待修复" to "Needs attention",
+        "规则" to "Rule",
+        "已保存" to "Saved",
+        "LSPosed 作用域" to "LSPosed scope",
+        "Hook 心跳" to "Hook heartbeat",
+        "普通保护权限" to "Basic protection permissions",
+        "完整" to "Complete",
+        "缺失" to "Missing",
+        "当前模式不适用" to "Not applicable in this mode",
+        "最终接管" to "Effective controller",
+        "请求作用域" to "Request scope",
+        "作用域提示" to "Scope guide",
+        "强停并重开" to "Force-stop and reopen",
+        "重新打开" to "Reopen",
+        "确认停止" to "Confirm stop",
+        "LSPosed" to "LSPosed",
+        "普通保护" to "Basic protection",
+        "普通保护 + Shizuku" to "Basic protection + Shizuku",
+        "由目标应用内 Hook 精确计时并执行限制" to
+            "Uses in-app hooks for precise timing and enforcement",
+        "无障碍识别前台，UsageStats 校准，到限显示独立限制页" to
+            "Accessibility detects foreground use, UsageStats calibrates it, and a restriction page enforces limits",
+        "普通保护计时，到限优先通过 Shizuku 强停" to
+            "Basic protection handles timing and Shizuku force-stops at the limit",
+        "所有管控应用统一使用所选链路，模式之间不会自动混合接管。" to
+            "All managed apps use the selected controller. Modes never take over from one another automatically.",
+        "非 Root 普通保护" to "Non-root basic protection",
+        "使用无障碍前台事件和系统使用统计，无需 Root" to
+            "Uses accessibility foreground events and system usage data; no Root required",
+        "使用无障碍前台事件和系统使用统计；LSPosed 生效时自动由 Hook 接管" to
+            "Uses accessibility foreground events and system usage data; Hook takes over automatically when LSPosed is active",
+        "无障碍服务已启用" to "Accessibility service enabled",
+        "无障碍服务尚未启用" to "Accessibility service is not enabled",
+        "使用情况访问已授予" to "Usage access granted",
+        "使用情况访问尚未授予" to "Usage access is not granted",
+        "只读取当前前台应用包名，不读取页面节点、文字或输入内容；达到限制时执行返回桌面并显示限制页。" to
+            "Only the foreground app package is read. Page nodes, text, and input are never read. When a limit is reached, Time Stop returns Home and shows a restriction page.",
+        "只读取当前前台应用包名，不读取页面节点、文字或输入内容；达到限制时显示独立限制页，启动失败才返回桌面。" to
+            "Only the foreground app package is read. Page nodes, text, and input are never read. At the limit, Time Stop opens the standalone restriction page and returns Home only if it cannot open.",
+        "启用无障碍" to "Enable accessibility",
+        "检查无障碍连接" to "Check accessibility connection",
+        "授予使用情况访问" to "Grant usage access",
+        "自启动与电池设置" to "Autostart and battery settings",
+        "Shizuku 强停增强" to "Shizuku force-stop enhancement",
+        "可选；只在到限时强停已配置的第三方应用，失败自动回退限制页" to
+            "Optional; force-stops configured third-party apps only at the limit and falls back to the restriction page on failure",
+        "普通保护到限方式" to "Basic protection action at the limit",
+        "选择达到限制后的执行方式" to "Choose what happens when a limit is reached",
+        "只影响未被 LSPosed Hook 接管的应用" to
+            "Only affects apps that are not handled by the LSPosed Hook",
+        "独立限制页" to "Standalone restriction page",
+        "Shizuku 强制退出" to "Shizuku force-stop",
+        "到限后优先强停第三方应用并丢失当前页面；不可用或执行失败时自动回退独立限制页。" to
+            "Force-stops third-party apps first and discards the current page. If unavailable or unsuccessful, it falls back to the standalone restriction page.",
+        "到限后返回桌面并显示独立限制页，目标进程保持运行，后台音乐可能继续。" to
+            "Returns Home and shows a standalone restriction page. The target process stays alive and background audio may continue.",
+        "到限后直接显示独立限制页，解除后可恢复原应用；目标进程保持运行，后台音乐可能继续。" to
+            "Opens the standalone restriction page so the target app can resume after the restriction clears. The target process stays alive and background audio may continue.",
+        "本次使用计划会在结束前 5 秒提供重新计划入口。" to
+            "A session plan offers a replan action five seconds before it ends.",
+        "非 Root 的本次使用计划会在结束前 5 秒提供重新计划入口，不使用下方 LSPosed 提醒设置。" to
+            "Non-root session plans offer a replan action five seconds before ending and do not use the LSPosed reminder settings below.",
+        "Shizuku 已连接并授权" to "Shizuku connected and authorized",
+        "正在连接 Shizuku" to "Connecting to Shizuku",
+        "Shizuku 等待授权" to "Shizuku authorization required",
+        "未检测到运行中的 Shizuku" to "No running Shizuku service detected",
+        "Shizuku 连接失败" to "Shizuku connection failed",
+        "保存设置后启用 Shizuku 增强" to "Save settings to enable Shizuku enhancement",
+        "保存设置后启用 Shizuku 强制退出" to
+            "Save settings to enable Shizuku force-stop",
+        "强停会丢失目标应用当前页面；Shizuku 非 Root 模式通常需要在重启后重新启动。" to
+            "Force-stop discards the target app's current page. Non-root Shizuku usually needs to be started again after a reboot.",
+        "请求 Shizuku 授权" to "Request Shizuku authorization",
+        "安装与启动指南" to "Installation and startup guide",
+        "LSPosed 提醒与退出" to "LSPosed reminders and enforcement",
+        "LSPosed 到限方式" to "LSPosed action at the limit",
+        "只影响已被 Hook 接管的目标应用" to
+            "Only affects target apps handled by the Hook",
+        "达到限制后打开独立休息页，使目标界面自然暂停，并尽力暂停常见媒体。休息页不提供延时；单次额度配合冷却时，结束后可继续原页面。切换方式后请强停并重开目标应用。" to
+            "Opens a standalone break page at the limit so the target screen pauses naturally, while common media is paused on a best-effort basis. The page has no extension action; a per-session allowance with cooldown can resume the original page afterward. Force-stop and reopen targets after switching modes.",
+        "Hook 目标到期前 5 秒显示倒计时" to
+            "Shows a countdown five seconds before a Hook target reaches its limit",
+        "开启后倒计时覆盖 Hook 目标；关闭时显示顶部圆角提醒" to
+            "When enabled, the countdown covers the Hook target; otherwise a rounded top reminder is shown",
+        "Hook 退出倒计时出现时震动一次" to
+            "Vibrates once when the Hook exit countdown appears",
+        "仅对 Hook 提醒生效；可设置 1–60 分钟" to
+            "Only affects Hook reminders; range: 1–60 minutes",
+        "恢复桌面图标" to "Restore launcher icon",
+        "当前无法确认 LSPosed 设置入口，请恢复图标避免无法打开时停" to
+            "The LSPosed settings entry cannot be confirmed. Restore the icon to avoid losing access to Time Stop.",
+        "仅在 LSPosed 设置入口可用时提供；隐藏后从模块页打开" to
+            "Available only when the LSPosed settings entry works; open Time Stop from the module page after hiding it",
+        "当前未检测到可用的 LSPosed 设置入口，请关闭上方开关恢复桌面图标；也可连接电脑执行：" to
+            "No working LSPosed settings entry was detected. Turn off the switch above to restore the launcher icon, or run this command from a computer:",
+        "隐藏后桌面缓存图标可能短暂残留。可从 LSPosed 模块页进入；也可连接电脑执行：" to
+            "A cached launcher icon may remain briefly after hiding. Open Time Stop from the LSPosed module page, or run this command from a computer:",
+        "记录管控引擎、包名、时间戳和限制事件；仅在你主动反馈时导出" to
+            "Records control-engine events, package names, timestamps, and limits; exported only when you choose to send feedback",
+        "请选择反馈方式。邮件反馈会附带设备型号、包名、时间戳和诊断日志，仅在你主动发送时离开设备；QQ群适合交流和参与内测。" to
+            "Choose a feedback method. Email includes device model, package names, timestamps, and diagnostic logs and leaves the device only when you send it; the QQ group is for discussion and beta testing.",
+        "无障碍服务用途说明" to "Accessibility service disclosure",
+        "时停使用无障碍服务识别当前前台应用，并在用户保存的时间规则触发时返回桌面、显示计划选择或限制浮层。" to
+            "Time Stop uses accessibility to identify the foreground app and, when a saved time rule triggers, return Home and show a plan picker or restriction overlay.",
+        "时停使用无障碍服务识别当前前台应用，并在用户保存的时间规则触发时返回桌面、显示计划选择浮层或独立限制页。" to
+            "Time Stop uses accessibility to identify the foreground app and, when a saved time rule triggers, return Home and show a plan-picker overlay or the standalone restriction page.",
+        "时停使用无障碍服务识别当前前台应用，并在用户保存的时间规则触发时显示计划选择浮层或独立限制页；限制页启动失败时返回桌面。" to
+            "Time Stop uses accessibility to identify the foreground app and show a plan-picker overlay or standalone restriction page when a saved rule triggers. It returns Home only if the restriction page cannot open.",
+        "时停不会读取页面节点、文字、账号、输入内容或通知，也不会上传无障碍事件。" to
+            "Time Stop does not read page nodes, text, accounts, input, or notifications, and does not upload accessibility events.",
+        "普通保护属于自我时间管理。你可以随时在系统设置中关闭服务；关闭后非 Root 管控将停止。" to
+            "Basic protection is for self-managed screen time. You can disable the service in system settings at any time; non-root control then stops.",
+        "同意并前往启用" to "Agree and enable",
+        "暂不开启" to "Not now",
+        "LSPosed 保护运行中" to "LSPosed protection is active",
+        "混合保护运行中" to "Mixed protection is active",
+        "Shizuku 增强保护运行中" to "Shizuku enhanced protection is active",
+        "普通保护运行中" to "Basic protection is active",
+        "普通保护未就绪" to "Basic protection is not ready",
+        "部分应用管控异常" to "Some app controls need attention",
+        "管控运行中" to "Control is active",
+        "管控已配置" to "Control is configured",
+        "无障碍服务未启用" to "Accessibility service is disabled",
+        "使用情况访问未授权" to "Usage access is not granted",
+        "目标应用由 LSPosed 独占管控，普通保护会自动停止重复计时" to
+            "LSPosed exclusively controls target apps; basic protection stops duplicate timing automatically",
+        "已 Hook 的目标由 LSPosed 管控，其余目标由普通保护接管" to
+            "Hooked targets use LSPosed; basic protection handles the remaining targets",
+        "无障碍负责计时，达到限制后优先通过 Shizuku 强停第三方应用" to
+            "Accessibility tracks time; Shizuku force-stops third-party apps first when a limit is reached",
+        "无障碍与系统使用统计协同管控，达到限制后返回桌面并显示限制页" to
+            "Accessibility and system usage data work together; Time Stop returns Home and shows a restriction page at the limit",
+        "无障碍与系统使用统计协同管控，达到限制后显示独立限制页" to
+            "Accessibility and system usage data work together; Time Stop opens the standalone restriction page at the limit",
+        "普通保护需要启用时停无障碍服务" to
+            "Basic protection requires the Time Stop accessibility service",
+        "普通保护需要使用情况访问来校准每日累计时长" to
+            "Basic protection requires usage access to calibrate daily totals",
+        "请检查普通保护所需权限" to "Check the permissions required by basic protection",
+        "请强制停止异常应用并重新打开" to
+            "Force-stop and reopen the affected apps",
+        "目标应用正在执行已保存的时间规则" to
+            "Target apps are enforcing the saved time rules",
+        "打开目标应用后自动生效" to "Control starts automatically when a target app opens",
+        "若应用未被限制，请打开诊断日志检查运行状态" to
+            "If an app is not limited, open diagnostics to check its runtime state",
+        "选择适合你的保护方式" to "Choose the protection method that fits",
+        "有 LSPosed 时可加入模块作用域获得更稳定的进程内管控；未 Root 设备也可启用普通保护。" to
+            "With LSPosed, add apps to the module scope for more reliable in-process control. Non-root devices can use basic protection.",
+        "普通保护需要无障碍服务与使用情况访问" to
+            "Basic protection requires accessibility and usage access",
+        "Shizuku 可选增强只负责到限强停" to
+            "The optional Shizuku enhancement only force-stops apps at the limit",
+        "普通保护需要修复" to "Basic protection needs attention",
+        "保护权限需要处理" to "Protection permissions need attention",
+        "时停无障碍服务尚未启用" to "The Time Stop accessibility service is not enabled",
+        "使用情况访问权限尚未授予" to "Usage access has not been granted",
+        "Shizuku 尚未授权，强制退出不可用" to
+            "Shizuku is not authorized, so force-stop is unavailable",
+        "Shizuku 未安装或服务尚未运行" to
+            "Shizuku is not installed or its service is not running",
+        "Shizuku 连接失败" to "Shizuku connection failed",
+        "增强兼容检测" to "Enhanced compatibility detection",
+        "普通保护仍会使用独立限制页，但在问题解决前不能通过 Shizuku 强制退出。" to
+            "Basic protection will continue with the standalone restriction page, but Shizuku force-stop is unavailable until this is fixed.",
+        "必要权限缺失时，普通保护不会生效。请完成授权后重新打开目标应用。" to
+            "Basic protection is inactive while required permissions are missing. Grant them, then reopen the target app.",
+        "必要权限缺失时，非 Root 管控不会生效。LSPosed 已正常 Hook 的应用不受影响。" to
+            "Non-root control is inactive while required permissions are missing. Apps already hooked by LSPosed are unaffected.",
+        "查看 Shizuku 设置指南" to "View Shizuku setup guide",
+        "普通保护运行中 · Shizuku 需处理" to
+            "Basic protection is active · Shizuku needs attention",
+        "基础管控仍有效；Shizuku 强制退出不可用，到限后将回退独立限制页" to
+            "Basic control remains active. Shizuku force-stop is unavailable, so limits fall back to the standalone restriction page.",
+        "权限缺失时，非 Root 管控无法可靠计时或拦截应用。LSPosed 已正常 Hook 的应用不受影响。" to
+            "Without these permissions, non-root control cannot reliably time or block apps. Apps already hooked by LSPosed are unaffected.",
+        "稍后处理" to "Later",
+        "请选择一种保护方式；LSPosed 有效时会自动优先使用。" to
+            "Choose a protection method. LSPosed is used automatically when available.",
+        "LSPosed：启用时停模块，将目标应用加入作用域，保存规则后强停并重开目标应用。" to
+            "LSPosed: enable Time Stop, add target apps to its scope, then force-stop and reopen them after saving rules.",
+        "普通保护：在设置中开启普通保护，并授予无障碍服务和使用情况访问。无需 Root。" to
+            "Basic protection: enable it in Settings and grant accessibility and usage access. Root is not required.",
+        "Shizuku：可选增强，仅负责到限后强停第三方应用；不可用时自动回退普通限制页。" to
+            "Shizuku: an optional enhancement that only force-stops third-party apps at the limit; it falls back to the basic restriction page when unavailable.",
+        "普通保护不会读取页面文字或输入内容，也不会持续轮询；关闭权限、停止或卸载时停后无法继续保护。" to
+            "Basic protection does not read page text or input and does not poll continuously. Protection stops if permissions are revoked or Time Stop is stopped or uninstalled.",
+        "普通保护需要启用时停无障碍服务，并授予使用情况访问权限。" to
+            "Basic protection requires the Time Stop accessibility service and usage access.",
+        "Shizuku 是可选增强，仅负责到限后强停第三方应用；不可用时自动回退独立限制页。" to
+            "Shizuku is optional and only force-stops third-party apps at the limit. If unavailable, Time Stop falls back to the standalone restriction page.",
+        "启用时停模块，将目标应用加入作用域，保存规则后强停并重开目标应用。" to
+            "Enable the Time Stop module, add target apps to its scope, then force-stop and reopen them after saving rules.",
+        "只有检测到应用未加入作用域或运行异常时，时停才会显示修复提示。" to
+            "Time Stop shows a repair prompt only when an app is out of scope or its runtime state is abnormal.",
+        "规则保存后由目标应用执行；若实际未生效，请在诊断日志中检查运行状态。" to
+            "Target apps enforce saved rules. If control does not take effect, check the runtime state in diagnostics.",
         "搜索应用或包名" to "Search app or package",
         "仅看已启用" to "Enabled only",
         "显示系统应用" to "Show system apps",
         "请确认 LSPosed 作用域" to "Confirm the LSPosed scope",
         "规则已保存，但这些应用尚未回传当前版本的 Hook 验证。请确认已加入时停的 LSPosed 作用域，再强制停止并重新打开目标应用。" to "The rule was saved, but these apps have not reported the current Hook version. Add them to the Time Stop LSPosed scope, then force-stop and reopen them.",
         "检测到这些应用尚未加入时停的 LSPosed 作用域。可以向框架申请加入，确认后请强制停止并重新打开目标应用。" to "These apps are not in the Time Stop LSPosed scope. Request scope access, then force-stop and reopen the target apps after approval.",
+        "当前框架连接已变化，暂时无法申请作用域。请稍后重试或在 LSPosed 中手动检查。" to
+            "The framework connection changed, so scope access cannot be requested right now. Try again later or check it manually in LSPosed.",
         "当前框架无法直接确认这些应用的作用域，或 Hook 版本仍待验证。请在 LSPosed 中检查作用域，再强制停止并重新打开目标应用。" to "This framework cannot expose the scope directly, or the Hook version is still pending. Check the scope in LSPosed, then force-stop and reopen the target apps.",
         "请求加入作用域" to "Request scope access",
         "正在申请" to "Requesting",
@@ -255,14 +478,17 @@ object UiText {
         "诊断日志" to "Diagnostic logs",
         "需要使用情况访问权限" to "Usage access required",
         "授权后由 Android 系统提供今日使用时长，仅在打开时停时读取，不需要后台服务。" to "Android provides today's usage after authorization. Time Stop reads it on demand without a background service.",
+        "授权后由 Android 系统提供今日使用时长；统计页按需读取，普通保护仅在前台切换或额度校验时读取，不需要前台常驻服务。" to
+            "Android provides today's usage after authorization. Statistics read it on demand, while basic protection reads it only on foreground changes or allowance checks, without a persistent foreground service.",
         "去授权" to "Authorize",
         "使用统计展示已关闭；应用分组仍会保留共享额度所需的内部时长。" to "Usage statistics are hidden; app groups still retain timing required for shared allowances.",
         "Android 系统按需读取 · 无后台服务" to "Android data on demand · no background service",
+        "Android 系统前台区间去重 · 无后台服务" to
+            "Deduplicated Android foreground intervals · no background service",
         "授权后显示系统使用时长" to "Authorize to show system usage",
         "清空模块记录" to "Clear module records",
         "今天暂无应用使用记录。" to "No app usage recorded today.",
         "Android 系统使用统计" to "Android system usage",
-        "Hook 计数来自旧版本，请强停并重新打开应用" to "Hook counters came from an older version; force-stop and reopen the app",
         "需要 LSPosed" to "LSPosed required",
         "保存规则后，请在 LSPosed 中启用本模块并勾选目标应用。首次启用或修改作用域后，需要强制停止目标应用再打开。" to "After saving a rule, enable this module in LSPosed and select the target app. Force-stop and reopen it after first setup or a scope change.",
         "共享每日额度" to "Shared daily allowance",
@@ -309,12 +535,17 @@ object UiText {
         "Hook 运行中" to "Hook running",
         "Hook 待重载" to "Hook reload needed",
         "Hook 异常" to "Hook error",
+        "运行中" to "Running",
+        "需要重启" to "Restart required",
+        "运行异常" to "Runtime error",
+        "等待验证" to "Pending verification",
         "管控中" to "Controlled",
         "精细管控" to "Precise control",
         "把使用边界设清楚" to "Set clear usage boundaries",
         "每日累计、单次打开、可用时段和退出后冷却可以独立开启，也可以组合生效。" to "Daily, per-launch, schedule and post-exit cooldown rules can work independently or together.",
         "任一规则先到即执行退出" to "The first rule reached enforces the limit",
-        "管理应用被清理后规则仍由 Hook 执行" to "Hook rules keep working after the manager app is cleared from Recents",
+        "管理应用被清理后规则仍可继续执行" to
+            "Rules can keep working after the manager app is cleared from Recents",
         "本次计划" to "Session plan",
         "打开应用前，先决定用多久" to "Decide how long to use the app",
         "为应用开启“打开时制定计划”，每次新进程首次进入时选择本次前台使用时长。" to "Enable plan-on-launch to choose a foreground-use duration when each new app process first opens.",
@@ -359,6 +590,24 @@ object UiText {
         "默认跟随系统语言" to "Follows the system language by default",
         "跟随系统" to "System default",
         "简体中文" to "Simplified Chinese",
+        "外观" to "Appearance",
+        "颜色主题" to "Color theme",
+        "所有管理页、管控弹窗和限制页同步使用" to
+            "Applied across manager screens, control prompts, and restriction pages",
+        "健康绿" to "Health green",
+        "宁静蓝" to "Calm blue",
+        "专注紫" to "Focus purple",
+        "明暗模式" to "Light and dark mode",
+        "主题模式" to "Theme mode",
+        "选择舒适的浅色或深色界面" to "Choose a comfortable light or dark appearance",
+        "浅色" to "Light",
+        "深色" to "Dark",
+        "时间短句" to "Time reflections",
+        "在计划、全屏提醒和独立限制页显示" to
+            "Show in plan prompts, full-screen warnings, and restriction pages",
+        "使用内置短句" to "Use built-in lines",
+        "自定义短句（每行一句）" to "Custom lines (one per line)",
+        "当前没有可显示的短句" to "There are no lines to display",
         "统计与诊断" to "Statistics and diagnostics",
         "使用时长统计" to "Usage statistics",
         "统计页按需读取系统数据；共享额度会保留必要的内部计时" to "The stats page reads system data on demand; shared allowances retain required internal timing",
@@ -377,6 +626,8 @@ object UiText {
         "复制恢复命令" to "Copy recovery command",
         "维护与支持" to "Maintenance and support",
         "检查更新" to "Check for updates",
+        "自动检查更新" to "Automatic update checks",
+        "打开时停时按需检查，新版发布后主动提醒" to "Check when Time Stop opens and notify you when a new release is available",
         "正在连接 GitHub…" to "Connecting to GitHub…",
         "从 GitHub Releases 检查并下载新版 APK" to "Check GitHub Releases and download a newer APK",
         "检查 ›" to "Check ›",
@@ -422,7 +673,8 @@ object UiText {
         "完整条款见项目仓库根目录 LICENSE 文件。" to "See the LICENSE file in the repository root for the complete terms.",
         "关闭" to "Close",
         "无法打开链接" to "Unable to open link",
-        "暂无日志。打开一次已配置的目标应用；若仍为空，请检查 LSPosed 是否启用模块及目标应用作用域。" to "No logs. Open a configured target app; if this remains empty, check the LSPosed module and scope.",
+        "暂无日志。请打开一次已配置的目标应用；若仍为空，请检查当前保护方式的权限与配置。" to
+            "No logs. Open a configured target app; if this remains empty, check the permissions and configuration for the current protection method.",
         "反馈" to "Feedback",
         "刷新" to "Refresh",
         "清空" to "Clear",

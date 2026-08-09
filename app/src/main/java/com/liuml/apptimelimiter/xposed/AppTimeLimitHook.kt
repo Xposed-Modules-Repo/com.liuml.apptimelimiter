@@ -24,19 +24,29 @@ import com.liuml.apptimelimiter.core.LimitGateSnapshot
 import com.liuml.apptimelimiter.core.QuotaIncidentPolicy
 import com.liuml.apptimelimiter.core.QuotaKind
 import com.liuml.apptimelimiter.core.RestPagePolicy
+import com.liuml.apptimelimiter.core.ResumedActivityRegistry
 import com.liuml.apptimelimiter.core.RuleSnapshotSelectionPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownRecord
 import com.liuml.apptimelimiter.core.UsageMath
+import com.liuml.apptimelimiter.core.UsageReportingPolicy
 import com.liuml.apptimelimiter.core.ProcessTerminationPolicy
+import com.liuml.apptimelimiter.core.ProtectionModePolicy
 import com.liuml.apptimelimiter.core.ScheduleDecision
 import com.liuml.apptimelimiter.core.ScheduleBlockPolicy
 import com.liuml.apptimelimiter.core.ScheduleConstraint
 import com.liuml.apptimelimiter.core.ScheduleEvaluator
 import com.liuml.apptimelimiter.core.SessionPlanPolicy
+import com.liuml.apptimelimiter.core.SessionPlanInterruptionAction
+import com.liuml.apptimelimiter.core.SessionPlanInterruptionPolicy
+import com.liuml.apptimelimiter.core.TimeQuotePolicy
+import com.liuml.apptimelimiter.core.ThemeColorPolicy
 import com.liuml.apptimelimiter.data.RuleRepository
 import com.liuml.apptimelimiter.data.AppLanguageMode
+import com.liuml.apptimelimiter.data.AppThemeColor
+import com.liuml.apptimelimiter.data.AppThemeMode
 import com.liuml.apptimelimiter.data.LimitEnforcementMode
+import com.liuml.apptimelimiter.data.ProtectionMode
 import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.data.ScheduleMode
 import com.liuml.apptimelimiter.data.ScheduleWindow
@@ -66,7 +76,19 @@ class AppTimeLimitHook : IXposedHookLoadPackage {
         val preferences = XSharedPreferences(MODULE_PACKAGE, RuleRepository.PREFS_NAME)
         preferences.makeWorldReadable()
         runCatching { preferences.reload() }
-        val installMediaHooks = LimitEnforcementPolicy.shouldInstallMediaHooks(
+        val initialProtectionMode = ProtectionModePolicy.parse(
+            storedValue = preferences.getString(RuleRepository.KEY_PROTECTION_MODE, null),
+            legacyNonRootEnabled = preferences.getBoolean(
+                RuleRepository.KEY_NON_ROOT_PROTECTION_ENABLED,
+                false,
+            ),
+            legacyShizukuEnabled = preferences.getBoolean(
+                RuleRepository.KEY_SHIZUKU_ENHANCEMENT_ENABLED,
+                false,
+            ),
+        )
+        val installMediaHooks = initialProtectionMode == ProtectionMode.XPOSED &&
+            LimitEnforcementPolicy.shouldInstallMediaHooks(
             LimitEnforcementPolicy.parseMode(
                 preferences.getString(RuleRepository.KEY_LIMIT_ENFORCEMENT_MODE, null),
             ),
@@ -184,7 +206,10 @@ private class RuntimeLimiter(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val processSessionId =
         "${Process.myPid()}-${SystemClock.elapsedRealtime()}-${processName.hashCode()}"
+    private val resumedActivities = ResumedActivityRegistry<Activity>()
     private var activeActivity = WeakReference<Activity>(null)
+    private var lastPausedActivity = WeakReference<Activity>(null)
+    private var activityHandoffPending = false
     private var foregroundStartedAt = NOT_RUNNING
     private var foregroundDayToken = -1
     private var perLaunchCommittedMs = 0L
@@ -201,6 +226,11 @@ private class RuntimeLimiter(
     private var warningBanner: TopWarningBanner? = null
     private var warningCountdown: Runnable? = null
     private var sessionLaunchReported = false
+    private var lastHookHeartbeatAtElapsedMillis = Long.MIN_VALUE
+    private var lastHookStatusReportAtElapsedMillis = Long.MIN_VALUE
+    private var lastReportedModeGeneration = Long.MIN_VALUE
+    private var lastYieldedModeGeneration = Long.MIN_VALUE
+    private var lastUiCancelledModeGeneration = Long.MIN_VALUE
     private var statsContext: Context? = null
     private val pendingStatsByDay = linkedMapOf<String, PendingUsageBatch>()
     private var statsRetryCount = 0
@@ -219,6 +249,9 @@ private class RuntimeLimiter(
     private var sessionPlanWarningVibrated = false
     private var sessionPlanDialog: SessionPlanDialog? = null
     private var activeSessionPlanDialogMode: SessionPlanDialogMode? = null
+    private var activeSessionPlanPromptId: String? = null
+    private var sessionPlanPromptSequence = 0L
+    private var restoreReplanWarningOnResume = false
     private var sessionPlanWaitingForUsage = false
     private var sessionPlanPromptAttempts = 0
     private var activityGeneration = 0L
@@ -240,10 +273,10 @@ private class RuntimeLimiter(
     private val sessionPlanDeadline = Runnable { checkSessionPlanDeadline() }
     private val sessionPlanWarningDeadline = Runnable { showSessionPlanWarning() }
     private val activityHandoffFinalize = Runnable {
-        if (activeActivity.get() == null) {
-            warningShownForExtensionMs = Long.MIN_VALUE
-            sessionPlanWarningShown = false
-        }
+        if (!activityHandoffPending || !resumedActivities.isEmpty) return@Runnable
+        activityHandoffPending = false
+        val activity = lastPausedActivity.get() ?: activeActivity.get() ?: return@Runnable
+        finalizeProcessBackground(activity)
     }
     fun onActivityResumedFallback(activity: Activity) {
         mainHandler.post { onActivityResumed(activity) }
@@ -255,11 +288,31 @@ private class RuntimeLimiter(
 
     fun onActivityResumed(activity: Activity) {
         if (exitScheduled) return
-        if (activeActivity.get() === activity) return
+        val processWasForeground = !resumedActivities.isEmpty
+        if (!resumedActivities.markResumed(activity)) return
+        val previousActivity = activeActivity.get()
+        val resumedDuringHandoff = activityHandoffPending
         activityGeneration++
         mainHandler.removeCallbacks(activityHandoffFinalize)
+        activityHandoffPending = false
+        lastPausedActivity.clear()
         cancelPendingSessionPlanPrompt()
+        if (previousActivity != null && previousActivity !== activity) {
+            transferSessionPlanUiForActivityHandoff(previousActivity, activity)
+        } else if (resumedDuringHandoff) {
+            recoverDetachedSessionPlanDialog(activity)
+        }
+        activeActivity = WeakReference(activity)
         val rule = readRule(activity, reloadFallback = true)
+        if ((processWasForeground || resumedDuringHandoff) && previousActivity !== activity) {
+            diagnostic(
+                activity,
+                level = "DEBUG",
+                event = "ACTIVITY_HANDOFF",
+                message = "进程保持前台并切换 Activity；from=${previousActivity?.javaClass?.name.orEmpty()}；to=${activity.javaClass.name}；resumed=${resumedActivities.size}",
+            )
+        }
+        reportHookStatus(activity, rule)
         if (!hookReadyLogged) {
             hookReadyLogged = true
             diagnostic(
@@ -269,7 +322,22 @@ private class RuntimeLimiter(
             )
         }
 
-        val ruleSummary = "${rule.enabled}/${rule.sessionPlanningEnabled}/${rule.dailyEnabled}/${rule.dailyLimitMillis}/${rule.systemTodayUsedMillis}/${rule.systemUsageMeasuredAtElapsedMillis}/${rule.systemUsagePending}/${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis}/${rule.groupEnabled}/${rule.groupId}/${rule.groupDailyEnabled}/${rule.groupDailyLimitMillis}/${rule.groupTodayUsedMillis}/${rule.groupPerLaunchEnabled}/${rule.groupPerLaunchLimitMillis}/${rule.groupScheduleEnabled}/${rule.groupScheduleMode}/${ScheduleCodec.encode(rule.groupScheduleWindows)}/${rule.groupCooldownEnabled}/${rule.groupCooldownMillis}/${rule.groupVersion}/${rule.scheduleEnabled}/${rule.scheduleMode}/${ScheduleCodec.encode(rule.scheduleWindows)}/${rule.cooldownEnabled}/${rule.cooldownMillis}/${rule.version}/${rule.exitWarningEnabled}/${rule.fullScreenExitWarningEnabled}/${rule.exitWarningVibrationEnabled}/${rule.languageMode}/${rule.extensionMillis}/${rule.limitEnforcementMode}/${rule.diagnosticsEnabled}/${rule.source}"
+        if (rule.protectionMode != ProtectionMode.XPOSED) {
+            if (lastYieldedModeGeneration != rule.protectionModeGeneration) {
+                lastYieldedModeGeneration = rule.protectionModeGeneration
+                diagnostic(
+                    activity,
+                    event = "HOOK_YIELDED_BY_MODE",
+                    message = "已选择${rule.protectionMode}；LSPosed Hook 已停止计时与限制；modeGeneration=${rule.protectionModeGeneration}",
+                )
+            }
+            cancelSessionPlan(dismissDialog = true, resetPrompt = true)
+            if (blockingState != null) removeBlockingOverlay(activity, "保护模式已切换")
+            stopTiming()
+            return
+        }
+
+        val ruleSummary = "${rule.protectionMode}/${rule.protectionModeGeneration}/${rule.enabled}/${rule.sessionPlanningEnabled}/${rule.dailyEnabled}/${rule.dailyLimitMillis}/${rule.systemTodayUsedMillis}/${rule.systemUsageMeasuredAtElapsedMillis}/${rule.systemUsagePending}/${rule.perLaunchEnabled}/${rule.perLaunchLimitMillis}/${rule.groupEnabled}/${rule.groupId}/${rule.groupDailyEnabled}/${rule.groupDailyLimitMillis}/${rule.groupTodayUsedMillis}/${rule.groupPerLaunchEnabled}/${rule.groupPerLaunchLimitMillis}/${rule.groupScheduleEnabled}/${rule.groupScheduleMode}/${ScheduleCodec.encode(rule.groupScheduleWindows)}/${rule.groupCooldownEnabled}/${rule.groupCooldownMillis}/${rule.groupVersion}/${rule.scheduleEnabled}/${rule.scheduleMode}/${ScheduleCodec.encode(rule.scheduleWindows)}/${rule.cooldownEnabled}/${rule.cooldownMillis}/${rule.version}/${rule.exitWarningEnabled}/${rule.fullScreenExitWarningEnabled}/${rule.exitWarningVibrationEnabled}/${rule.languageMode}/${rule.themeMode}/${rule.themeColor}/${rule.timeQuotesEnabled}/${rule.builtInTimeQuotesEnabled}/${TimeQuotePolicy.encode(rule.customTimeQuotes)}/${rule.extensionMillis}/${rule.limitEnforcementMode}/${rule.diagnosticsEnabled}/${rule.source}"
         if (lastRuleSummary != ruleSummary) {
             lastRuleSummary = ruleSummary
             diagnostic(
@@ -299,9 +367,24 @@ private class RuntimeLimiter(
                 limitHitIncrement = 0,
             )
             sessionLaunchReported = true
+            lastHookHeartbeatAtElapsedMillis = SystemClock.elapsedRealtime()
+        } else {
+            val heartbeatElapsed = SystemClock.elapsedRealtime()
+            if (
+                lastHookHeartbeatAtElapsedMillis == Long.MIN_VALUE ||
+                heartbeatElapsed - lastHookHeartbeatAtElapsedMillis >=
+                HOOK_HEARTBEAT_MIN_INTERVAL_MS
+            ) {
+                recordUsageEvent(
+                    activity = activity,
+                    durationMillis = 0L,
+                    launchIncrement = 0,
+                    limitHitIncrement = 0,
+                )
+                lastHookHeartbeatAtElapsedMillis = heartbeatElapsed
+            }
         }
 
-        activeActivity = WeakReference(activity)
         if (
             enforceBlockingConditions(
                 activity = activity,
@@ -362,13 +445,34 @@ private class RuntimeLimiter(
     }
 
     fun onActivityPaused(activity: Activity) {
-        if (activeActivity.get() !== activity) return
+        if (!resumedActivities.markPaused(activity)) return
+        if (!resumedActivities.isEmpty) {
+            if (activeActivity.get() === activity) {
+                resumedActivities.anyOrNull()?.let { activeActivity = WeakReference(it) }
+            }
+            diagnostic(
+                activity,
+                level = "DEBUG",
+                event = "ACTIVITY_HANDOFF",
+                message = "Activity 已暂停但进程内仍有 resumed Activity；remaining=${resumedActivities.size}",
+            )
+            return
+        }
+        lastPausedActivity = WeakReference(activity)
+        activityHandoffPending = true
+        mainHandler.removeCallbacks(activityHandoffFinalize)
+        mainHandler.postDelayed(activityHandoffFinalize, ACTIVITY_HANDOFF_GRACE_MS)
+    }
+
+    private fun finalizeProcessBackground(activity: Activity) {
+        if (!resumedActivities.isEmpty) return
         pauseSessionPlan(activity)
         detachBlockingOverlay()
         val rule = readRule(activity, reloadFallback = true)
         val segmentMs = if (foregroundStartedAt == NOT_RUNNING) 0L else activeSegmentMillis()
         if (foregroundStartedAt != NOT_RUNNING) commitActiveSegment(activity, rule)
         activeActivity.clear()
+        lastPausedActivity.clear()
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
         mainHandler.removeCallbacks(scheduleDeadline)
@@ -378,14 +482,21 @@ private class RuntimeLimiter(
         foregroundDayToken = -1
         dismissWarning(resetForCurrentLimit = false)
         dismissScheduleWarning()
-        mainHandler.removeCallbacks(activityHandoffFinalize)
-        mainHandler.postDelayed(activityHandoffFinalize, ACTIVITY_HANDOFF_GRACE_MS)
+        warningShownForExtensionMs = Long.MIN_VALUE
+        sessionPlanWarningShown = false
         if (rule.enabled && segmentMs >= LOGGABLE_SEGMENT_MS) {
             diagnostic(
                 activity,
                 event = "TIMER_PAUSE",
-                message = "本段=${segmentMs / 1000.0}s，${usageSummary(activity, rule)}",
+                message = "进程进入后台；本段=${segmentMs / 1000.0}s，${usageSummary(activity, rule)}",
             )
+        }
+    }
+
+    private fun currentResumedActivity(): Activity? {
+        val activity = activeActivity.get() ?: return null
+        return activity.takeIf {
+            resumedActivities.contains(it) && !it.isFinishing && !it.isDestroyed
         }
     }
 
@@ -397,6 +508,20 @@ private class RuntimeLimiter(
         if (!rule.sessionPlanningEnabled) {
             cancelSessionPlan(dismissDialog = true, resetPrompt = true)
             return
+        }
+        if (restoreReplanWarningOnResume) {
+            restoreReplanWarningOnResume = false
+            if (sessionPlanRemainingMs != NOT_RUNNING) {
+                sessionPlanWarningShown = false
+                sessionPlanForegroundStartedAt = SystemClock.elapsedRealtime()
+                scheduleSessionPlan(activity, rule)
+                diagnostic(
+                    activity,
+                    event = "SESSION_PLAN_REPLAN_RESTORED",
+                    message = "重新计划弹窗被非用户操作中断，已恢复原计划和到期提醒；remaining=${sessionPlanRemainingMillis() / 1000.0}s",
+                )
+                return
+            }
         }
         if (sessionPlanRemainingMs != NOT_RUNNING) {
             if (sessionPlanRemainingMillis() <= 0L) {
@@ -428,19 +553,57 @@ private class RuntimeLimiter(
         }
     }
 
-    private fun pauseSessionPlan(activity: Activity) {
-        cancelPendingSessionPlanPrompt()
-        if (sessionPlanDialog?.isShowing == true) {
-            val interruptedMode = activeSessionPlanDialogMode
-            sessionPlanDialog?.dismiss()
-            sessionPlanDialog = null
-            activeSessionPlanDialogMode = null
+    private fun transferSessionPlanUiForActivityHandoff(from: Activity, to: Activity) {
+        interruptSessionPlanDialog(
+            activity = to,
+            reason = "activity_handoff:${from.javaClass.name}->${to.javaClass.name}",
+        )
+        if (warningBanner != null) {
+            val warningKind = warningBanner?.kind
+            dismissWarning(resetForCurrentLimit = false)
+            dismissScheduleWarning()
+            dismissSessionPlanWarning()
             diagnostic(
-                activity,
-                event = "SESSION_PLAN_PROMPT_INTERRUPTED",
-                message = "Activity 交接时关闭计划弹窗；mode=$interruptedMode；不再重复显示",
+                to,
+                level = "DEBUG",
+                event = "ACTIVITY_HANDOFF",
+                message = "Activity 交接，提醒将在新页面按剩余时间恢复；kind=$warningKind",
             )
         }
+    }
+
+    private fun recoverDetachedSessionPlanDialog(activity: Activity) {
+        if (activeSessionPlanDialogMode == null) return
+        if (sessionPlanDialog?.isShowing == true) return
+        interruptSessionPlanDialog(
+            activity,
+            reason = "dialog_detached_on_resume",
+        )
+    }
+
+    private fun interruptSessionPlanDialog(activity: Activity, reason: String) {
+        val interruptedMode = activeSessionPlanDialogMode ?: return
+        val promptId = activeSessionPlanPromptId.orEmpty()
+        sessionPlanDialog?.dismiss()
+        sessionPlanDialog = null
+        activeSessionPlanDialogMode = null
+        activeSessionPlanPromptId = null
+        val action = SessionPlanInterruptionPolicy.resolve(
+            isReplanPrompt = interruptedMode == SessionPlanDialogMode.REPLAN,
+            hasRunningPlan = sessionPlanRemainingMs != NOT_RUNNING,
+        )
+        restoreReplanWarningOnResume =
+            action == SessionPlanInterruptionAction.RESTORE_PLAN_WARNING
+        diagnostic(
+            activity,
+            event = "SESSION_PLAN_PROMPT_INTERRUPTED",
+            message = "mode=$interruptedMode；promptId=$promptId；host=${activity.javaClass.name}；reason=$reason；action=$action",
+        )
+    }
+
+    private fun pauseSessionPlan(activity: Activity) {
+        cancelPendingSessionPlanPrompt()
+        interruptSessionPlanDialog(activity, reason = "process_background")
         if (sessionPlanRemainingMs == NOT_RUNNING || sessionPlanForegroundStartedAt == NOT_RUNNING) {
             return
         }
@@ -452,7 +615,7 @@ private class RuntimeLimiter(
         diagnostic(
             activity,
             event = "SESSION_PLAN_PAUSED",
-            message = "进入后台，计划暂停；remaining=${sessionPlanRemainingMs / 1000.0}s",
+            message = "进程内已无 resumed Activity，计划暂停；remaining=${sessionPlanRemainingMs / 1000.0}s",
         )
     }
 
@@ -462,27 +625,50 @@ private class RuntimeLimiter(
         mode: SessionPlanDialogMode,
         allowHandledInitialRetry: Boolean = false,
     ) {
+        if (!guardXposedUiMode(activity, rule, "session_plan_prompt")) return
         if (exitScheduled || blockingState != null || sessionPlanDialog?.isShowing == true) return
-        if (activity !== activeActivity.get() || activity.isFinishing || activity.isDestroyed) {
+        if (
+            activity !== activeActivity.get() ||
+            !resumedActivities.contains(activity) ||
+            activityHandoffPending ||
+            activity.isFinishing ||
+            activity.isDestroyed
+        ) {
             return
         }
         if (mode == SessionPlanDialogMode.INITIAL) {
             if (sessionPlanPromptHandled && !allowHandledInitialRetry) return
         }
+        val promptId = "$processSessionId:${++sessionPlanPromptSequence}:$mode"
         activeSessionPlanDialogMode = mode
+        activeSessionPlanPromptId = promptId
         sessionPlanDialog = SessionPlanDialog.show(
             activity = activity,
             mode = mode,
             english = isEnglish(activity, rule),
+            themeMode = rule.themeMode,
+            themeColor = rule.themeColor,
+            quote = TimeQuotePolicy.select(
+                enabled = rule.timeQuotesEnabled,
+                builtInEnabled = rule.builtInTimeQuotesEnabled,
+                customQuotes = rule.customTimeQuotes,
+                english = isEnglish(activity, rule),
+                seed = "hook-plan:$packageName:${Process.myPid()}:$mode:$activityGeneration",
+            ),
             includeDebugChoice = BuildConfig.DEBUG,
+            maxAllowedMillis = earliestPermanentRemainingMillis(activity, rule),
             onStart = { durationMillis ->
                 sessionPlanDialog = null
                 activeSessionPlanDialogMode = null
+                activeSessionPlanPromptId = null
+                restoreReplanWarningOnResume = false
                 requestSessionPlan(activity, durationMillis, mode)
             },
             onWithoutPlan = {
                 sessionPlanDialog = null
                 activeSessionPlanDialogMode = null
+                activeSessionPlanPromptId = null
+                restoreReplanWarningOnResume = false
                 cancelSessionPlan(dismissDialog = false)
                 resumePermanentQuotaEnforcement(activity)
                 diagnostic(
@@ -491,8 +677,19 @@ private class RuntimeLimiter(
                     message = if (mode == SessionPlanDialogMode.REPLAN) "用户取消本次计划" else "用户选择本次不计划",
                 )
             },
+            onExit = {
+                sessionPlanDialog = null
+                activeSessionPlanDialogMode = null
+                activeSessionPlanPromptId = null
+                restoreReplanWarningOnResume = false
+                cancelSessionPlan(dismissDialog = false)
+                leaveTargetByUser(activity, "session_plan_dialog")
+            },
         )
         if (sessionPlanDialog != null) {
+            if (mode == SessionPlanDialogMode.REPLAN) {
+                restoreReplanWarningOnResume = false
+            }
             if (mode == SessionPlanDialogMode.INITIAL) {
                 sessionPlanPromptHandled = true
                 sessionPlanPromptAttempts = 0
@@ -500,11 +697,14 @@ private class RuntimeLimiter(
             diagnostic(
                 activity,
                 event = "SESSION_PLAN_PROMPT",
-                message = "mode=$mode",
+                message = "mode=$mode；promptId=$promptId；pid=${Process.myPid()}；process=$processName；host=${activity.javaClass.name}；presentation=1",
             )
         } else {
             activeSessionPlanDialogMode = null
+            activeSessionPlanPromptId = null
             if (mode == SessionPlanDialogMode.REPLAN && sessionPlanRemainingMs != NOT_RUNNING) {
+                restoreReplanWarningOnResume = false
+                sessionPlanWarningShown = false
                 sessionPlanForegroundStartedAt = SystemClock.elapsedRealtime()
                 scheduleSessionPlan(activity, rule)
             }
@@ -516,7 +716,7 @@ private class RuntimeLimiter(
                 activity,
                 level = "ERROR",
                 event = "SESSION_PLAN_PROMPT_FAILED",
-                message = "无法显示计划弹窗；mode=$mode, attempt=$sessionPlanPromptAttempts/${SessionPlanPolicy.MAX_PROMPT_ATTEMPTS}",
+                message = "无法显示计划弹窗；mode=$mode；promptId=$promptId；pid=${Process.myPid()}；process=$processName；host=${activity.javaClass.name}；attempt=$sessionPlanPromptAttempts/${SessionPlanPolicy.MAX_PROMPT_ATTEMPTS}",
             )
             if (mode == SessionPlanDialogMode.INITIAL) {
                 if (SessionPlanPolicy.shouldRetryPrompt(sessionPlanPromptAttempts)) {
@@ -597,7 +797,9 @@ private class RuntimeLimiter(
                 if (ActivityCallbackPolicy.isCurrent(
                         capturedGeneration = generation,
                         currentGeneration = activityGeneration,
-                        hostIsCurrent = activity === activeActivity.get(),
+                        hostIsCurrent = activity === activeActivity.get() &&
+                            resumedActivities.contains(activity) &&
+                            !activityHandoffPending,
                         hostIsUsable = !activity.isFinishing && !activity.isDestroyed,
                         exitScheduled = exitScheduled,
                     )
@@ -653,6 +855,7 @@ private class RuntimeLimiter(
         mainHandler.removeCallbacks(sessionPlanDeadline)
         mainHandler.removeCallbacks(sessionPlanWarningDeadline)
         dismissSessionPlanWarning()
+        restoreReplanWarningOnResume = true
         showSessionPlanPrompt(activity, rule, SessionPlanDialogMode.REPLAN)
     }
 
@@ -662,6 +865,8 @@ private class RuntimeLimiter(
         sessionPlanWarningShown = false
         sessionPlanWarningVibrated = false
         sessionPlanWaitingForUsage = false
+        restoreReplanWarningOnResume = false
+        activeSessionPlanPromptId = null
         cancelPendingSessionPlanPrompt()
         mainHandler.removeCallbacks(sessionPlanDeadline)
         mainHandler.removeCallbacks(sessionPlanWarningDeadline)
@@ -679,10 +884,26 @@ private class RuntimeLimiter(
         activity: Activity,
         delayMillis: Long = SESSION_PLAN_PROMPT_STABLE_MS,
     ) {
-        if (sessionPlanPromptHandled || sessionPlanPromptRunnable != null) return
+        if (sessionPlanPromptHandled) return
+        scheduleSessionPlanPrompt(
+            activity = activity,
+            mode = SessionPlanDialogMode.INITIAL,
+            delayMillis = delayMillis,
+        )
+    }
+
+    private fun scheduleSessionPlanPrompt(
+        activity: Activity,
+        mode: SessionPlanDialogMode,
+        delayMillis: Long,
+    ) {
+        if (sessionPlanPromptRunnable != null) return
         val generation = activityGeneration
         val prompt = Runnable {
             sessionPlanPromptRunnable = null
+            if (activityHandoffPending || !resumedActivities.contains(activity)) {
+                return@Runnable
+            }
             if (!ActivityCallbackPolicy.isCurrent(
                     capturedGeneration = generation,
                     currentGeneration = activityGeneration,
@@ -706,7 +927,11 @@ private class RuntimeLimiter(
                 suppressSessionPlanForBlock(activity, blockingState?.reason)
                 return@Runnable
             }
-            showSessionPlanPrompt(activity, latestRule, SessionPlanDialogMode.INITIAL)
+            showSessionPlanPrompt(
+                activity = activity,
+                rule = latestRule,
+                mode = mode,
+            )
         }
         sessionPlanPromptRunnable = prompt
         mainHandler.postDelayed(prompt, delayMillis)
@@ -791,15 +1016,17 @@ private class RuntimeLimiter(
     }
 
     private fun checkSessionPlanDeadline() {
-        val activity = activeActivity.get() ?: return
-        if (activity.isFinishing || activity.isDestroyed || exitScheduled) return
+        val activity = currentResumedActivity() ?: return
+        if (exitScheduled) return
+        val latestRule = readRule(activity, reloadFallback = true)
+        if (!guardXposedUiMode(activity, latestRule, "session_plan_deadline")) return
         if (sessionPlanRemainingMs == NOT_RUNNING || sessionPlanForegroundStartedAt == NOT_RUNNING) return
         val remainingMs = sessionPlanRemainingMillis()
         if (remainingMs > 0L) {
-            scheduleSessionPlan(activity, readRule(activity, reloadFallback = true))
+            scheduleSessionPlan(activity, latestRule)
             return
         }
-        val rule = readRule(activity, reloadFallback = true)
+        val rule = latestRule
         if (rule.enabled && rule.hasSchedule()) {
             val decision = evaluateSchedule(rule)
             if (!decision.allowed) {
@@ -856,10 +1083,11 @@ private class RuntimeLimiter(
     }
 
     private fun showSessionPlanWarning() {
-        val activity = activeActivity.get() ?: return
-        if (activity.isFinishing || activity.isDestroyed || exitScheduled) return
+        val activity = currentResumedActivity() ?: return
+        if (exitScheduled) return
         if (isBannerShowing(WarningBannerKind.SCHEDULE)) return
         val rule = readRule(activity, reloadFallback = true)
+        if (!guardXposedUiMode(activity, rule, "session_plan_warning")) return
         if (!rule.sessionPlanningEnabled || !rule.exitWarningEnabled) return
         val remainingMs = sessionPlanRemainingMillis()
         if (remainingMs == NOT_RUNNING) return
@@ -892,12 +1120,17 @@ private class RuntimeLimiter(
                 remainingMillis = remainingMs,
                 maxProgressMillis = SessionPlanPolicy.WARNING_LEAD_MILLIS,
                 fullScreen = rule.fullScreenExitWarningEnabled,
+                themeMode = rule.themeMode,
+                themeColor = rule.themeColor,
+                quote = timeQuote(activity, rule, "session-plan-warning:$processSessionId"),
                 actionLabel = hookText(activity, rule, "重新计划", "Replan"),
                 onAction = {
                     if (!activity.isFinishing && !activity.isDestroyed && !exitScheduled) {
                         beginSessionReplan(activity, rule)
                     }
                 },
+                exitLabel = hookText(activity, rule, "退出应用", "Exit app"),
+                onExit = { leaveTargetByUser(activity, "session_plan_warning") },
             )
             if (!sessionPlanWarningVibrated) {
                 sessionPlanWarningVibrated = true
@@ -946,8 +1179,8 @@ private class RuntimeLimiter(
         return hookText(
             context,
             rule,
-            "$seconds 秒后退出 · 可重新制定本次计划",
-            "Exit in $seconds sec · you can replan this session",
+            "$seconds 秒后退出 · 可立即退出或重新制定",
+            "Exit in $seconds sec · exit now or replan",
         )
     }
 
@@ -962,6 +1195,7 @@ private class RuntimeLimiter(
     }
 
     private fun scheduleDeadline(activity: Activity, rule: HookRule): Long {
+        if (!guardXposedUiMode(activity, rule, "schedule_deadline")) return 0L
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
         val status = thresholdStatus(activity, rule)
@@ -992,9 +1226,9 @@ private class RuntimeLimiter(
     }
 
     private fun checkDeadline() {
-        val activity = activeActivity.get() ?: return
-        if (activity.isFinishing) return
+        val activity = currentResumedActivity() ?: return
         val rule = readRule(activity, reloadFallback = true)
+        if (!guardXposedUiMode(activity, rule, "deadline")) return
         if (!rule.enabled) {
             diagnostic(activity, event = "TIMER_CANCEL", message = "规则已停用")
             stopTiming()
@@ -1020,7 +1254,11 @@ private class RuntimeLimiter(
         mainHandler.removeCallbacks(midnightDeadline)
         if (
             exitScheduled ||
-            (!rule.dailyEnabled && !rule.groupDailyEnabled) ||
+            (
+                !rule.dailyEnabled &&
+                    !rule.groupDailyEnabled &&
+                    !shouldReportUsageDuration(rule)
+                ) ||
             foregroundStartedAt == NOT_RUNNING
         ) return
         val now = ZonedDateTime.now()
@@ -1030,10 +1268,18 @@ private class RuntimeLimiter(
     }
 
     private fun checkMidnightRollover() {
-        val activity = activeActivity.get() ?: return
-        if (activity.isFinishing || activity.isDestroyed || foregroundStartedAt == NOT_RUNNING) return
+        val activity = currentResumedActivity() ?: return
+        if (foregroundStartedAt == NOT_RUNNING) return
         val rule = readRule(activity, reloadFallback = true)
-        if (!rule.enabled || (!rule.dailyEnabled && !rule.groupDailyEnabled)) {
+        if (!guardXposedUiMode(activity, rule, "midnight_rollover")) return
+        if (
+            !rule.enabled ||
+            (
+                !rule.dailyEnabled &&
+                    !rule.groupDailyEnabled &&
+                    !shouldReportUsageDuration(rule)
+                )
+        ) {
             mainHandler.removeCallbacks(midnightDeadline)
             return
         }
@@ -1041,7 +1287,7 @@ private class RuntimeLimiter(
         if (foregroundDayToken != currentDay) {
             val fullSegmentMillis = activeSegmentMillis()
             val todaySegmentMillis = activeSegmentMillisForToday()
-            if (rule.groupDailyEnabled) {
+            if (shouldReportUsageDuration(rule)) {
                 val previousDaySegmentMillis = (fullSegmentMillis - todaySegmentMillis)
                     .coerceAtLeast(0L)
                 if (previousDaySegmentMillis > 0L) {
@@ -1050,7 +1296,8 @@ private class RuntimeLimiter(
                         durationMillis = previousDaySegmentMillis,
                         launchIncrement = 0,
                         limitHitIncrement = 0,
-                        eventDayToken = LocalDate.now().minusDays(1L).toString(),
+                        eventDayToken = dateFromDayToken(foregroundDayToken)
+                            ?: LocalDate.now().minusDays(1L).toString(),
                     )
                 }
                 if (todaySegmentMillis > 0L) {
@@ -1063,7 +1310,7 @@ private class RuntimeLimiter(
                 }
             }
             if (rule.perLaunchEnabled || rule.groupPerLaunchEnabled) {
-                perLaunchCommittedMs += fullSegmentMillis
+                perLaunchCommittedMs = safeAdd(perLaunchCommittedMs, fullSegmentMillis)
             }
             foregroundStartedAt = SystemClock.elapsedRealtime()
             foregroundDayToken = currentDay
@@ -1097,9 +1344,10 @@ private class RuntimeLimiter(
     }
 
     private fun syncGroupUsage() {
-        val activity = activeActivity.get() ?: return
-        if (activity.isFinishing || activity.isDestroyed || foregroundStartedAt == NOT_RUNNING) return
-        val currentRule = lastLoadedRule ?: readRule(activity, reloadFallback = true)
+        val activity = currentResumedActivity() ?: return
+        if (foregroundStartedAt == NOT_RUNNING) return
+        val currentRule = readRule(activity, reloadFallback = true)
+        if (!guardXposedUiMode(activity, currentRule, "group_usage_sync")) return
         if (!currentRule.enabled || !currentRule.groupDailyEnabled) return
         commitActiveSegment(activity, currentRule)
         foregroundStartedAt = SystemClock.elapsedRealtime()
@@ -1143,9 +1391,9 @@ private class RuntimeLimiter(
     }
 
     private fun checkScheduleBoundary() {
-        val activity = activeActivity.get() ?: return
-        if (activity.isFinishing || activity.isDestroyed) return
+        val activity = currentResumedActivity() ?: return
         val rule = readRule(activity, reloadFallback = true)
+        if (!guardXposedUiMode(activity, rule, "schedule_boundary")) return
         if (!rule.enabled) {
             stopTiming()
             return
@@ -1169,6 +1417,7 @@ private class RuntimeLimiter(
         decision: ScheduleDecision,
         openedDuringBlockedTime: Boolean,
     ) {
+        if (!guardXposedUiMode(activity, rule, "schedule_exit")) return
         if (exitScheduled) return
         if (
             rule.limitEnforcementMode.usesBreakPage() &&
@@ -1211,6 +1460,7 @@ private class RuntimeLimiter(
     }
 
     private fun forceExit(activity: Activity, rule: HookRule, status: ThresholdStatus) {
+        if (!guardXposedUiMode(activity, rule, "quota_exit")) return
         if (exitScheduled) return
         val incidentClaim = claimQuotaIncident(activity, rule, status)
         if (
@@ -1226,7 +1476,7 @@ private class RuntimeLimiter(
         val segmentMs = activeSegmentMillis()
         val statsPersisted = recordUsageEvent(
             activity = activity,
-            durationMillis = if (rule.groupEnabled) segmentMs else 0L,
+            durationMillis = if (shouldReportUsageDuration(rule)) segmentMs else 0L,
             launchIncrement = 0,
             limitHitIncrement = if (rule.usageStatsEnabled && incidentClaim.isNewIncident) {
                 1
@@ -1244,7 +1494,7 @@ private class RuntimeLimiter(
             writeDailyState(activity, rule, finalDailyUsed)
         }
         if (rule.perLaunchEnabled || rule.groupPerLaunchEnabled) {
-            perLaunchCommittedMs += segmentMs
+            perLaunchCommittedMs = safeAdd(perLaunchCommittedMs, segmentMs)
         }
         foregroundStartedAt = NOT_RUNNING
         foregroundDayToken = -1
@@ -1280,6 +1530,7 @@ private class RuntimeLimiter(
         remainingMillis: Long,
         statsPersisted: Boolean,
     ) {
+        if (!guardXposedUiMode(activity, rule, "cooldown_exit")) return
         if (exitScheduled) return
         if (
             rule.limitEnforcementMode.usesBreakPage() &&
@@ -1322,16 +1573,6 @@ private class RuntimeLimiter(
         openedDuringBlockedTime: Boolean,
     ): Boolean {
         val nextAllowed = formatNextTransition(activity, rule, decision)
-        val message = if (nextAllowed == null) {
-            hookText(activity, rule, "当前处于不可用时段", "This time is unavailable")
-        } else {
-            hookText(
-                activity,
-                rule,
-                "下次可用：$nextAllowed",
-                "Next available: $nextAllowed",
-            )
-        }
         val token = "schedule:${rule.scheduleTokenVersion()}:${decision.nextTransition}"
         val newlyBlocked = blockingState?.token != token
         if (
@@ -1340,8 +1581,6 @@ private class RuntimeLimiter(
                 BlockingState(
                     LimitBlockReason.SCHEDULE,
                     token,
-                    hookText(activity, rule, "当前时段不可使用", "Unavailable at this time"),
-                    message,
                     ruleVersion = rule.version,
                     groupVersion = rule.groupVersion,
                 ),
@@ -1382,40 +1621,12 @@ private class RuntimeLimiter(
             nowMillis = System.currentTimeMillis(),
         )
         val initialReason = quotaState.reason
-        val initialTitle = if (initialReason == LimitBlockReason.COOLDOWN) {
-            hookText(activity, rule, "休息一下", "Take a break")
-        } else {
-            hookText(activity, rule, "使用额度已耗尽", "Usage limit reached")
-        }
-        val initialMessage = if (initialReason == LimitBlockReason.COOLDOWN) {
-            val remainingText = formatCooldownRemaining(
-                activity,
-                rule,
-                (quotaState.cooldownEndsAtMillis - System.currentTimeMillis())
-                    .coerceAtLeast(0L),
-            )
-            hookText(
-                activity,
-                rule,
-                "$remainingText 后自动继续",
-                "Continue automatically in $remainingText",
-            )
-        } else {
-            hookText(
-                activity,
-                rule,
-                "已达到${status.reachedLabels}限制，请等待额度恢复",
-                "${status.reachedLabels} limit reached. Wait for it to reset.",
-            )
-        }
         if (
             !showBlockingOverlay(
                 activity,
                 BlockingState(
                     initialReason,
                     token,
-                    initialTitle,
-                    initialMessage,
                     ruleVersion = rule.version,
                     groupVersion = rule.groupVersion,
                     cooldownEndsAtMillis = quotaState.cooldownEndsAtMillis,
@@ -1457,7 +1668,6 @@ private class RuntimeLimiter(
         rule: HookRule,
         remainingMillis: Long,
     ): Boolean {
-        val remainingText = formatCooldownRemaining(activity, rule, remainingMillis)
         val token = "cooldown:${rule.cooldownToken()}"
         val newlyBlocked = blockingState?.token != token
         val reachedKinds = buildSet {
@@ -1471,13 +1681,6 @@ private class RuntimeLimiter(
                 BlockingState(
                     LimitBlockReason.COOLDOWN,
                     token,
-                    hookText(activity, rule, "休息一下", "Take a break"),
-                    hookText(
-                        activity,
-                        rule,
-                        "$remainingText 后自动继续",
-                        "Continue automatically in $remainingText",
-                    ),
                     ruleVersion = rule.version,
                     groupVersion = rule.groupVersion,
                     cooldownEndsAtMillis = cooldownEndsAtMillis,
@@ -1562,8 +1765,6 @@ private class RuntimeLimiter(
                     LimitBlockActivity.EXTRA_BREAK_SESSION_TOKEN,
                     breakSessionToken,
                 )
-                putExtra(LimitBlockActivity.EXTRA_TITLE, state.title)
-                putExtra(LimitBlockActivity.EXTRA_MESSAGE, state.message)
                 putExtra(LimitBlockActivity.EXTRA_RULE_VERSION, state.ruleVersion)
                 putExtra(LimitBlockActivity.EXTRA_GROUP_VERSION, state.groupVersion)
                 putExtra(
@@ -1576,7 +1777,11 @@ private class RuntimeLimiter(
                 )
                 putExtra(LimitBlockActivity.EXTRA_DAY_TOKEN, LocalDate.now().toString())
                 putExtra(LimitBlockActivity.EXTRA_ENGLISH, isEnglish(activity, rule))
-                addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_NO_ANIMATION,
+                )
             }
             activity.startActivity(intent)
             @Suppress("DEPRECATION")
@@ -1686,6 +1891,8 @@ private class RuntimeLimiter(
         sessionPlanDialog?.dismiss()
         sessionPlanDialog = null
         activeSessionPlanDialogMode = null
+        activeSessionPlanPromptId = null
+        restoreReplanWarningOnResume = false
         diagnostic(
             context,
             event = "SESSION_PLAN_SUPPRESSED_BLOCKED",
@@ -1786,6 +1993,34 @@ private class RuntimeLimiter(
             },
             if (statsPersisted) EXIT_DELAY_MS else EXIT_DELAY_AFTER_STATS_FAILURE_MS,
         )
+    }
+
+    private fun leaveTargetByUser(activity: Activity, source: String) {
+        dismissWarning(resetForCurrentLimit = false)
+        dismissScheduleWarning()
+        dismissSessionPlanWarning()
+        sessionPlanDialog?.dismiss()
+        sessionPlanDialog = null
+        activeSessionPlanDialogMode = null
+        activeSessionPlanPromptId = null
+        restoreReplanWarningOnResume = false
+        diagnostic(
+            activity,
+            event = "USER_EXIT_REQUESTED",
+            message = "source=$source",
+        )
+        runCatching { activity.finishAndRemoveTask() }
+            .onFailure {
+                diagnostic(activity, level = "WARN", event = "USER_EXIT_FINISH_TASK_FAILED", message = it.toString())
+            }
+        runCatching { activity.finishAffinity() }
+            .onFailure {
+                diagnostic(activity, level = "WARN", event = "USER_EXIT_FINISH_AFFINITY_FAILED", message = it.toString())
+            }
+        runCatching { activity.moveTaskToBack(true) }
+            .onFailure {
+                diagnostic(activity, level = "WARN", event = "USER_EXIT_MOVE_TASK_FAILED", message = it.toString())
+            }
     }
 
     private fun isSafeToTerminateProcess(activity: Activity): Boolean =
@@ -2108,9 +2343,9 @@ private class RuntimeLimiter(
             )
         }
         if (rule.perLaunchEnabled || rule.groupPerLaunchEnabled) {
-            perLaunchCommittedMs += segmentMs
+            perLaunchCommittedMs = safeAdd(perLaunchCommittedMs, segmentMs)
         }
-        if (rule.groupEnabled) {
+        if (shouldReportUsageDuration(rule)) {
             recordUsageEvent(
                 activity = activity,
                 durationMillis = segmentMs,
@@ -2121,6 +2356,12 @@ private class RuntimeLimiter(
         foregroundStartedAt = NOT_RUNNING
         foregroundDayToken = -1
     }
+
+    private fun shouldReportUsageDuration(rule: HookRule): Boolean =
+        UsageReportingPolicy.shouldReportDuration(
+            usageStatsEnabled = rule.usageStatsEnabled,
+            groupDailyEnabled = rule.groupDailyEnabled,
+        )
 
     private fun reportLimitHit(activity: Activity, rule: HookRule): Boolean =
         recordUsageEvent(
@@ -2180,6 +2421,51 @@ private class RuntimeLimiter(
         return flushUsageEvents(context)
     }
 
+    private fun reportHookStatus(
+        context: Context,
+        rule: HookRule,
+    ) {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (
+            lastReportedModeGeneration == rule.protectionModeGeneration &&
+            lastHookStatusReportAtElapsedMillis != Long.MIN_VALUE &&
+            nowElapsed - lastHookStatusReportAtElapsedMillis < HOOK_STATUS_MIN_INTERVAL_MS
+        ) return
+        val result = runCatching {
+            context.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_REPORT_HOOK_STATUS,
+                packageName,
+                Bundle().apply {
+                    putInt(RuleContract.KEY_HOOK_VERSION_CODE, BuildConfig.VERSION_CODE)
+                    putLong(
+                        RuleContract.KEY_HOOK_MODE_GENERATION,
+                        rule.protectionModeGeneration,
+                    )
+                },
+            )
+        }
+        val persisted = result.getOrNull()?.getBoolean(RuleContract.KEY_OK, false) == true
+        if (persisted) {
+            val generationChanged = lastReportedModeGeneration != rule.protectionModeGeneration
+            lastReportedModeGeneration = rule.protectionModeGeneration
+            lastHookStatusReportAtElapsedMillis = nowElapsed
+            if (generationChanged) {
+                diagnostic(
+                    context,
+                    event = "HOOK_MODE_ACKNOWLEDGED",
+                    message = "mode=${rule.protectionMode}, modeGeneration=${rule.protectionModeGeneration}",
+                )
+            }
+        } else {
+            XposedBridge.log(
+                "AppTimeLimiter: HOOK_STATUS_REPORT_FAILED package=$packageName " +
+                    "generation=${rule.protectionModeGeneration} " +
+                    "error=${result.exceptionOrNull()?.javaClass?.simpleName ?: "provider_rejected"}",
+            )
+        }
+    }
+
     private fun loadStatsOutbox(context: Context) {
         if (statsOutboxLoaded) return
         val prefs = context.getSharedPreferences(STATS_OUTBOX_PREFS, Context.MODE_PRIVATE)
@@ -2234,6 +2520,10 @@ private class RuntimeLimiter(
                 putInt(RuleContract.KEY_LAUNCH_INCREMENT, batch.launches)
                 putInt(RuleContract.KEY_LIMIT_HIT_INCREMENT, batch.limitHits)
                 putInt(RuleContract.KEY_HOOK_VERSION_CODE, BuildConfig.VERSION_CODE)
+                putLong(
+                    RuleContract.KEY_HOOK_MODE_GENERATION,
+                    lastLoadedRule?.protectionModeGeneration ?: 0L,
+                )
             }
             val result = runCatching {
                 context.contentResolver.call(
@@ -2293,6 +2583,30 @@ private class RuntimeLimiter(
     private fun safeAdd(current: Int, increment: Int): Int =
         if (increment > Int.MAX_VALUE - current) Int.MAX_VALUE else current + increment
 
+    private fun guardXposedUiMode(
+        activity: Activity,
+        rule: HookRule,
+        stage: String,
+    ): Boolean {
+        if (rule.protectionMode == ProtectionMode.XPOSED) return true
+        cancelSessionPlan(dismissDialog = true, resetPrompt = true)
+        if (blockingState != null) {
+            removeBlockingOverlay(activity, "保护模式已切换")
+        }
+        dismissWarning(resetForCurrentLimit = true)
+        dismissScheduleWarning()
+        stopTiming()
+        if (lastUiCancelledModeGeneration != rule.protectionModeGeneration) {
+            lastUiCancelledModeGeneration = rule.protectionModeGeneration
+            diagnostic(
+                activity,
+                event = "HOOK_UI_CANCELLED_BY_MODE",
+                message = "stage=$stage mode=${rule.protectionMode} generation=${rule.protectionModeGeneration}",
+            )
+        }
+        return false
+    }
+
     private fun stopTiming() {
         foregroundStartedAt = NOT_RUNNING
         foregroundDayToken = -1
@@ -2311,10 +2625,11 @@ private class RuntimeLimiter(
     }
 
     private fun showExitWarning() {
-        val activity = activeActivity.get() ?: return
-        if (activity.isFinishing || activity.isDestroyed || exitScheduled) return
+        val activity = currentResumedActivity() ?: return
+        if (exitScheduled) return
         if (isBannerShowing(WarningBannerKind.SCHEDULE)) return
         val rule = readRule(activity, reloadFallback = true)
+        if (!guardXposedUiMode(activity, rule, "quota_warning")) return
         if (!rule.enabled || !rule.exitWarningEnabled) return
 
         val status = thresholdStatus(activity, rule)
@@ -2353,6 +2668,13 @@ private class RuntimeLimiter(
                 remainingMillis = remainingMs,
                 maxProgressMillis = WARNING_LEAD_MS,
                 fullScreen = rule.fullScreenExitWarningEnabled,
+                themeMode = rule.themeMode,
+                themeColor = rule.themeColor,
+                quote = timeQuote(
+                    activity,
+                    rule,
+                    "quota-warning:$processSessionId:$grantedExtensionMs",
+                ),
                 actionLabel = hookText(
                     activity,
                     rule,
@@ -2368,11 +2690,19 @@ private class RuntimeLimiter(
                     },
                 ),
                 onAction = {
-                    if (!activity.isFinishing && !activity.isDestroyed && !exitScheduled) {
+                    val latest = readRule(activity, reloadFallback = true)
+                    if (
+                        guardXposedUiMode(activity, latest, "quota_warning_action") &&
+                        !activity.isFinishing &&
+                        !activity.isDestroyed &&
+                        !exitScheduled
+                    ) {
                         dismissWarning(resetForCurrentLimit = false)
-                        grantExtension(activity, rule.extensionMillis)
+                        grantExtension(activity, latest.extensionMillis)
                     }
                 },
+                exitLabel = hookText(activity, rule, "退出应用", "Exit app"),
+                onExit = { leaveTargetByUser(activity, "time_limit_warning") },
             )
             if (warningVibratedForExtensionMs != grantedExtensionMs) {
                 warningVibratedForExtensionMs = grantedExtensionMs
@@ -2394,9 +2724,10 @@ private class RuntimeLimiter(
     }
 
     private fun showScheduleWarning() {
-        val activity = activeActivity.get() ?: return
-        if (activity.isFinishing || activity.isDestroyed || exitScheduled) return
+        val activity = currentResumedActivity() ?: return
+        if (exitScheduled) return
         val rule = readRule(activity, reloadFallback = true)
+        if (!guardXposedUiMode(activity, rule, "schedule_warning")) return
         if (!rule.enabled || !rule.hasSchedule() || !rule.exitWarningEnabled) return
         val decision = evaluateSchedule(rule)
         if (!decision.allowed) {
@@ -2425,6 +2756,15 @@ private class RuntimeLimiter(
                 remainingMillis = remainingMs,
                 maxProgressMillis = WARNING_LEAD_MS,
                 fullScreen = rule.fullScreenExitWarningEnabled,
+                themeMode = rule.themeMode,
+                themeColor = rule.themeColor,
+                quote = timeQuote(
+                    activity,
+                    rule,
+                    "schedule-warning:$processSessionId:${dayToken()}",
+                ),
+                exitLabel = hookText(activity, rule, "退出应用", "Exit app"),
+                onExit = { leaveTargetByUser(activity, "schedule_warning") },
             )
             vibrateExitWarning(activity, rule)
             diagnostic(
@@ -2479,8 +2819,8 @@ private class RuntimeLimiter(
         return hookText(
             context,
             rule,
-            "$seconds 秒后退出 · 时段限制不可延时",
-            "Exit in $seconds sec · schedule limits cannot be extended",
+            "$seconds 秒后退出 · 可立即退出，时段限制不可延时",
+            "Exit in $seconds sec · exit now; schedule limits cannot be extended",
         )
     }
 
@@ -2714,8 +3054,8 @@ private class RuntimeLimiter(
         return hookText(
             context,
             rule,
-            "$seconds 秒后退出 · 延时将同步延长已开启阈值 ${formatDuration(context, rule, extensionMillis)}",
-            "Exit in $seconds sec · extension adds ${formatDuration(context, rule, extensionMillis)} to active limits",
+            "$seconds 秒后退出 · 可立即退出，或延长 ${formatDuration(context, rule, extensionMillis)}",
+            "Exit in $seconds sec · exit now or extend ${formatDuration(context, rule, extensionMillis)}",
         )
     }
 
@@ -2737,6 +3077,15 @@ private class RuntimeLimiter(
 
     private fun isEnglish(context: Context, rule: HookRule): Boolean =
         AppLocaleController.resolvedLanguage(context, rule.languageMode) == SupportedLanguage.ENGLISH
+
+    private fun timeQuote(context: Context, rule: HookRule, seed: String): String? =
+        TimeQuotePolicy.select(
+            enabled = rule.timeQuotesEnabled,
+            builtInEnabled = rule.builtInTimeQuotesEnabled,
+            customQuotes = rule.customTimeQuotes,
+            english = isEnglish(context, rule),
+            seed = seed,
+        )
 
     private fun localDailyUsedMillis(context: Context, rule: HookRule): Long {
         val statePrefs = context.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE)
@@ -2993,6 +3342,15 @@ private class RuntimeLimiter(
             )
         }.getOrNull()?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) }?.let { result ->
             val rule = HookRule(
+                protectionMode = ProtectionModePolicy.parse(
+                    storedValue = result.getString(RuleContract.KEY_PROTECTION_MODE),
+                    legacyNonRootEnabled = false,
+                    legacyShizukuEnabled = false,
+                ),
+                protectionModeGeneration = result.getLong(
+                    RuleContract.KEY_PROTECTION_MODE_GENERATION,
+                    RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION,
+                ).coerceAtLeast(RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION),
                 enabled = result.getBoolean(RuleContract.KEY_ENABLED, false),
                 sessionPlanningEnabled = result.getBoolean(
                     RuleContract.KEY_SESSION_PLANNING_ENABLED,
@@ -3125,6 +3483,23 @@ private class RuntimeLimiter(
                 languageMode = result.getString(RuleContract.KEY_LANGUAGE_MODE)
                     ?.let { runCatching { AppLanguageMode.valueOf(it) }.getOrNull() }
                     ?: AppLanguageMode.SYSTEM,
+                themeMode = result.getString(RuleContract.KEY_THEME_MODE)
+                    ?.let { runCatching { AppThemeMode.valueOf(it) }.getOrNull() }
+                    ?: AppThemeMode.SYSTEM,
+                themeColor = ThemeColorPolicy.parse(
+                    result.getString(RuleContract.KEY_THEME_COLOR),
+                ),
+                timeQuotesEnabled = result.getBoolean(
+                    RuleContract.KEY_TIME_QUOTES_ENABLED,
+                    true,
+                ),
+                builtInTimeQuotesEnabled = result.getBoolean(
+                    RuleContract.KEY_BUILT_IN_TIME_QUOTES_ENABLED,
+                    true,
+                ),
+                customTimeQuotes = TimeQuotePolicy.parseCustomQuotes(
+                    result.getString(RuleContract.KEY_CUSTOM_TIME_QUOTES).orEmpty(),
+                ),
                 extensionMillis = result.getLong(
                     RuleContract.KEY_EXTENSION_SECONDS,
                     RuleRepository.DEFAULT_EXTENSION_SECONDS,
@@ -3161,14 +3536,24 @@ private class RuntimeLimiter(
             cachedRule?.groupEnabled == true &&
             rawSharedRule.groupIdentity() == cachedRule.groupIdentity()
         ) {
+            val cooldownRule = if (
+                RuleSnapshotSelectionPolicy.shouldUseSharedCooldown(
+                    sharedEndsAtMillis = rawSharedRule.groupCooldownEndsAtMillis,
+                    cachedEndsAtMillis = cachedRule.groupCooldownEndsAtMillis,
+                )
+            ) {
+                rawSharedRule
+            } else {
+                cachedRule
+            }
             rawSharedRule.copy(
                 groupTodayUsedMillis = cachedRule.groupTodayUsedMillis,
                 groupDayToken = cachedRule.groupDayToken,
                 groupMeasuredAtElapsedMillis = cachedRule.groupMeasuredAtElapsedMillis,
-                groupCooldownStartedAtMillis = cachedRule.groupCooldownStartedAtMillis,
-                groupCooldownEndsAtMillis = cachedRule.groupCooldownEndsAtMillis,
-                groupCooldownIncidentId = cachedRule.groupCooldownIncidentId,
-                groupCooldownSourcePackage = cachedRule.groupCooldownSourcePackage,
+                groupCooldownStartedAtMillis = cooldownRule.groupCooldownStartedAtMillis,
+                groupCooldownEndsAtMillis = cooldownRule.groupCooldownEndsAtMillis,
+                groupCooldownIncidentId = cooldownRule.groupCooldownIncidentId,
+                groupCooldownSourcePackage = cooldownRule.groupCooldownSourcePackage,
             )
         } else {
             rawSharedRule
@@ -3254,6 +3639,21 @@ private class RuntimeLimiter(
         val groupPerLaunchEnabled = groupEnabled &&
             preferences.getBoolean("${groupPrefix}per_launch_enabled", false)
         return HookRule(
+            protectionMode = ProtectionModePolicy.parse(
+                storedValue = preferences.getString(RuleRepository.KEY_PROTECTION_MODE, null),
+                legacyNonRootEnabled = preferences.getBoolean(
+                    RuleRepository.KEY_NON_ROOT_PROTECTION_ENABLED,
+                    false,
+                ),
+                legacyShizukuEnabled = preferences.getBoolean(
+                    RuleRepository.KEY_SHIZUKU_ENHANCEMENT_ENABLED,
+                    false,
+                ),
+            ),
+            protectionModeGeneration = preferences.getLong(
+                RuleRepository.KEY_PROTECTION_MODE_GENERATION,
+                RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION,
+            ).coerceAtLeast(RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION),
             enabled = if (groupAssigned) {
                 groupEnabled
             } else {
@@ -3378,6 +3778,25 @@ private class RuntimeLimiter(
                 AppLanguageMode.SYSTEM.name,
             )?.let { runCatching { AppLanguageMode.valueOf(it) }.getOrNull() }
                 ?: AppLanguageMode.SYSTEM,
+            themeMode = preferences.getString(
+                RuleRepository.KEY_THEME_MODE,
+                AppThemeMode.SYSTEM.name,
+            )?.let { runCatching { AppThemeMode.valueOf(it) }.getOrNull() }
+                ?: AppThemeMode.SYSTEM,
+            themeColor = ThemeColorPolicy.parse(
+                preferences.getString(RuleRepository.KEY_THEME_COLOR, null),
+            ),
+            timeQuotesEnabled = preferences.getBoolean(
+                RuleRepository.KEY_TIME_QUOTES_ENABLED,
+                true,
+            ),
+            builtInTimeQuotesEnabled = preferences.getBoolean(
+                RuleRepository.KEY_BUILT_IN_TIME_QUOTES_ENABLED,
+                true,
+            ),
+            customTimeQuotes = TimeQuotePolicy.parseCustomQuotes(
+                preferences.getString(RuleRepository.KEY_CUSTOM_TIME_QUOTES, "").orEmpty(),
+            ),
             extensionMillis = preferences.getLong(
                 RuleRepository.KEY_EXTENSION_SECONDS,
                 RuleRepository.DEFAULT_EXTENSION_SECONDS,
@@ -3397,6 +3816,8 @@ private class RuntimeLimiter(
 
     private fun cacheRule(context: Context, rule: HookRule) {
         val signature = listOf(
+            rule.protectionMode,
+            rule.protectionModeGeneration,
             rule.enabled,
             rule.sessionPlanningEnabled,
             rule.dailyEnabled,
@@ -3433,6 +3854,11 @@ private class RuntimeLimiter(
             rule.fullScreenExitWarningEnabled,
             rule.exitWarningVibrationEnabled,
             rule.languageMode.name,
+            rule.themeMode.name,
+            rule.themeColor.name,
+            rule.timeQuotesEnabled,
+            rule.builtInTimeQuotesEnabled,
+            TimeQuotePolicy.encode(rule.customTimeQuotes),
             rule.extensionMillis,
             rule.limitEnforcementMode.name,
             rule.diagnosticsEnabled,
@@ -3443,6 +3869,8 @@ private class RuntimeLimiter(
         if (prefs.getString(CACHE_SIGNATURE, null) == signature) return
         prefs.edit()
             .putBoolean(CACHE_PRESENT, true)
+            .putString(CACHE_PROTECTION_MODE, rule.protectionMode.name)
+            .putLong(CACHE_PROTECTION_MODE_GENERATION, rule.protectionModeGeneration)
             .putBoolean(CACHE_ENABLED, rule.enabled)
             .putBoolean(CACHE_SESSION_PLANNING_ENABLED, rule.sessionPlanningEnabled)
             .putBoolean(CACHE_DAILY_ENABLED, rule.dailyEnabled)
@@ -3494,6 +3922,17 @@ private class RuntimeLimiter(
                 rule.exitWarningVibrationEnabled,
             )
             .putString(CACHE_LANGUAGE_MODE, rule.languageMode.name)
+            .putString(CACHE_THEME_MODE, rule.themeMode.name)
+            .putString(CACHE_THEME_COLOR, rule.themeColor.name)
+            .putBoolean(CACHE_TIME_QUOTES_ENABLED, rule.timeQuotesEnabled)
+            .putBoolean(
+                CACHE_BUILT_IN_TIME_QUOTES_ENABLED,
+                rule.builtInTimeQuotesEnabled,
+            )
+            .putString(
+                CACHE_CUSTOM_TIME_QUOTES,
+                TimeQuotePolicy.encode(rule.customTimeQuotes),
+            )
             .putLong(CACHE_EXTENSION_MS, rule.extensionMillis)
             .putString(CACHE_LIMIT_ENFORCEMENT_MODE, rule.limitEnforcementMode.name)
             .putBoolean(CACHE_DIAGNOSTICS_ENABLED, rule.diagnosticsEnabled)
@@ -3520,6 +3959,15 @@ private class RuntimeLimiter(
             false,
         )
         return HookRule(
+            protectionMode = ProtectionModePolicy.parse(
+                storedValue = prefs.getString(CACHE_PROTECTION_MODE, null),
+                legacyNonRootEnabled = false,
+                legacyShizukuEnabled = false,
+            ),
+            protectionModeGeneration = prefs.getLong(
+                CACHE_PROTECTION_MODE_GENERATION,
+                RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION,
+            ).coerceAtLeast(RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION),
             enabled = prefs.getBoolean(CACHE_ENABLED, false),
             sessionPlanningEnabled = !groupAssigned &&
                 prefs.getBoolean(CACHE_SESSION_PLANNING_ENABLED, false),
@@ -3630,6 +4078,18 @@ private class RuntimeLimiter(
             languageMode = prefs.getString(CACHE_LANGUAGE_MODE, AppLanguageMode.SYSTEM.name)
                 ?.let { runCatching { AppLanguageMode.valueOf(it) }.getOrNull() }
                 ?: AppLanguageMode.SYSTEM,
+            themeMode = prefs.getString(CACHE_THEME_MODE, AppThemeMode.SYSTEM.name)
+                ?.let { runCatching { AppThemeMode.valueOf(it) }.getOrNull() }
+                ?: AppThemeMode.SYSTEM,
+            themeColor = ThemeColorPolicy.parse(prefs.getString(CACHE_THEME_COLOR, null)),
+            timeQuotesEnabled = prefs.getBoolean(CACHE_TIME_QUOTES_ENABLED, true),
+            builtInTimeQuotesEnabled = prefs.getBoolean(
+                CACHE_BUILT_IN_TIME_QUOTES_ENABLED,
+                true,
+            ),
+            customTimeQuotes = TimeQuotePolicy.parseCustomQuotes(
+                prefs.getString(CACHE_CUSTOM_TIME_QUOTES, "").orEmpty(),
+            ),
             extensionMillis = prefs.getLong(
                 CACHE_EXTENSION_MS,
                 RuleRepository.DEFAULT_EXTENSION_SECONDS * 1000L,
@@ -3651,6 +4111,10 @@ private class RuntimeLimiter(
         rulesetGeneration: Long = 0L,
         source: String = "unavailable",
     ) = HookRule(
+        protectionMode = ProtectionMode.XPOSED,
+        protectionModeGeneration = rulesetGeneration.coerceAtLeast(
+            RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION,
+        ),
         enabled = false,
         sessionPlanningEnabled = false,
         dailyEnabled = false,
@@ -3690,6 +4154,11 @@ private class RuntimeLimiter(
         fullScreenExitWarningEnabled = false,
         exitWarningVibrationEnabled = false,
         languageMode = AppLanguageMode.SYSTEM,
+        themeMode = AppThemeMode.SYSTEM,
+        themeColor = AppThemeColor.GREEN,
+        timeQuotesEnabled = true,
+        builtInTimeQuotesEnabled = true,
+        customTimeQuotes = emptyList(),
         extensionMillis = RuleRepository.DEFAULT_EXTENSION_SECONDS * 1000L,
         limitEnforcementMode = LimitEnforcementMode.FORCE_EXIT,
         diagnosticsEnabled = true,
@@ -3730,7 +4199,16 @@ private class RuntimeLimiter(
         return calendar.get(Calendar.YEAR) * 1000 + calendar.get(Calendar.DAY_OF_YEAR)
     }
 
+    private fun dateFromDayToken(token: Int): String? {
+        val year = token / 1000
+        val dayOfYear = token % 1000
+        if (year <= 0 || dayOfYear <= 0) return null
+        return runCatching { LocalDate.ofYearDay(year, dayOfYear).toString() }.getOrNull()
+    }
+
     private data class HookRule(
+        val protectionMode: ProtectionMode,
+        val protectionModeGeneration: Long,
         val enabled: Boolean,
         val sessionPlanningEnabled: Boolean,
         val dailyEnabled: Boolean,
@@ -3770,6 +4248,11 @@ private class RuntimeLimiter(
         val fullScreenExitWarningEnabled: Boolean,
         val exitWarningVibrationEnabled: Boolean,
         val languageMode: AppLanguageMode,
+        val themeMode: AppThemeMode,
+        val themeColor: AppThemeColor,
+        val timeQuotesEnabled: Boolean,
+        val builtInTimeQuotesEnabled: Boolean,
+        val customTimeQuotes: List<String>,
         val extensionMillis: Long,
         val limitEnforcementMode: LimitEnforcementMode,
         val diagnosticsEnabled: Boolean,
@@ -3809,8 +4292,6 @@ private class RuntimeLimiter(
     private data class BlockingState(
         val reason: LimitBlockReason,
         val token: String,
-        val title: String,
-        val message: String,
         val ruleVersion: Long = Long.MIN_VALUE,
         val groupVersion: Long = Long.MIN_VALUE,
         val cooldownEndsAtMillis: Long = 0L,
@@ -3828,7 +4309,7 @@ private class RuntimeLimiter(
     private companion object {
         const val NOT_RUNNING = -1L
         const val ACTIVITY_HANDOFF_GRACE_MS = 350L
-        const val SESSION_PLAN_PROMPT_STABLE_MS = 500L
+        const val SESSION_PLAN_PROMPT_STABLE_MS = 1_000L
         const val SESSION_PLAN_PROMPT_RETRY_MS = 1_000L
         const val STATE_PREFS = "__app_time_limiter_state__"
         const val RULE_CACHE_PREFS = "__app_time_limiter_rule_cache__"
@@ -3845,6 +4326,8 @@ private class RuntimeLimiter(
         const val KEY_SCHEDULE_BLOCK_TOKEN = "schedule_block_token"
         const val CACHE_PRESENT = "present"
         const val CACHE_SIGNATURE = "signature"
+        const val CACHE_PROTECTION_MODE = "protection_mode"
+        const val CACHE_PROTECTION_MODE_GENERATION = "protection_mode_generation"
         const val CACHE_ENABLED = "enabled"
         const val CACHE_SESSION_PLANNING_ENABLED = "session_planning_enabled"
         const val CACHE_DAILY_ENABLED = "daily_enabled"
@@ -3881,6 +4364,11 @@ private class RuntimeLimiter(
         const val CACHE_FULL_SCREEN_EXIT_WARNING_ENABLED = "full_screen_exit_warning_enabled"
         const val CACHE_EXIT_WARNING_VIBRATION_ENABLED = "exit_warning_vibration_enabled"
         const val CACHE_LANGUAGE_MODE = "language_mode"
+        const val CACHE_THEME_MODE = "theme_mode"
+        const val CACHE_THEME_COLOR = "theme_color"
+        const val CACHE_TIME_QUOTES_ENABLED = "time_quotes_enabled"
+        const val CACHE_BUILT_IN_TIME_QUOTES_ENABLED = "built_in_time_quotes_enabled"
+        const val CACHE_CUSTOM_TIME_QUOTES = "custom_time_quotes"
         const val CACHE_EXTENSION_MS = "extension_ms"
         const val CACHE_LIMIT_ENFORCEMENT_MODE = "limit_enforcement_mode"
         const val CACHE_DIAGNOSTICS_ENABLED = "diagnostics_enabled"
@@ -3903,6 +4391,8 @@ private class RuntimeLimiter(
         const val RULE_RECHECK_MAX_MS = 60_000L
         const val SYSTEM_USAGE_PENDING_RECHECK_MS = 1_000L
         const val GROUP_USAGE_SYNC_INTERVAL_MS = 15_000L
+        const val HOOK_HEARTBEAT_MIN_INTERVAL_MS = 500L
+        const val HOOK_STATUS_MIN_INTERVAL_MS = 500L
         const val MAX_STATS_RETRIES = 3
         const val MAX_STATS_DURATION_PER_DAY_MS = 24L * 60L * 60L * 1000L
         val STATS_RETRY_DELAYS_MS = longArrayOf(1_000L, 5_000L, 15_000L)
