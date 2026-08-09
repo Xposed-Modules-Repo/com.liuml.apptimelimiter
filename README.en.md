@@ -122,6 +122,28 @@ When upgrading from a build whose only rule copy lives in LSPosed's redirected p
 
 On frameworks that expose the modern service, Time Stop can read scope before the target app is opened and request missing packages through the framework confirmation UI. Older frameworks fall back to the persisted `HOOK_READY` heartbeat, so "Hook verified" means the target app has successfully loaded this module version before.
 
+## Distribution
+
+### GitHub Releases
+
+The official APK is published from the LSPosed mirror repository:
+
+<https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest>
+
+### Obtainium
+
+Time Stop works with Obtainium by tracking GitHub Releases:
+
+- App source URL: `https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter`
+- Source type: GitHub Releases
+- APK asset pattern: `app-time-limiter-v*.apk`
+
+Obtainium is a third-party updater. It does not change Time Stop's protection engine; it only checks the release page and installs the APK selected by the user.
+
+### F-Droid
+
+Time Stop is licensed as GPL-3.0-only so it can be submitted to F-Droid-compatible repositories. Packaging metadata is kept in `packaging/fdroid/`. Until the official F-Droid review is accepted, use GitHub Releases, LSPosed, Obtainium, or a self-hosted F-Droid repository.
+
 ## Diagnostics
 
 Open **Diagnostic Logs** from the home screen and check:
@@ -193,9 +215,7 @@ This tool should be used only by the device owner or on explicitly authorized ma
 
 ## License and copyright
 
-This repository does not grant a general open-source license. Individual users may install and
-use unmodified official binaries obtained from release channels approved by the author for
-personal, non-commercial purposes. Copying, impersonation, repackaging, paid redistribution,
-resale, derivative works, and commercial use require prior written authorization. See
+Time Stop is free software licensed under GPL-3.0-only. You may use, study, modify, and
+redistribute it under the terms of the GNU General Public License version 3 only. See
 [LICENSE](LICENSE) for the complete terms. Third-party components remain under their respective
 licenses.

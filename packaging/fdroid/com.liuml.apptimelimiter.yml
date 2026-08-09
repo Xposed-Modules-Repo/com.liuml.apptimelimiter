@@ -1,0 +1,48 @@
+Categories:
+  - Time
+  - System
+License: GPL-3.0-only
+AuthorName: TACPR
+AuthorEmail: liuml.yx@139.com
+WebSite: https://modules.lsposed.org/module/com.liuml.apptimelimiter/
+SourceCode: https://github.com/TACPR/com.liuml.apptimelimiter
+IssueTracker: https://github.com/TACPR/com.liuml.apptimelimiter/issues
+Changelog: https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases
+
+AutoName: Time Stop
+Summary: Precise app-time control with LSPosed and non-root protection modes
+Description: |-
+    Time Stop is an Android app-time control tool for device owners who want
+    explicit, composable usage boundaries.
+
+    It supports per-app rules, daily quotas, per-launch timers, weekly
+    allow/block windows, shared group budgets, cooldowns after forced exits,
+    session planning, diagnostics, and update checks.
+
+    On rooted devices, Time Stop can use LSPosed/Xposed hooks for the strongest
+    enforcement. On non-root devices, it can use a content-blind Accessibility
+    service plus Android UsageStats for package-level foreground detection and
+    daily usage calibration. The optional Shizuku mode is used only as an
+    execution enhancement for configured third-party target apps and falls back
+    to the normal restriction page when unavailable.
+
+    The accessibility service is designed for package-level foreground changes:
+    it does not retrieve window content, nodes, text, account data, input, or
+    notifications, and it does not upload foreground events or diagnostics.
+
+RepoType: git
+Repo: https://github.com/TACPR/com.liuml.apptimelimiter.git
+
+Builds:
+  - versionName: 0.10.14
+    versionCode: 37
+    commit: 37-0.10.14
+    subdir: .
+    gradle:
+      - yes
+
+AutoUpdateMode: Version %c-%v
+UpdateCheckMode: Tags
+CurrentVersion: 0.10.14
+CurrentVersionCode: 37
+

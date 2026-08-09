@@ -5,10 +5,11 @@
 ![Android 8.1+](https://img.shields.io/badge/Android-8.1%2B-3DDC84?logo=android&logoColor=white)
 ![LSPosed API 93+](https://img.shields.io/badge/LSPosed-API%2093%2B-5C6BC0)
 ![Version 0.10.14](https://img.shields.io/badge/version-0.10.14-2E7D5B)
+![License GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
 Stock screen-time tools are usually built for reports, daily caps, and focus modes. **Time Stop** is built for people who want sharper controls: per-app quotas, per-launch timers, weekly allow/block windows, shared group budgets, cooldowns after forced exits, Hook verification, and diagnostics that show what is actually happening inside the target process.
 
-[Latest release](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed module page](https://modules.lsposed.org/module/com.liuml.apptimelimiter/) · [中文说明](#中文说明)
+[Latest release](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed module page](https://modules.lsposed.org/module/com.liuml.apptimelimiter/) · [Obtainium](#obtainium) · [中文说明](#中文说明)
 
 Current version: `0.10.14`
 
@@ -125,6 +126,28 @@ Time Stop checks required non-root permissions when the manager opens and when i
 When upgrading from a build that stored its only rule copy in LSPosed's redirected preferences, open Time Stop once while the module is still enabled. This performs a one-time migration to the stable private manager store. After that migration, disabling LSPosed no longer switches the manager UI to a different rule database.
 
 On frameworks that expose the modern service, Time Stop can read scope before the target app is opened and request missing packages through the framework confirmation UI. Older frameworks fall back to the persisted `HOOK_READY` heartbeat, so "Hook verified" means the target app has successfully loaded this module version before.
+
+## Distribution
+
+### GitHub Releases
+
+The official APK is published from the LSPosed mirror repository:
+
+<https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest>
+
+### Obtainium
+
+Time Stop works with Obtainium by tracking GitHub Releases:
+
+- App source URL: `https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter`
+- Source type: GitHub Releases
+- APK asset pattern: `app-time-limiter-v*.apk`
+
+Obtainium is a third-party updater. It does not change Time Stop's protection engine; it only checks the release page and installs the APK selected by the user.
+
+### F-Droid
+
+Time Stop is licensed as GPL-3.0-only so it can be submitted to F-Droid-compatible repositories. Packaging metadata is kept in `packaging/fdroid/`. Until the official F-Droid review is accepted, use GitHub Releases, LSPosed, Obtainium, or a self-hosted F-Droid repository.
 
 ## Diagnostics
 
@@ -323,6 +346,28 @@ subst T: /d
 
 支持现代服务的框架可在目标应用尚未打开时直接显示作用域状态，缺少作用域时可通过框架确认界面申请加入。旧版 LSPosed 会自动回退到 `HOOK_READY` 心跳验证；此时“Hook 已验证”表示目标应用曾成功加载当前版本。
 
+## 分发渠道
+
+### GitHub Releases
+
+官方 APK 发布在 LSPosed 镜像仓库：
+
+<https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest>
+
+### Obtainium
+
+时停可通过 Obtainium 跟踪 GitHub Releases 更新：
+
+- 应用来源 URL：`https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter`
+- 来源类型：GitHub Releases
+- APK 文件匹配：`app-time-limiter-v*.apk`
+
+Obtainium 是第三方更新工具，只负责检查 Release 页面并由用户选择安装 APK，不改变时停自身的保护链路。
+
+### F-Droid
+
+时停已改为 GPL-3.0-only 授权，可提交到 F-Droid 兼容仓库。打包元数据放在 `packaging/fdroid/`。在官方 F-Droid 审核通过前，请继续使用 GitHub Releases、LSPosed、Obtainium 或自建 F-Droid 仓库。
+
 ## 诊断日志判断方法
 
 在首页点击“诊断日志”，重点查看以下事件：
@@ -395,4 +440,4 @@ subst T: /d
 
 ## 软件许可与版权
 
-本仓库没有授予通用开源许可。个人用户可以从作者认可的官方发布渠道下载、安装并非商业使用未经修改的官方版本；未经书面授权，不得抄袭、改名冒充、重新打包、收费分发、倒卖或用于其他商业产品。完整条款见 [LICENSE](LICENSE)，第三方组件仍分别遵循其原有许可证。
+时停是采用 GPL-3.0-only 授权的自由软件。你可以在 GNU General Public License 第 3 版的条款下使用、学习、修改和再分发本项目。完整条款见 [LICENSE](LICENSE)，第三方组件仍分别遵循其原有许可证。
