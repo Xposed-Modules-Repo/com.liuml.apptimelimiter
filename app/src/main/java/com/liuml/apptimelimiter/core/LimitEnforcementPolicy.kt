@@ -80,6 +80,43 @@ object ActivityCallbackPolicy {
             !exitScheduled
 }
 
+enum class ExitActivityResumeAction {
+    IGNORE_DUPLICATE,
+    CONTINUE,
+    REJECT_REENTRY,
+}
+
+enum class ExitRecoveryAction {
+    NO_OP,
+    CLEAR_ONLY,
+    RECHECK_RESUMED_ACTIVITY,
+}
+
+/**
+ * Keeps a system app from reopening an untracked Activity while its previous task is being
+ * dismissed. System apps are intentionally not process-killed, so lifecycle registration must
+ * happen before the pending-exit guard is evaluated.
+ */
+object ExitReentryPolicy {
+    fun onActivityResumed(
+        exitScheduled: Boolean,
+        newlyRegistered: Boolean,
+    ): ExitActivityResumeAction = when {
+        !newlyRegistered -> ExitActivityResumeAction.IGNORE_DUPLICATE
+        exitScheduled -> ExitActivityResumeAction.REJECT_REENTRY
+        else -> ExitActivityResumeAction.CONTINUE
+    }
+
+    fun onRecoveryWindowElapsed(
+        exitScheduled: Boolean,
+        hasResumedActivity: Boolean,
+    ): ExitRecoveryAction = when {
+        !exitScheduled -> ExitRecoveryAction.NO_OP
+        hasResumedActivity -> ExitRecoveryAction.RECHECK_RESUMED_ACTIVITY
+        else -> ExitRecoveryAction.CLEAR_ONLY
+    }
+}
+
 object RestPagePolicy {
     data class QuotaState(
         val reason: LimitBlockReason,

@@ -17,6 +17,18 @@ class ProtectionExecutionPolicyTest {
         ).forEach { mode ->
             assertFalse(ProtectionExecutionPolicy.hookMayExecute(mode))
             assertFalse(ProtectionExecutionPolicy.acceptHookSideEffect(mode))
+            assertFalse(
+                ProtectionExecutionPolicy.acceptUsageReport(
+                    mode = mode,
+                    trustedManagerRequest = false,
+                ),
+            )
+            assertTrue(
+                ProtectionExecutionPolicy.acceptUsageReport(
+                    mode = mode,
+                    trustedManagerRequest = true,
+                ),
+            )
             assertTrue(ProtectionExecutionPolicy.nonRootMayExecute(mode))
             assertFalse(
                 ProtectionExecutionPolicy.ruleSnapshotMayExecute(
@@ -35,6 +47,12 @@ class ProtectionExecutionPolicyTest {
             ProtectionExecutionPolicy.ruleSnapshotMayExecute(
                 ProtectionMode.XPOSED,
                 trustedNonRootRequest = true,
+            ),
+        )
+        assertTrue(
+            ProtectionExecutionPolicy.acceptUsageReport(
+                mode = ProtectionMode.XPOSED,
+                trustedManagerRequest = false,
             ),
         )
     }

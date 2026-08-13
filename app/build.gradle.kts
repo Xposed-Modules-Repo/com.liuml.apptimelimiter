@@ -12,8 +12,8 @@ android {
         applicationId = "com.liuml.apptimelimiter"
         minSdk = 27
         targetSdk = 35
-        versionCode = 37
-        versionName = "0.10.14"
+        versionCode = 38
+        versionName = "0.10.15"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

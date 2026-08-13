@@ -34,14 +34,14 @@ RepoType: git
 Repo: https://github.com/TACPR/com.liuml.apptimelimiter.git
 
 Builds:
-  - versionName: 0.10.14
-    versionCode: 37
-    commit: 37-0.10.14
+  - versionName: 0.10.15
+    versionCode: 38
+    commit: 38-0.10.15
     subdir: .
     gradle:
       - yes
 
 AutoUpdateMode: Version %c-%v
 UpdateCheckMode: Tags
-CurrentVersion: 0.10.14
-CurrentVersionCode: 37
+CurrentVersion: 0.10.15
+CurrentVersionCode: 38

@@ -83,4 +83,24 @@ object NonRootActionGuard {
     ): Boolean = newForegroundPackageName != targetPackageName &&
         newForegroundPackageName != ownPackageName &&
         newForegroundKind != ForegroundPackageKind.TIME_STOP_OVERLAY
+
+    /**
+     * Transient system surfaces replace the execution snapshot without changing the underlying
+     * foreground app. When that app emits a new authoritative accessibility event, restore the
+     * target snapshot even though the package-level foreground session did not change.
+     */
+    fun shouldRestoreSamePackageSnapshot(
+        currentForegroundPackageName: String?,
+        signalPackageName: String,
+        signalKind: ForegroundPackageKind,
+        signalConfirmedByAccessibility: Boolean,
+        currentExecutionSnapshot: ForegroundExecutionSnapshot?,
+    ): Boolean = currentForegroundPackageName == signalPackageName &&
+        signalKind == ForegroundPackageKind.TARGET_APP &&
+        signalConfirmedByAccessibility &&
+        (
+            currentExecutionSnapshot?.packageName != signalPackageName ||
+                currentExecutionSnapshot.kind != ForegroundPackageKind.TARGET_APP ||
+                !currentExecutionSnapshot.confirmedByAccessibility
+            )
 }

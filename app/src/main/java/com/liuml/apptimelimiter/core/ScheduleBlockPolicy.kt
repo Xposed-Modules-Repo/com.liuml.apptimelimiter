@@ -6,9 +6,10 @@ import com.liuml.apptimelimiter.data.ScheduleMode
 object ScheduleBlockPolicy {
     fun token(
         ruleVersion: Long,
+        groupVersion: Long,
         mode: ScheduleMode,
         nextTransitionEpochMillis: Long?,
-    ): String = "$ruleVersion:$mode:${nextTransitionEpochMillis ?: "none"}"
+    ): String = "$ruleVersion:$groupVersion:$mode:${nextTransitionEpochMillis ?: "none"}"
 
     fun shouldRecord(previousToken: String?, currentToken: String): Boolean =
         previousToken != currentToken

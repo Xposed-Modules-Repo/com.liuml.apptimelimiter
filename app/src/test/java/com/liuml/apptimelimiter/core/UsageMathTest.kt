@@ -71,6 +71,16 @@ class UsageMathTest {
     }
 
     @Test
+    fun `daily usage addition saturates instead of wrapping negative`() {
+        assertEquals(12_000L, UsageMath.saturatedAddMillis(5_000L, 7_000L))
+        assertEquals(
+            Long.MAX_VALUE,
+            UsageMath.saturatedAddMillis(Long.MAX_VALUE - 1L, 2L),
+        )
+        assertEquals(5_000L, UsageMath.saturatedAddMillis(5_000L, -1L))
+    }
+
+    @Test
     fun `system snapshot does not double count the active foreground segment`() {
         assertEquals(
             2_000L,
@@ -90,6 +100,22 @@ class UsageMathTest {
         assertEquals(
             Long.MAX_VALUE,
             UsageMath.projectedSystemUsageMillis(Long.MAX_VALUE - 1L, 3_000L),
+        )
+    }
+
+    @Test
+    fun `daily hook usage resets only when the calendar day changes`() {
+        assertFalse(
+            DailyUsageStatePolicy.shouldReset(
+                savedDayToken = 20260813,
+                currentDayToken = 20260813,
+            ),
+        )
+        assertTrue(
+            DailyUsageStatePolicy.shouldReset(
+                savedDayToken = 20260813,
+                currentDayToken = 20260814,
+            ),
         )
     }
 }

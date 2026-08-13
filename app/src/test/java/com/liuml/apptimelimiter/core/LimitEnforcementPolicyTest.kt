@@ -118,6 +118,56 @@ class LimitEnforcementPolicyTest {
     }
 
     @Test
+    fun pendingExitRegistersAndRejectsOnlyNewActivityReentry() {
+        assertEquals(
+            ExitActivityResumeAction.REJECT_REENTRY,
+            ExitReentryPolicy.onActivityResumed(
+                exitScheduled = true,
+                newlyRegistered = true,
+            ),
+        )
+        assertEquals(
+            ExitActivityResumeAction.IGNORE_DUPLICATE,
+            ExitReentryPolicy.onActivityResumed(
+                exitScheduled = true,
+                newlyRegistered = false,
+            ),
+        )
+        assertEquals(
+            ExitActivityResumeAction.CONTINUE,
+            ExitReentryPolicy.onActivityResumed(
+                exitScheduled = false,
+                newlyRegistered = true,
+            ),
+        )
+    }
+
+    @Test
+    fun pendingExitRecoveryRechecksOnlyAStillResumedActivity() {
+        assertEquals(
+            ExitRecoveryAction.RECHECK_RESUMED_ACTIVITY,
+            ExitReentryPolicy.onRecoveryWindowElapsed(
+                exitScheduled = true,
+                hasResumedActivity = true,
+            ),
+        )
+        assertEquals(
+            ExitRecoveryAction.CLEAR_ONLY,
+            ExitReentryPolicy.onRecoveryWindowElapsed(
+                exitScheduled = true,
+                hasResumedActivity = false,
+            ),
+        )
+        assertEquals(
+            ExitRecoveryAction.NO_OP,
+            ExitReentryPolicy.onRecoveryWindowElapsed(
+                exitScheduled = false,
+                hasResumedActivity = true,
+            ),
+        )
+    }
+
+    @Test
     fun restPageStartsNewPerLaunchCycleAfterCooldown() {
         assertTrue(
             RestPagePolicy.shouldStartNewPerLaunchCycle(

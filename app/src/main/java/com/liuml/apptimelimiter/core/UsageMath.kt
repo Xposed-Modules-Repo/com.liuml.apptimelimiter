@@ -29,6 +29,12 @@ object UsageMath {
     fun authoritativeDailyUsedMillis(localMillis: Long, systemMillis: Long): Long =
         maxOf(localMillis.coerceAtLeast(0L), systemMillis.coerceAtLeast(0L))
 
+    fun saturatedAddMillis(leftMillis: Long, rightMillis: Long): Long {
+        val left = leftMillis.coerceAtLeast(0L)
+        val right = rightMillis.coerceAtLeast(0L)
+        return if (right > Long.MAX_VALUE - left) Long.MAX_VALUE else left + right
+    }
+
     fun activeIncludedAtMeasurementMillis(
         foregroundStartedAtElapsedMillis: Long,
         measuredAtElapsedMillis: Long,
@@ -68,4 +74,16 @@ object UsageReportingPolicy {
         usageStatsEnabled: Boolean,
         groupDailyEnabled: Boolean,
     ): Boolean = usageStatsEnabled || groupDailyEnabled
+}
+
+object DailyUsageStatePolicy {
+    /**
+     * Daily usage belongs to the package and calendar day, not to a particular rule revision.
+     * Editing a limit, theme, or another rule field must never erase time already accumulated
+     * today. A new day is the only automatic reset boundary.
+     */
+    fun shouldReset(
+        savedDayToken: Int,
+        currentDayToken: Int,
+    ): Boolean = savedDayToken != currentDayToken
 }

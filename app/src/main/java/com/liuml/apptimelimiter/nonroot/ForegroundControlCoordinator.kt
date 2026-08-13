@@ -16,6 +16,7 @@ import com.liuml.apptimelimiter.core.GroupUsagePolicy
 import com.liuml.apptimelimiter.core.QuotaIncidentPolicy
 import com.liuml.apptimelimiter.core.QuotaKind
 import com.liuml.apptimelimiter.core.ScheduleBlockPolicy
+import com.liuml.apptimelimiter.core.RuleActivationPolicy
 import com.liuml.apptimelimiter.core.ScheduleConstraint
 import com.liuml.apptimelimiter.core.ScheduleEvaluator
 import com.liuml.apptimelimiter.core.UsageReportingPolicy
@@ -137,7 +138,6 @@ class ForegroundControlCoordinator(
         overlay.dismiss("protection_mode_changed")
         pendingBreakPageAttempt = null
         visibleRestrictionPackage = null
-        statusRepository.recordBreakPageConfirmed()
         sessions.clear()
         planPromptAttempts.clear()
         runtimeStore.clearAllSessions()
@@ -232,9 +232,13 @@ class ForegroundControlCoordinator(
         }
         val previous = foregroundPackage
         if (previous == packageName) {
-            if (
-                confirmedByAccessibility &&
-                foregroundExecutionSnapshot?.confirmedByAccessibility != true
+            if (NonRootActionGuard.shouldRestoreSamePackageSnapshot(
+                    currentForegroundPackageName = previous,
+                    signalPackageName = packageName,
+                    signalKind = kind,
+                    signalConfirmedByAccessibility = confirmedByAccessibility,
+                    currentExecutionSnapshot = foregroundExecutionSnapshot,
+                )
             ) {
                 val confirmedGeneration = foregroundGeneration.incrementAndGet()
                 foregroundExecutionSnapshot = ForegroundExecutionSnapshot(
@@ -253,6 +257,12 @@ class ForegroundControlCoordinator(
                 )
                 generation.incrementAndGet()
                 if (kind == ForegroundPackageKind.TARGET_APP) {
+                    log(
+                        packageName,
+                        "NON_ROOT_FOREGROUND_SIGNAL",
+                        "source=$source, eventType=$eventType, kind=$kind, " +
+                            "accepted=restored_after_transient_surface",
+                    )
                     scheduleEvaluation(packageName, 0L)
                 }
             }
@@ -943,7 +953,8 @@ class ForegroundControlCoordinator(
         val scheduleIncidentToken = if (constraints.isNotEmpty() && !scheduleDecision.allowed) {
             val scheduleMode = group?.scheduleMode ?: rule.scheduleMode
             "schedule:$packageName:" + ScheduleBlockPolicy.token(
-                ruleVersion = 31L * rule.version + (group?.version ?: 0L),
+                ruleVersion = rule.version,
+                groupVersion = group?.version ?: 0L,
                 mode = scheduleMode,
                 nextTransitionEpochMillis = scheduleDecision.nextTransition
                     ?.toInstant()
@@ -2056,16 +2067,7 @@ class ForegroundControlCoordinator(
     }
 
     private fun hasEffectiveRule(rule: AppRule, group: AppGroup?): Boolean =
-        group?.let {
-            it.enabled &&
-                (it.dailyEnabled || it.perLaunchEnabled || it.scheduleEnabled)
-        } ?: (
-            rule.sessionPlanningEnabled ||
-                rule.enabled ||
-                rule.dailyEnabled ||
-                rule.perLaunchEnabled ||
-                rule.scheduleEnabled
-            )
+        RuleActivationPolicy.hasEffectiveRule(rule, group)
 
     private fun isBasicProtectionReady(): Boolean =
         repository.getGlobalSettings().protectionMode.usesNonRoot &&

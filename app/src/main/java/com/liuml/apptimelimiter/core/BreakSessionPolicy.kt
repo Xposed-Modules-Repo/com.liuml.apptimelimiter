@@ -14,6 +14,15 @@ data class BreakSessionConsumeResult(
 object BreakSessionPolicy {
     const val TOKEN_TTL_MILLIS = 30_000L
     const val MAX_RECORDS = 64
+    const val MAX_RULE_READ_FAILURES = 3
+
+    fun mayRestoreAuthorizedActivity(
+        savedAuthorized: Boolean,
+        targetPackage: String,
+    ): Boolean = savedAuthorized && PackageNamePolicy.isValid(targetPackage)
+
+    fun shouldFailClosedAfterRuleReadFailure(failureCount: Int): Boolean =
+        failureCount >= MAX_RULE_READ_FAILURES
 
     fun issue(
         existing: Collection<BreakSessionRecord>,

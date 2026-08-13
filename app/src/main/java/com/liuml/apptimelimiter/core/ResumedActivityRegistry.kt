@@ -26,4 +26,6 @@ class ResumedActivityRegistry<T : Any> {
     fun contains(activity: T): Boolean = activities.containsKey(activity)
 
     fun anyOrNull(): T? = activities.keys.firstOrNull()
+
+    fun firstOrNull(predicate: (T) -> Boolean): T? = activities.keys.firstOrNull(predicate)
 }

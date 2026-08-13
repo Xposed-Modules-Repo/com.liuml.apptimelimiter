@@ -8,6 +8,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.view.accessibility.AccessibilityEvent
 import com.liuml.apptimelimiter.data.NonRootCompatibilityMode
@@ -191,7 +193,16 @@ class TimeStopAccessibilityService : AccessibilityService() {
         }
 
         fun refreshConfiguration() {
-            activeService?.get()?.applyConfiguredEventTypes()
+            val service = activeService?.get() ?: return
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                service.applyConfiguredEventTypes()
+            } else {
+                MAIN_HANDLER.post {
+                    activeService?.get()
+                        ?.takeIf { it === service }
+                        ?.applyConfiguredEventTypes()
+                }
+            }
         }
 
         fun notifyProtectionModeChanged(
@@ -203,6 +214,7 @@ class TimeStopAccessibilityService : AccessibilityService() {
 
         fun isServiceConnected(): Boolean = activeService?.get() != null
 
+        private val MAIN_HANDLER = Handler(Looper.getMainLooper())
         private const val ACCESSIBILITY_NOTIFICATION_TIMEOUT_MILLIS = 100L
     }
 }

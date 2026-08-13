@@ -222,7 +222,7 @@ class RuleProvider : ContentProvider() {
                     putString(RuleContract.KEY_GROUP_NAME, assignedGroup?.name.orEmpty())
                     putBoolean(
                         RuleContract.KEY_GROUP_DAILY_ENABLED,
-                        group?.dailyEnabled ?: false,
+                        ruleSnapshotMayExecute && group?.dailyEnabled == true,
                     )
                     putLong(
                         RuleContract.KEY_GROUP_DAILY_LIMIT_SECONDS,
@@ -231,7 +231,7 @@ class RuleProvider : ContentProvider() {
                     putLong(RuleContract.KEY_GROUP_TODAY_USED_MS, groupTodayUsedMillis)
                     putBoolean(
                         RuleContract.KEY_GROUP_PER_LAUNCH_ENABLED,
-                        group?.perLaunchEnabled ?: false,
+                        ruleSnapshotMayExecute && group?.perLaunchEnabled == true,
                     )
                     putLong(
                         RuleContract.KEY_GROUP_PER_LAUNCH_LIMIT_SECONDS,
@@ -239,7 +239,7 @@ class RuleProvider : ContentProvider() {
                     )
                     putBoolean(
                         RuleContract.KEY_GROUP_SCHEDULE_ENABLED,
-                        group?.scheduleEnabled ?: false,
+                        ruleSnapshotMayExecute && group?.scheduleEnabled == true,
                     )
                     putString(
                         RuleContract.KEY_GROUP_SCHEDULE_MODE,
@@ -251,7 +251,7 @@ class RuleProvider : ContentProvider() {
                     )
                     putBoolean(
                         RuleContract.KEY_GROUP_COOLDOWN_ENABLED,
-                        group?.cooldownEnabled ?: false,
+                        ruleSnapshotMayExecute && group?.cooldownEnabled == true,
                     )
                     putLong(
                         RuleContract.KEY_GROUP_COOLDOWN_SECONDS,
@@ -494,8 +494,10 @@ class RuleProvider : ContentProvider() {
                     0,
                 )?.coerceIn(0, MAX_HOOK_VERSION_CODE) ?: 0
                 if (
-                    hookVersionCode > 0 &&
-                    !ProtectionExecutionPolicy.acceptHookSideEffect(settings.protectionMode)
+                    !ProtectionExecutionPolicy.acceptUsageReport(
+                        mode = settings.protectionMode,
+                        trustedManagerRequest = Binder.getCallingUid() == Process.myUid(),
+                    )
                 ) return denied()
                 val persisted = UsageStatsRepository(appContext).record(
                     packageName = packageName,

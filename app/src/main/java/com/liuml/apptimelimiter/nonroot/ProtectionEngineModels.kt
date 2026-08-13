@@ -70,7 +70,6 @@ object ProtectionEnginePolicy {
                 ProtectionDegradedReason.SHIZUKU_UNAVAILABLE
             shizukuEnabled && !shizukuPermissionGranted ->
                 ProtectionDegradedReason.SHIZUKU_PERMISSION_MISSING
-            !shizukuEnabled -> ProtectionDegradedReason.SHIZUKU_DISABLED
             else -> ProtectionDegradedReason.NONE
         }
         val basicReady = accessibilityEnabled && usageAccessGranted

@@ -73,6 +73,49 @@ class ForegroundExecutionPolicyTest {
         )
     }
 
+    @Test
+    fun `authoritative target signal restores snapshot after transient system surface`() {
+        val transient = ForegroundExecutionSnapshot(
+            packageName = "com.android.systemui",
+            kind = ForegroundPackageKind.SYSTEM_UI,
+            source = ForegroundSignalSource.ACCESSIBILITY_WINDOWS_CHANGED,
+            generation = 5L,
+            observedAtMillis = 1_000L,
+            confirmedByAccessibility = true,
+        )
+
+        assertTrue(
+            NonRootActionGuard.shouldRestoreSamePackageSnapshot(
+                currentForegroundPackageName = TARGET,
+                signalPackageName = TARGET,
+                signalKind = ForegroundPackageKind.TARGET_APP,
+                signalConfirmedByAccessibility = true,
+                currentExecutionSnapshot = transient,
+            ),
+        )
+        assertFalse(
+            NonRootActionGuard.shouldRestoreSamePackageSnapshot(
+                currentForegroundPackageName = TARGET,
+                signalPackageName = TARGET,
+                signalKind = ForegroundPackageKind.TARGET_APP,
+                signalConfirmedByAccessibility = false,
+                currentExecutionSnapshot = transient,
+            ),
+        )
+        assertFalse(
+            NonRootActionGuard.shouldRestoreSamePackageSnapshot(
+                currentForegroundPackageName = TARGET,
+                signalPackageName = TARGET,
+                signalKind = ForegroundPackageKind.TARGET_APP,
+                signalConfirmedByAccessibility = true,
+                currentExecutionSnapshot = transient.copy(
+                    packageName = TARGET,
+                    kind = ForegroundPackageKind.TARGET_APP,
+                ),
+            ),
+        )
+    }
+
     private companion object {
         const val OWN = "com.liuml.apptimelimiter"
         const val TARGET = "com.example.target"

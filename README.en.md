@@ -2,7 +2,7 @@
 
 Precision app-time control for Android power users who want policy, telemetry, and enforcement in the same loop.
 
-Current version: `0.10.14`
+Current version: `0.10.15`
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -162,6 +162,7 @@ Open **Diagnostic Logs** from the home screen and check:
 - `SESSION_PLAN_SUPPRESSED_BLOCKED`: a schedule, cooldown, or exhausted quota correctly prevented the plan dialog.
 - `COOLDOWN_STARTED/COOLDOWN_PERSIST_FAILED`: cooldown persistence after a quota limit.
 - `LIMIT_REACHED`: a configured boundary was reached and exit execution started.
+- `EXIT_REENTRY_DETECTED` and `EXIT_RECOVERY_RECHECK`: a system app was relaunched from Home, a launcher feed, or another external entry after UI-only exit; the new Activity is closed and any still-resumed Activity is revalidated when the recovery window ends.
 - `PROTECTION_MODE_CHANGED`, `HOOK_MODE_ACKNOWLEDGED`, and `PROTECTION_STATUS_DEGRADED`: selected-mode changes, Hook mode-generation acknowledgement, and protection-health degradation.
 - `NON_ROOT_RESTRICTION_REENTRY` and `NON_ROOT_RESTRICTION_STATE_PERSIST_FAILED`: fast restriction revalidation after reopening a target and failures to persist its re-entry marker.
 - `NON_ROOT_BREAK_PAGE_START_REQUESTED`, `NON_ROOT_BREAK_PAGE_START_ACCEPTED`, `NON_ROOT_BREAK_PAGE_CONFIRMED`, and `NON_ROOT_BREAK_PAGE_CONFIRM_TIMEOUT`: distinguish a launch request, Android accepting it, the page actually gaining foreground focus, and silent vendor-ROM blocking.
@@ -189,6 +190,7 @@ The lifecycle Hook remains on the [legacy Xposed Framework API](https://api.xpos
 - The standalone restriction Activity is the enforcement surface because it naturally pauses the target Activity. Accessibility overlays are reserved for the session-plan picker and short warnings: an overlay can block touches but cannot reliably pause media, games, or the target lifecycle.
 - Enhanced compatibility detection is off by default. It only uses the package name attached to content-change events, keeps `canRetrieveWindowContent=false`, and confirms ambiguous signals with a one-shot recent UsageStats query.
 - The accessibility service retrieves no window content, nodes, text, accounts, input, or notifications. Foreground package changes and local timing or diagnostics are not uploaded.
+- Exit-reentry diagnostics record only the target Activity class, component, Intent action, referrer host, process, and PID. Intent URIs, search queries, and page content are not recorded.
 
 - Session planning is process-local: it is offered once per target process, survives Activity changes in that process, and is cleared when the process ends.
 - A session plan counts only resumed foreground Activity time. Background and screen-off time is paused by design; this feature does not provide background media playback or a wall-clock sleep timer.

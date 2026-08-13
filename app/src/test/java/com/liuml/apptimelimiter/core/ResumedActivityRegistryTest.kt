@@ -49,5 +49,7 @@ class ResumedActivityRegistryTest {
         assertEquals(2, registry.size)
         assertTrue(registry.contains(first))
         assertTrue(registry.contains(second))
+        assertSame(second, registry.firstOrNull { it === second })
+        assertNull(registry.firstOrNull { it.value == 2 })
     }
 }

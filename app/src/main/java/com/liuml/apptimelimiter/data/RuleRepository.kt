@@ -14,6 +14,7 @@ import com.liuml.apptimelimiter.core.PackageNamePolicy
 import com.liuml.apptimelimiter.core.ProtectionModePolicy
 import com.liuml.apptimelimiter.core.RuleStorageBootstrapAction
 import com.liuml.apptimelimiter.core.RuleStorageBootstrapPolicy
+import com.liuml.apptimelimiter.core.RuleActivationPolicy
 import com.liuml.apptimelimiter.core.TimeQuotePolicy
 import com.liuml.apptimelimiter.core.ThemeColorPolicy
 import com.liuml.apptimelimiter.ipc.RuleContract
@@ -257,13 +258,21 @@ class RuleRepository(context: Context) {
         return persisted
     }
 
-    fun configuredPackages(): Set<String> =
-        prefs.getStringSet(KEY_PACKAGES, emptySet())
-            .orEmpty()
+    /** Packages that currently have an executable personal or group rule. */
+    fun configuredPackages(): Set<String> = knownPackages()
             .asSequence()
             .filter(PackageNamePolicy::isValid)
             .filterNot { it == appContext.packageName }
+            .filter { packageName ->
+                RuleActivationPolicy.hasEffectiveRule(
+                    rule = getRule(packageName),
+                    assignedGroup = groupForPackage(packageName),
+                )
+            }
             .toSet()
+
+    private fun knownPackages(): Set<String> = prefs.getStringSet(KEY_PACKAGES, emptySet())
+        .orEmpty() + getGroups().flatMap(AppGroup::packageNames)
 
     fun rulesetGeneration(): Long = prefs.getLong(KEY_RULESET_GENERATION, 0L)
 
@@ -384,7 +393,7 @@ class RuleRepository(context: Context) {
         val groupIds = prefs.getStringSet(KEY_GROUP_IDS, emptySet()).orEmpty().toMutableSet()
         if (groupId !in groupIds && groupIds.size >= MAX_GROUPS) return false
         groupIds.add(groupId)
-        val configuredPackages = configuredPackages().toMutableSet().apply { addAll(members) }
+        val configuredPackages = knownPackages().toMutableSet().apply { addAll(members) }
         val editor = prefs.edit()
             .putStringSet(KEY_GROUP_IDS, groupIds)
             .putStringSet(KEY_PACKAGES, configuredPackages)

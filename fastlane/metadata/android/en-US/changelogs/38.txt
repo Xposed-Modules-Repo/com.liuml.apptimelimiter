@@ -1,0 +1,1 @@
+Added stronger protection for system apps that are relaunched by launchers or other external surfaces after a UI-only exit. Fixed protection-mode ownership checks, non-root foreground snapshot recovery, effective-rule activation, and provider usage-report validation. Added diagnostics for exit re-entry and recovery rechecks.

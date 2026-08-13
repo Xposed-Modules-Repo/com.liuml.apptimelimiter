@@ -95,7 +95,9 @@ class UsageStatsRepository(context: Context) {
         packageNames.map(::summaryToday)
 
     fun totalToday(packageNames: Collection<String>): Long =
-        packageNames.sumOf { summaryToday(it).durationMillis }
+        packageNames.fold(0L) { total, packageName ->
+            safeAdd(total, summaryToday(packageName).durationMillis)
+        }
 
     fun verifiedHookPackages(
         packageNames: Collection<String>,

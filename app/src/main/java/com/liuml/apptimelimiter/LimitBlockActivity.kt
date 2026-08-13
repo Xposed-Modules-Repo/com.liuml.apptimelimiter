@@ -14,6 +14,7 @@ import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.view.WindowCompat
+import com.liuml.apptimelimiter.core.BreakSessionPolicy
 import com.liuml.apptimelimiter.core.QuotaKind
 import com.liuml.apptimelimiter.core.LimitEnforcementPolicy
 import com.liuml.apptimelimiter.core.ScheduleConstraint
@@ -84,7 +85,8 @@ class LimitBlockActivity : Activity() {
                 // Back is blocked; Home and Recents remain controlled by the system.
             }
         }
-        if (!consumeBreakSession(intent)) {
+        val restored = restoreTrustedState(savedInstanceState)
+        if (!restored && !consumeBreakSession(intent)) {
             diagnostic(
                 "WARN",
                 intent.getStringExtra(EXTRA_TARGET_PACKAGE).orEmpty(),
@@ -96,13 +98,35 @@ class LimitBlockActivity : Activity() {
         }
         authorized = true
         buildContent()
-        applyTrustedIntent(intent)
+        if (restored) {
+            applyPageCopy(RuleRepository(this).getGlobalSettings())
+            showConfirmingCopy()
+        } else {
+            applyTrustedIntent(intent)
+        }
         diagnostic(
             "INFO",
             targetPackage,
-            "BREAK_PAGE_ACTIVITY_CREATED",
-            "attempt=${launchAttemptId.take(12)}, nonRoot=$nonRoot",
+            if (restored) "BREAK_PAGE_ACTIVITY_RECREATED" else "BREAK_PAGE_ACTIVITY_CREATED",
+            "attempt=${launchAttemptId.take(12)}, nonRoot=$nonRoot, restored=$restored",
         )
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        if (!BreakSessionPolicy.mayRestoreAuthorizedActivity(authorized, targetPackage)) return
+        outState.putBoolean(STATE_AUTHORIZED, true)
+        outState.putString(STATE_TARGET_PACKAGE, targetPackage)
+        outState.putString(STATE_LAUNCH_ATTEMPT_ID, launchAttemptId)
+        outState.putString(STATE_CONFIRMED_ATTEMPT_ID, confirmedAttemptId)
+        outState.putLong(STATE_RULE_VERSION, initialRuleVersion)
+        outState.putLong(STATE_GROUP_VERSION, initialGroupVersion)
+        outState.putLong(STATE_COOLDOWN_ENDS_AT, cooldownEndsAtMillis)
+        outState.putLong(STATE_SESSION_RESET_AT, sessionResetAtMillis)
+        outState.putString(STATE_REACHED_KINDS, reachedKinds.joinToString(",") { it.name })
+        outState.putString(STATE_DAY_TOKEN, initialDayToken)
+        outState.putBoolean(STATE_ENGLISH, english)
+        outState.putBoolean(STATE_NON_ROOT, nonRoot)
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
@@ -359,6 +383,38 @@ class LimitBlockActivity : Activity() {
         // The target process can request a token for its own configured package. Never display
         // caller-provided copy, even with a valid token; all restriction text is derived from the
         // Provider snapshot below.
+        showConfirmingCopy()
+    }
+
+    private fun restoreTrustedState(state: Bundle?): Boolean {
+        if (state == null) return false
+        val restoredTarget = state.getString(STATE_TARGET_PACKAGE).orEmpty()
+        if (
+            !BreakSessionPolicy.mayRestoreAuthorizedActivity(
+                savedAuthorized = state.getBoolean(STATE_AUTHORIZED, false),
+                targetPackage = restoredTarget,
+            )
+        ) return false
+        targetPackage = restoredTarget
+        launchAttemptId = state.getString(STATE_LAUNCH_ATTEMPT_ID).orEmpty()
+        confirmedAttemptId = state.getString(STATE_CONFIRMED_ATTEMPT_ID).orEmpty()
+        initialRuleVersion = state.getLong(STATE_RULE_VERSION, Long.MIN_VALUE)
+        initialGroupVersion = state.getLong(STATE_GROUP_VERSION, Long.MIN_VALUE)
+        cooldownEndsAtMillis = state.getLong(STATE_COOLDOWN_ENDS_AT, 0L)
+        sessionResetAtMillis = state.getLong(STATE_SESSION_RESET_AT, 0L)
+        reachedKinds = state.getString(STATE_REACHED_KINDS)
+            .orEmpty()
+            .split(',')
+            .mapNotNull { raw -> runCatching { QuotaKind.valueOf(raw) }.getOrNull() }
+            .toSet()
+        initialDayToken = state.getString(STATE_DAY_TOKEN).orEmpty()
+        english = state.getBoolean(STATE_ENGLISH, false)
+        nonRoot = state.getBoolean(STATE_NON_ROOT, false)
+        lastRestrictionState = ""
+        return true
+    }
+
+    private fun showConfirmingCopy() {
         updateText(
             if (english) "Confirming restriction" else "正在确认限制状态",
             if (english) "Reading the current Time Stop rule…" else "正在读取时停中的当前规则…",
@@ -429,10 +485,10 @@ class LimitBlockActivity : Activity() {
                 "WARN",
                 targetPackage,
                 "BREAK_PAGE_RULE_READ_FAILED",
-                "attempt=$ruleReadFailures/$MAX_RULE_READ_FAILURES",
+                "attempt=$ruleReadFailures/${BreakSessionPolicy.MAX_RULE_READ_FAILURES}",
             )
-            if (ruleReadFailures >= MAX_RULE_READ_FAILURES) {
-                finishWithoutAnimation("rule_read_failed")
+            if (BreakSessionPolicy.shouldFailClosedAfterRuleReadFailure(ruleReadFailures)) {
+                leaveToHomeAndFinish("rule_read_failed")
             }
             return
         }
@@ -672,6 +728,21 @@ class LimitBlockActivity : Activity() {
             "USER_EXIT_REQUESTED",
             "source=break_page, nonRoot=$nonRoot",
         )
+        launchHome()
+    }
+
+    private fun leaveToHomeAndFinish(reason: String) {
+        diagnostic(
+            "WARN",
+            targetPackage,
+            "BREAK_PAGE_FAIL_CLOSED",
+            "reason=$reason, nonRoot=$nonRoot",
+        )
+        launchHome()
+        finishWithoutAnimation(reason)
+    }
+
+    private fun launchHome() {
         val home = Intent(Intent.ACTION_MAIN).apply {
             addCategory(Intent.CATEGORY_HOME)
             flags = Intent.FLAG_ACTIVITY_NEW_TASK
@@ -710,8 +781,19 @@ class LimitBlockActivity : Activity() {
         const val EXTRA_DAY_TOKEN = "day_token"
         const val EXTRA_ENGLISH = "english"
         const val EXTRA_NON_ROOT = "non_root"
+        private const val STATE_AUTHORIZED = "state_authorized"
+        private const val STATE_TARGET_PACKAGE = "state_target_package"
+        private const val STATE_LAUNCH_ATTEMPT_ID = "state_launch_attempt_id"
+        private const val STATE_CONFIRMED_ATTEMPT_ID = "state_confirmed_attempt_id"
+        private const val STATE_RULE_VERSION = "state_rule_version"
+        private const val STATE_GROUP_VERSION = "state_group_version"
+        private const val STATE_COOLDOWN_ENDS_AT = "state_cooldown_ends_at"
+        private const val STATE_SESSION_RESET_AT = "state_session_reset_at"
+        private const val STATE_REACHED_KINDS = "state_reached_kinds"
+        private const val STATE_DAY_TOKEN = "state_day_token"
+        private const val STATE_ENGLISH = "state_english"
+        private const val STATE_NON_ROOT = "state_non_root"
         private const val REFRESH_INTERVAL_MS = 1_000L
-        private const val MAX_RULE_READ_FAILURES = 3
     }
 
     private fun diagnostic(

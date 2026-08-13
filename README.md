@@ -4,14 +4,14 @@
 
 ![Android 8.1+](https://img.shields.io/badge/Android-8.1%2B-3DDC84?logo=android&logoColor=white)
 ![LSPosed API 93+](https://img.shields.io/badge/LSPosed-API%2093%2B-5C6BC0)
-![Version 0.10.14](https://img.shields.io/badge/version-0.10.14-2E7D5B)
+![Version 0.10.15](https://img.shields.io/badge/version-0.10.15-2E7D5B)
 ![License GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
 Stock screen-time tools are usually built for reports, daily caps, and focus modes. **Time Stop** is built for people who want sharper controls: per-app quotas, per-launch timers, weekly allow/block windows, shared group budgets, cooldowns after forced exits, Hook verification, and diagnostics that show what is actually happening inside the target process.
 
 [Latest release](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed module page](https://modules.lsposed.org/module/com.liuml.apptimelimiter/) · [Obtainium](#obtainium) · [中文说明](#中文说明)
 
-Current version: `0.10.14`
+Current version: `0.10.15`
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -223,7 +223,7 @@ This tool should be used only by the device owner or on explicitly authorized ma
 
 [下载最新版本](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed 模块页面](https://modules.lsposed.org/module/com.liuml.apptimelimiter/)
 
-当前版本：`0.10.14`
+当前版本：`0.10.15`
 
 ## 它和系统屏幕时间有什么不同？
 
@@ -386,6 +386,7 @@ Obtainium 是第三方更新工具，只负责检查 Release 页面并由用户�
 - `SESSION_PLAN_SUPPRESSED_BLOCKED`：禁止时段、冷却或额度耗尽正确阻止了计划弹窗。
 - `COOLDOWN_STARTED/COOLDOWN_PERSIST_FAILED`：额度限制后的冷却起点保存结果。
 - `LIMIT_REACHED`：限制已达到，代码已发出关闭任务栈和结束进程操作。
+- `EXIT_REENTRY_DETECTED` 与 `EXIT_RECOVERY_RECHECK`：系统应用只关闭界面后，被桌面、负一屏或其他外部入口再次拉起；模块会关闭新页面，并在退出恢复窗口结束时复检仍处于前台的 Activity。
 - `PROTECTION_MODE_TRANSITION_STARTED/COMPLETED`、`HOOK_UI_CANCELLED_BY_MODE` 与 `PROTECTION_EFFECTIVE_STATE_CHANGED`：模式切换、旧 Hook UI 取消和实际执行状态变化。
 - `PERMISSION_REPAIR_PROMPT_*`：权限提醒展示、72 小时冷却、同类问题压制及修复动作。
 - `BREAK_PAGE_COMPATIBILITY_REQUIRED` 与 `OEM_COMPATIBILITY_SETTINGS_*`：独立限制页被厂商系统拦截及兼容设置跳转结果。
@@ -413,6 +414,7 @@ Obtainium 是第三方更新工具，只负责检查 Release 页面并由用户�
 - 部分厂商系统会遗漏 Activity 暂停事件。统计器在熄屏时清除旧前台状态，亮屏后等待新的前台事件；这可避免多个应用重复累计同一批亮屏时间，但厂商事件本身缺失时仍可能出现少量误差。
 - 非 Root 正式限制界面采用独立 Activity，因为它能让目标 Activity 自然进入暂停；无障碍悬浮层只用于本次计划选择和短提示。悬浮层虽能拦截触摸，但不能可靠暂停播放器、游戏引擎或目标生命周期，因此不作为到限限制页。
 - 无障碍服务不读取窗口内容、页面节点、文字、账号、输入内容或通知；前台包变化、本地计时和诊断数据不会上传。
+- 退出重入诊断只记录目标 Activity 类名、组件、Intent action、来源 host、进程和 PID，不记录 Intent URI、搜索词或页面内容。
 - “增强兼容检测”默认关闭；开启后只使用内容变化事件携带的包名，并对模糊信号进行一次性 UsageStats 校验，`canRetrieveWindowContent` 始终保持关闭。
 
 - 本次使用计划只保存在目标进程内：每个目标进程首次打开时询问一次，应用内页面切换或短暂切后台不会重复询问，进程结束后自动清除。

@@ -17,6 +17,9 @@ import android.widget.Toast
 import com.liuml.apptimelimiter.BuildConfig
 import com.liuml.apptimelimiter.LimitBlockActivity
 import com.liuml.apptimelimiter.core.ActivityCallbackPolicy
+import com.liuml.apptimelimiter.core.ExitActivityResumeAction
+import com.liuml.apptimelimiter.core.ExitRecoveryAction
+import com.liuml.apptimelimiter.core.ExitReentryPolicy
 import com.liuml.apptimelimiter.core.GroupRulePolicy
 import com.liuml.apptimelimiter.core.LimitBlockReason
 import com.liuml.apptimelimiter.core.LimitEnforcementPolicy
@@ -30,6 +33,7 @@ import com.liuml.apptimelimiter.core.SharedCooldownPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownRecord
 import com.liuml.apptimelimiter.core.UsageMath
 import com.liuml.apptimelimiter.core.UsageReportingPolicy
+import com.liuml.apptimelimiter.core.DailyUsageStatePolicy
 import com.liuml.apptimelimiter.core.ProcessTerminationPolicy
 import com.liuml.apptimelimiter.core.ProtectionModePolicy
 import com.liuml.apptimelimiter.core.ScheduleDecision
@@ -278,6 +282,7 @@ private class RuntimeLimiter(
         val activity = lastPausedActivity.get() ?: activeActivity.get() ?: return@Runnable
         finalizeProcessBackground(activity)
     }
+    private val exitRecovery = Runnable { recoverPendingExit() }
     fun onActivityResumedFallback(activity: Activity) {
         mainHandler.post { onActivityResumed(activity) }
     }
@@ -287,9 +292,17 @@ private class RuntimeLimiter(
     }
 
     fun onActivityResumed(activity: Activity) {
-        if (exitScheduled) return
         val processWasForeground = !resumedActivities.isEmpty
-        if (!resumedActivities.markResumed(activity)) return
+        val newlyRegistered = resumedActivities.markResumed(activity)
+        when (ExitReentryPolicy.onActivityResumed(exitScheduled, newlyRegistered)) {
+            ExitActivityResumeAction.IGNORE_DUPLICATE -> return
+            ExitActivityResumeAction.REJECT_REENTRY -> {
+                registerActivityDuringPendingExit(activity)
+                rejectActivityDuringPendingExit(activity)
+                return
+            }
+            ExitActivityResumeAction.CONTINUE -> Unit
+        }
         val previousActivity = activeActivity.get()
         val resumedDuringHandoff = activityHandoffPending
         activityGeneration++
@@ -303,6 +316,20 @@ private class RuntimeLimiter(
             recoverDetachedSessionPlanDialog(activity)
         }
         activeActivity = WeakReference(activity)
+        processResumedActivity(
+            activity = activity,
+            processWasForeground = processWasForeground,
+            previousActivity = previousActivity,
+            resumedDuringHandoff = resumedDuringHandoff,
+        )
+    }
+
+    private fun processResumedActivity(
+        activity: Activity,
+        processWasForeground: Boolean,
+        previousActivity: Activity?,
+        resumedDuringHandoff: Boolean,
+    ) {
         val rule = readRule(activity, reloadFallback = true)
         if ((processWasForeground || resumedDuringHandoff) && previousActivity !== activity) {
             diagnostic(
@@ -442,6 +469,27 @@ private class RuntimeLimiter(
             )
         }
         if (!exitScheduled) resumeSessionPlan(activity, rule)
+    }
+
+    private fun registerActivityDuringPendingExit(activity: Activity) {
+        activityGeneration++
+        mainHandler.removeCallbacks(activityHandoffFinalize)
+        activityHandoffPending = false
+        lastPausedActivity.clear()
+        cancelPendingSessionPlanPrompt()
+        activeActivity = WeakReference(activity)
+    }
+
+    private fun rejectActivityDuringPendingExit(activity: Activity) {
+        val component = activity.componentName?.flattenToShortString().orEmpty()
+        val referrerHost = runCatching { activity.referrer?.host.orEmpty() }.getOrDefault("")
+        diagnostic(
+            activity,
+            level = "WARN",
+            event = "EXIT_REENTRY_DETECTED",
+            message = "退出处理中检测到新 Activity，已再次关闭且不重复统计；activity=${activity.javaClass.name}；component=$component；action=${activity.intent?.action.orEmpty()}；referrer=$referrerHost；process=$processName；pid=${Process.myPid()}",
+        )
+        closeActivityUi(activity, eventPrefix = "EXIT_REENTRY")
     }
 
     fun onActivityPaused(activity: Activity) {
@@ -1573,7 +1621,12 @@ private class RuntimeLimiter(
         openedDuringBlockedTime: Boolean,
     ): Boolean {
         val nextAllowed = formatNextTransition(activity, rule, decision)
-        val token = "schedule:${rule.scheduleTokenVersion()}:${decision.nextTransition}"
+        val token = "schedule:" + ScheduleBlockPolicy.token(
+            ruleVersion = rule.version,
+            groupVersion = rule.groupVersion,
+            mode = rule.scheduleModeForToken(),
+            nextTransitionEpochMillis = decision.nextTransition?.toInstant()?.toEpochMilli(),
+        )
         val newlyBlocked = blockingState?.token != token
         if (
             !showBlockingOverlay(
@@ -1955,21 +2008,7 @@ private class RuntimeLimiter(
         }.onFailure {
             diagnostic(activity, level = "WARN", event = "EXIT_NOTICE_FAILED", message = it.toString())
         }
-        runCatching {
-            activity.finishAndRemoveTask()
-        }.onFailure {
-            diagnostic(activity, level = "ERROR", event = "FINISH_TASK_FAILED", message = it.toString())
-        }
-        runCatching {
-            activity.finishAffinity()
-        }.onFailure {
-            diagnostic(activity, level = "ERROR", event = "FINISH_AFFINITY_FAILED", message = it.toString())
-        }
-        runCatching {
-            activity.moveTaskToBack(true)
-        }.onFailure {
-            diagnostic(activity, level = "ERROR", event = "MOVE_TASK_FAILED", message = it.toString())
-        }
+        closeActivityUi(activity)
         if (!isSafeToTerminateProcess(activity)) {
             diagnostic(
                 activity,
@@ -1977,7 +2016,7 @@ private class RuntimeLimiter(
                 event = "PROCESS_KILL_SKIPPED",
                 message = "为避免影响系统稳定性，仅关闭界面；uid=${Process.myUid()}, process=$processName",
             )
-            mainHandler.postDelayed({ exitScheduled = false }, EXIT_RECOVERY_DELAY_MS)
+            scheduleExitRecovery()
             return
         }
         if (!statsPersisted) {
@@ -1989,9 +2028,86 @@ private class RuntimeLimiter(
         mainHandler.postDelayed(
             {
                 runCatching { Process.killProcess(Process.myPid()) }
-                mainHandler.postDelayed({ exitScheduled = false }, EXIT_RECOVERY_DELAY_MS)
+                    .onFailure {
+                        diagnostic(
+                            activity,
+                            level = "ERROR",
+                            event = "PROCESS_KILL_FAILED",
+                            message = it.toString(),
+                        )
+                    }
+                scheduleExitRecovery()
             },
             if (statsPersisted) EXIT_DELAY_MS else EXIT_DELAY_AFTER_STATS_FAILURE_MS,
+        )
+    }
+
+    private fun closeActivityUi(activity: Activity, eventPrefix: String? = null) {
+        fun event(defaultName: String): String = eventPrefix?.let { "${it}_$defaultName" } ?: defaultName
+        runCatching { activity.finishAndRemoveTask() }
+            .onFailure {
+                diagnostic(
+                    activity,
+                    level = "ERROR",
+                    event = event("FINISH_TASK_FAILED"),
+                    message = it.toString(),
+                )
+            }
+        runCatching { activity.finishAffinity() }
+            .onFailure {
+                diagnostic(
+                    activity,
+                    level = "ERROR",
+                    event = event("FINISH_AFFINITY_FAILED"),
+                    message = it.toString(),
+                )
+            }
+        runCatching { activity.moveTaskToBack(true) }
+            .onFailure {
+                diagnostic(
+                    activity,
+                    level = "ERROR",
+                    event = event("MOVE_TASK_FAILED"),
+                    message = it.toString(),
+                )
+            }
+    }
+
+    private fun scheduleExitRecovery() {
+        mainHandler.removeCallbacks(exitRecovery)
+        mainHandler.postDelayed(exitRecovery, EXIT_RECOVERY_DELAY_MS)
+    }
+
+    private fun recoverPendingExit() {
+        val action = ExitReentryPolicy.onRecoveryWindowElapsed(
+            exitScheduled = exitScheduled,
+            hasResumedActivity = !resumedActivities.isEmpty,
+        )
+        when (action) {
+            ExitRecoveryAction.NO_OP -> return
+            ExitRecoveryAction.CLEAR_ONLY -> {
+                exitScheduled = false
+                return
+            }
+            ExitRecoveryAction.RECHECK_RESUMED_ACTIVITY -> Unit
+        }
+
+        exitScheduled = false
+        val activity = resumedActivities.firstOrNull {
+            !it.isFinishing && !it.isDestroyed
+        } ?: return
+        activeActivity = WeakReference(activity)
+        diagnostic(
+            activity,
+            level = "WARN",
+            event = "EXIT_RECOVERY_RECHECK",
+            message = "退出恢复窗口结束时仍有前台 Activity，重新读取规则；activity=${activity.javaClass.name}；process=$processName；pid=${Process.myPid()}",
+        )
+        processResumedActivity(
+            activity = activity,
+            processWasForeground = false,
+            previousActivity = activity,
+            resumedDuringHandoff = false,
         )
     }
 
@@ -2377,7 +2493,8 @@ private class RuntimeLimiter(
         decision: ScheduleDecision,
     ): ScheduleHitResult {
         val blockToken = ScheduleBlockPolicy.token(
-            ruleVersion = rule.scheduleTokenVersion(),
+            ruleVersion = rule.version,
+            groupVersion = rule.groupVersion,
             mode = rule.scheduleModeForToken(),
             nextTransitionEpochMillis = decision.nextTransition?.toInstant()?.toEpochMilli(),
         )
@@ -3026,9 +3143,6 @@ private class RuntimeLimiter(
             else -> ScheduleMode.BLOCK_DURING
         }
 
-    private fun HookRule.scheduleTokenVersion(): Long =
-        31L * version + groupVersion
-
     private fun formatNextTransition(
         context: Context,
         rule: HookRule,
@@ -3091,8 +3205,7 @@ private class RuntimeLimiter(
         val statePrefs = context.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE)
         val today = dayToken()
         val savedDay = statePrefs.getInt(KEY_DAY, -1)
-        val savedVersion = statePrefs.getLong(KEY_VERSION, Long.MIN_VALUE)
-        if (savedDay != today || savedVersion != rule.version) {
+        if (DailyUsageStatePolicy.shouldReset(savedDay, today)) {
             writeDailyState(context, rule, 0L)
             return 0L
         }
@@ -3141,7 +3254,10 @@ private class RuntimeLimiter(
             0L
         }
         return UsageMath.authoritativeDailyUsedMillis(
-            localDailyUsedMillis(context, rule) + activeTodayMillis.coerceAtLeast(0L),
+            UsageMath.saturatedAddMillis(
+                localDailyUsedMillis(context, rule),
+                activeTodayMillis,
+            ),
             UsageMath.projectedSystemUsageMillis(
                 rule.systemTodayUsedMillis,
                 activeAfterSystemMeasurement,

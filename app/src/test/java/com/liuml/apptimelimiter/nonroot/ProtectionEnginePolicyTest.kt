@@ -44,6 +44,20 @@ class ProtectionEnginePolicyTest {
     }
 
     @Test
+    fun `ordinary accessibility mode is healthy without Shizuku`() {
+        val snapshot = ProtectionEnginePolicy.resolve(
+            protectionMode = ProtectionMode.ACCESSIBILITY,
+            accessibilityEnabled = true,
+            usageAccessGranted = true,
+            shizukuAvailable = false,
+            shizukuPermissionGranted = false,
+        )
+
+        assertEquals(ProtectionEngine.ACCESSIBILITY_ONLY, snapshot.engine)
+        assertEquals(ProtectionDegradedReason.NONE, snapshot.degradedReason)
+    }
+
+    @Test
     fun `configured but disconnected accessibility is not ready`() {
         val snapshot = ProtectionEnginePolicy.resolve(
             protectionMode = ProtectionMode.ACCESSIBILITY,

@@ -76,4 +76,18 @@ class BreakSessionPolicyTest {
         assertEquals("token-10", decoded.first().token)
         assertEquals("token-73", decoded.last().token)
     }
+
+    @Test
+    fun `only an authorized system recreation can restore the break page`() {
+        assertTrue(BreakSessionPolicy.mayRestoreAuthorizedActivity(true, "app.a"))
+        assertFalse(BreakSessionPolicy.mayRestoreAuthorizedActivity(false, "app.a"))
+        assertFalse(BreakSessionPolicy.mayRestoreAuthorizedActivity(true, "bad package"))
+    }
+
+    @Test
+    fun `repeated rule read failures fail closed at the bounded threshold`() {
+        assertFalse(BreakSessionPolicy.shouldFailClosedAfterRuleReadFailure(1))
+        assertFalse(BreakSessionPolicy.shouldFailClosedAfterRuleReadFailure(2))
+        assertTrue(BreakSessionPolicy.shouldFailClosedAfterRuleReadFailure(3))
+    }
 }
