@@ -1,5 +1,6 @@
 package com.liuml.apptimelimiter.nonroot
 
+import com.liuml.apptimelimiter.core.SessionPlanPolicy
 import java.time.LocalDate
 import java.util.UUID
 
@@ -143,11 +144,18 @@ object NonRootSessionPolicy {
     fun withPlan(
         state: NonRootSessionState,
         durationMillis: Long,
-    ): NonRootSessionState = state.copy(
-        planPromptHandled = true,
-        planActive = true,
-        planRemainingMillis = durationMillis.coerceAtLeast(0L),
-    )
+        allowDebugShortChoice: Boolean = false,
+    ): NonRootSessionState {
+        val selectedDuration = SessionPlanPolicy.selectedDurationMillis(
+            requestedDurationMillis = durationMillis,
+            allowDebugShortChoice = allowDebugShortChoice,
+        ) ?: return skipPlan(state)
+        return state.copy(
+            planPromptHandled = true,
+            planActive = true,
+            planRemainingMillis = selectedDuration,
+        )
+    }
 
     fun skipPlan(state: NonRootSessionState): NonRootSessionState =
         state.copy(

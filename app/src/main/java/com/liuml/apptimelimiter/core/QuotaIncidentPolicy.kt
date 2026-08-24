@@ -46,7 +46,7 @@ object QuotaIncidentPolicy {
         QuotaKind.GROUP_DAILY in reachedKinds ->
             "group-daily|$groupId|$groupVersion|$dayToken"
         QuotaKind.GROUP_PER_LAUNCH in reachedKinds ->
-            "group-launch|$groupId|$groupVersion|$packageName|$processSessionId"
+            "group-launch|$groupId|$groupVersion|$processSessionId"
         QuotaKind.APP_DAILY in reachedKinds ->
             "app-daily|$packageName|$ruleVersion|$dayToken"
         QuotaKind.APP_PER_LAUNCH in reachedKinds ->

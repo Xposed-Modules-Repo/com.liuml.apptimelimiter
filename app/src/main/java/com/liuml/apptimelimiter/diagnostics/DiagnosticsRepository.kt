@@ -7,6 +7,7 @@ import com.liuml.apptimelimiter.BuildConfig
 import com.liuml.apptimelimiter.data.RuleRepository
 import com.liuml.apptimelimiter.nonroot.NonRootProtectionStatusRepository
 import com.liuml.apptimelimiter.nonroot.ShizukuExecutionRepository
+import com.liuml.apptimelimiter.security.ChildLockRepository
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.xposedstatus.XposedStatusRepository
 import java.io.File
@@ -106,11 +107,15 @@ class DiagnosticsRepository(context: Context) {
             ShizukuExecutionRepository.get(appContext).state.value
         }.getOrNull()
         val xposed = runCatching { XposedStatusRepository.instance.snapshot.value }.getOrNull()
-        val hasCurrentHookHeartbeat = runCatching {
+        val hookSummaries = runCatching {
             val packages = ruleRepository?.configuredPackages().orEmpty()
-            UsageStatsRepository(appContext).summariesToday(packages).any {
-                it.hookVersionCode >= BuildConfig.VERSION_CODE && it.lastHookEventAtMillis > 0L
-            }
+            UsageStatsRepository(appContext).summariesToday(packages)
+        }.getOrDefault(emptyList())
+        val hasCurrentHookHeartbeat = hookSummaries.any {
+            it.hookVersionCode >= BuildConfig.VERSION_CODE && it.lastHookEventAtMillis > 0L
+        }
+        val privateChildLockReady = runCatching {
+            ChildLockRepository(appContext).isEnabled()
         }.getOrDefault(false)
         appendLine("# Time Stop diagnostics")
         appendLine(
@@ -128,7 +133,9 @@ class DiagnosticsRepository(context: Context) {
         appendLine("# locale=${appContext.resources.configuration.locales[0]}")
         appendLine(
             "# protection_mode=${settings?.protectionMode ?: "UNKNOWN"} " +
-                "generation=${settings?.protectionModeGeneration ?: -1L}",
+                "generation=${settings?.protectionModeGeneration ?: -1L} " +
+                "child_lock=${settings?.childLockEnabled ?: false} " +
+                "child_lock_pin_ready=$privateChildLockReady",
         )
         appendLine(
             "# accessibility=${accessibility?.state ?: "UNKNOWN"} " +
@@ -147,6 +154,15 @@ class DiagnosticsRepository(context: Context) {
                 "snapshot_age_ms=${xposed?.capturedAtMillis?.takeIf { it > 0L }?.let { captured ->
                     (System.currentTimeMillis() - captured).coerceAtLeast(0L)
                 } ?: -1L}",
+        )
+        appendLine(
+            "# hook_versions=" + hookSummaries
+                .filter { it.hookVersionCode > 0 }
+                .sortedBy { it.packageName }
+                .joinToString(",") {
+                    "${clean(it.packageName, 120)}:${it.hookVersionCode}"
+                }
+                .ifBlank { "NONE" },
         )
         val breakPage = nonRootHealth?.breakPageCompatibility
         appendLine(

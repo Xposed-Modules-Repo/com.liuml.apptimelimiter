@@ -3,7 +3,7 @@ package com.liuml.apptimelimiter.core
 /** Pure calculations for the process-local, foreground-only session plan. */
 object SessionPlanPolicy {
     const val MIN_DURATION_MILLIS = 60_000L
-    const val MAX_DURATION_MILLIS = 24L * 60L * 60L * 1_000L
+    const val MAX_DURATION_MILLIS = SessionPlanDurationPolicy.MAX_TOTAL_MILLIS
     const val WARNING_LEAD_MILLIS = 5_000L
     const val MAX_PROMPT_ATTEMPTS = 3
 

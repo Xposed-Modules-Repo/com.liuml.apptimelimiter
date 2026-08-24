@@ -31,14 +31,14 @@ class QuotaIncidentPolicyTest {
     }
 
     @Test
-    fun `group per launch incident is scoped to member process session`() {
+    fun `group per launch incident is shared by members in one group session`() {
         val first = incident(
             packageName = "app.a",
             processSession = "session-1",
             kinds = setOf(QuotaKind.GROUP_PER_LAUNCH),
         )
         val sameSession = incident(
-            packageName = "app.a",
+            packageName = "app.b",
             processSession = "session-1",
             kinds = setOf(QuotaKind.GROUP_PER_LAUNCH),
         )

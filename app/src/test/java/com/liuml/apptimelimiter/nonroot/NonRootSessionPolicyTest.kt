@@ -81,6 +81,7 @@ class NonRootSessionPolicyTest {
         val foreground = NonRootSessionPolicy.withPlan(
             NonRootSessionPolicy.foreground(null, "pkg", 1_000L),
             10_000L,
+            allowDebugShortChoice = true,
         )
         val paused = NonRootSessionPolicy.background(foreground, 4_000L)
         assertEquals(7_000L, paused.planRemainingMillis)
@@ -93,13 +94,14 @@ class NonRootSessionPolicyTest {
     fun `process loss recovery does not charge an unobserved foreground gap`() {
         val active = NonRootSessionPolicy.withPlan(
             NonRootSessionPolicy.foreground(null, "pkg", 1_000L),
-            20_000L,
+            10_000L,
+            allowDebugShortChoice = true,
         ).copy(accumulatedForegroundMillis = 7_000L)
 
         val recovered = NonRootSessionPolicy.recoverAfterProcessLoss(active, 101_000L)
 
         assertEquals(7_000L, recovered.accumulatedForegroundMillis)
-        assertEquals(20_000L, recovered.planRemainingMillis)
+        assertEquals(10_000L, recovered.planRemainingMillis)
         assertEquals(0L, recovered.foregroundStartedAtElapsedMillis)
         assertEquals(101_000L, recovered.backgroundedAtElapsedMillis)
         assertEquals(131_000L, recovered.graceEndsAtElapsedMillis)

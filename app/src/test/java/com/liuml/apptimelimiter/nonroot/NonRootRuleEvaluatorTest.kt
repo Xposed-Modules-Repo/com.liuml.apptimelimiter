@@ -96,6 +96,37 @@ class NonRootRuleEvaluatorTest {
     }
 
     @Test
+    fun `group per session uses the shared group balance`() {
+        val decision = NonRootRuleEvaluator.evaluate(
+            snapshot().copy(
+                appDailyEnabled = false,
+                appPerSessionEnabled = false,
+                groupPerSessionEnabled = true,
+                groupPerSessionLimitMillis = 6_000L,
+                sessionUsedMillis = 1_000L,
+                groupSessionUsedMillis = 6_000L,
+            ),
+        )
+
+        assertEquals(NonRootBlockReason.QUOTA, decision.blockingReason)
+        assertEquals(setOf(QuotaKind.GROUP_PER_LAUNCH), decision.reachedKinds)
+    }
+
+    @Test
+    fun `sub second quota remainder is treated as reached`() {
+        val decision = NonRootRuleEvaluator.evaluate(
+            snapshot().copy(
+                appDailyEnabled = false,
+                appPerSessionEnabled = true,
+                appPerSessionLimitMillis = 6_000L,
+                sessionUsedMillis = 5_984L,
+            ),
+        )
+
+        assertEquals(NonRootBlockReason.QUOTA, decision.blockingReason)
+    }
+
+    @Test
     fun `returning during grace keeps per session restriction active`() {
         val started = NonRootSessionPolicy.foreground(null, "pkg", 1_000L)
         val paused = NonRootSessionPolicy.background(started, 7_000L)

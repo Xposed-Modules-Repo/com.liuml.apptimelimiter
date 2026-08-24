@@ -127,8 +127,8 @@ object UiText {
             return "${it.groupValues[1]}h ${it.groupValues[2]}m"
         }
         Regex("^(\\d+) 个$").matchEntire(source)?.let { return it.groupValues[1] }
-        Regex("^启动 (\\d+) 次 · 限制触发 (\\d+) 次$").matchEntire(source)?.let {
-            return "${it.groupValues[1]} launches · ${it.groupValues[2]} limit hits"
+        Regex("^启动 (\\d+) 次 · 今日限制触发 (\\d+) 次$").matchEntire(source)?.let {
+            return "${it.groupValues[1]} launches · ${it.groupValues[2]} limit hits today"
         }
         Regex("^共享每日：已用 (.+) / (.+) · 剩余 (.+)$").matchEntire(source)?.let {
             return "Shared daily: used ${translate(it.groupValues[1], SupportedLanguage.ENGLISH)} / " +
@@ -577,6 +577,7 @@ object UiText {
         "强制退出用于硬限制；独立休息页可暂停目标界面，冷静后继续" to "Force exit provides a hard limit. The standalone break page pauses the target screen and continues after cooldown",
         "强制退出（默认）" to "Force exit (default)",
         "独立休息页" to "Standalone break page",
+        "强制退出会关闭目标任务并结束当前 Hook 进程；多进程应用的独立后台服务可能继续运行，需整包强停时请使用普通保护 + Shizuku。" to "Force exit closes the target task and terminates the current hooked process. A separate background service in a multi-process app may keep running; use Standard protection + Shizuku when a package-wide force-stop is required.",
         "达到限制后会打开时停的独立休息页，使目标界面自然暂停，并尝试暂停常见的 MediaPlayer、ExoPlayer/Media3 和网页音视频。部分系统可能询问是否允许打开时停；自研播放器、后台服务和游戏引擎可能继续运行。休息页不提供延时，主页与最近任务仍可使用；单次额度需配合冷却，结束后自动继续。切换执行方式后，请强停并重开管控应用。" to "When a limit is reached, Time Stop opens its standalone break page so the target screen pauses naturally. It also attempts to pause common MediaPlayer, ExoPlayer/Media3, and web audio/video playback. Some systems may ask before opening Time Stop; custom players, background services, and game engines may keep running. The page has no extension action; Home and Recents remain available. Pair per-launch limits with cooldown to continue automatically. Force-stop and reopen managed apps after switching enforcement mode.",
         "需先开启每日累计或单次打开，才能启用退出后冷却。" to "Enable a daily or per-launch quota before enabling post-exit cooldown.",
         "提醒与延时" to "Warnings and extensions",
@@ -694,6 +695,7 @@ object UiText {
         "退出后冷却" to "Post-exit cooldown",
         "达到每日或单次额度后，在设定时间内限制再次使用" to "Restrict further use for the configured duration after a daily or per-launch limit",
         "冷却期间反复打开不会重新计算冷却时间，也不会重复增加限制触发次数。" to "Repeated attempts do not restart cooldown or add duplicate limit hits.",
+        "今日限制触发按自然日重置；同一额度或时段事件反复进入只记录一次。" to "Today's limit hits reset each calendar day; repeated entries for the same quota or schedule incident count once.",
         "保存并启用" to "Save and enable",
         "10 秒测试" to "10-second test",
         "可用时段" to "Usage schedule",

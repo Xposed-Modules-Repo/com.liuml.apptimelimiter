@@ -15,8 +15,8 @@ import android.net.Uri
 import android.provider.Settings
 import android.view.ContextThemeWrapper
 import android.widget.Toast
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
@@ -40,6 +40,7 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -68,6 +69,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -89,6 +91,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
@@ -146,6 +149,13 @@ import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
 import com.liuml.apptimelimiter.support.DonationLinkPolicy
 import com.liuml.apptimelimiter.support.FeedbackSender
 import com.liuml.apptimelimiter.settings.LauncherIconController
+import com.liuml.apptimelimiter.security.ChildLockRepository
+import com.liuml.apptimelimiter.security.ChildLockSnapshot
+import com.liuml.apptimelimiter.security.PinVerificationResult
+import com.liuml.apptimelimiter.security.BiometricRecoveryManager
+import com.liuml.apptimelimiter.security.BiometricRecoveryResult
+import com.liuml.apptimelimiter.security.ParentAuthStore
+import com.liuml.apptimelimiter.core.ManagerUnlockSessionPolicy
 import com.liuml.apptimelimiter.statistics.AppUsageSummary
 import com.liuml.apptimelimiter.statistics.CalculatedUsageSnapshot
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
@@ -171,7 +181,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     private val xposedStatusRepository = XposedStatusRepository.instance
     private lateinit var nonRootStatusRepository: NonRootProtectionStatusRepository
 
@@ -191,6 +201,15 @@ class MainActivity : ComponentActivity() {
         val usageStatsRepository = UsageStatsRepository(this)
         val deviceUsageStatsRepository = DeviceUsageStatsRepository(this)
         val installedAppsRepository = InstalledAppsRepository(this)
+        val childLockRepository = ChildLockRepository(this)
+        if (
+            ruleRepository.getGlobalSettings().childLockEnabled &&
+            !childLockRepository.isEnabled()
+        ) {
+            ruleRepository.saveGlobalSettings(
+                ruleRepository.getGlobalSettings().copy(childLockEnabled = false),
+            )
+        }
         setContent {
             val initialSettings = remember { ruleRepository.getGlobalSettings() }
             var themeMode by remember {
@@ -200,6 +219,22 @@ class MainActivity : ComponentActivity() {
             var apps by remember { mutableStateOf<List<InstalledApp>?>(null) }
             LaunchedEffect(Unit) {
                 apps = withContext(Dispatchers.IO) {
+                    val reconciliation = ruleRepository.reconcileRuleAccess()
+                    if (reconciliation.failedPackages.isNotEmpty()) {
+                        diagnosticsRepository.append(
+                            level = "WARN",
+                            packageName = packageName,
+                            event = "RULE_PROVIDER_ACCESS_RECONCILE_FAILED",
+                            message = "failed=${reconciliation.failedPackages.joinToString(",").take(500)}",
+                        )
+                    } else if (reconciliation.configuredPackages.isNotEmpty()) {
+                        diagnosticsRepository.append(
+                            level = "INFO",
+                            packageName = packageName,
+                            event = "RULE_PROVIDER_ACCESS_RECONCILED",
+                            message = "count=${reconciliation.grantedPackages.size}",
+                        )
+                    }
                     installedAppsRepository.loadLaunchableApps()
                 }
             }
@@ -218,6 +253,7 @@ class MainActivity : ComponentActivity() {
                         deviceUsageStatsRepository,
                         xposedStatusRepository,
                         nonRootStatusRepository,
+                        childLockRepository,
                         onThemeChanged = { mode, color ->
                             themeMode = mode
                             themeColor = color
@@ -246,13 +282,16 @@ private fun TimeLimiterScreen(
     deviceUsageStatsRepository: DeviceUsageStatsRepository,
     xposedStatusRepository: XposedStatusRepository,
     nonRootStatusRepository: NonRootProtectionStatusRepository,
+    childLockRepository: ChildLockRepository,
     onThemeChanged: (AppThemeMode, AppThemeColor) -> Unit,
 ) {
     val context = LocalContext.current
+    val screenScope = rememberCoroutineScope()
     val xposedSnapshot by xposedStatusRepository.snapshot.collectAsState()
     val nonRootSnapshot by nonRootStatusRepository.snapshot.collectAsState()
     val nonRootHealthSnapshot by nonRootStatusRepository.healthSnapshot.collectAsState()
     val shizukuRepository = remember(context) { ShizukuExecutionRepository.get(context) }
+    val biometricRecoveryManager = remember(context) { BiometricRecoveryManager(context) }
     val shizukuState by shizukuRepository.state.collectAsState()
     val rules = remember {
         mutableStateMapOf<String, AppRule>().also { map ->
@@ -319,6 +358,15 @@ private fun TimeLimiterScreen(
             ),
         )
     }
+    var childLockRevision by remember { mutableIntStateOf(0) }
+    val childLockSnapshot = remember(childLockRevision) { childLockRepository.snapshot() }
+    var managerUnlocked by remember { mutableStateOf(false) }
+    var managerBackgroundAtElapsed by remember { mutableStateOf<Long?>(null) }
+    var showManagerPinPrompt by remember { mutableStateOf(false) }
+    var showChildPinSetup by remember { mutableStateOf(false) }
+    var childPinSaveInProgress by remember { mutableStateOf(false) }
+    var pendingChildLockAction by remember { mutableStateOf<String?>(null) }
+    var pendingProtectedAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     LaunchedEffect(Unit) {
         val uiPreferences = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
@@ -379,7 +427,9 @@ private fun TimeLimiterScreen(
             showBetaInvite ||
             showSetupGuide ||
             showNonRootRepairPrompt ||
-            showDonationPrompt
+            showDonationPrompt ||
+            showManagerPinPrompt ||
+            showChildPinSetup
     LaunchedEffect(pendingAutomaticUpdate, anotherDialogVisible) {
         val available = pendingAutomaticUpdate ?: return@LaunchedEffect
         if (anotherDialogVisible) return@LaunchedEffect
@@ -673,13 +723,34 @@ private fun TimeLimiterScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                usageRevision++
-                appResumeRevision++
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    usageRevision++
+                    appResumeRevision++
+                    if (!ManagerUnlockSessionPolicy.remainsUnlocked(
+                            managerUnlocked,
+                            managerBackgroundAtElapsed,
+                            android.os.SystemClock.elapsedRealtime(),
+                        )
+                    ) {
+                        managerUnlocked = false
+                    }
+                    managerBackgroundAtElapsed = null
+                }
+                Lifecycle.Event.ON_STOP -> {
+                    managerBackgroundAtElapsed = android.os.SystemClock.elapsedRealtime()
+                }
+                else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val sensitiveManagerScreenOpen = showSettings || editingApp != null || editingGroup != null
+    LaunchedEffect(sensitiveManagerScreenOpen, childLockSnapshot.enabled, managerUnlocked) {
+        if (sensitiveManagerScreenOpen && childLockSnapshot.enabled && !managerUnlocked) {
+            showManagerPinPrompt = true
+        }
     }
     LaunchedEffect(Unit) {
         while (true) {
@@ -1016,32 +1087,40 @@ private fun TimeLimiterScreen(
                             if (enabled) {
                                 editingApp = app
                             } else {
-                                val updated = rule.copy(
-                                    enabled = false,
-                                    sessionPlanningEnabled = false,
-                                )
-                                if (!repository.save(updated)) {
-                                    Toast.makeText(
-                                        context,
-                                        localizedText(
-                                            context,
-                                            "规则保存失败，请重试",
-                                            "Failed to save the rule. Try again.",
-                                        ),
-                                        Toast.LENGTH_LONG,
-                                    ).show()
-                                    return@AppRow
-                                }
-                                if (repository.getGlobalSettings().diagnosticsEnabled) {
-                                    diagnosticsRepository.append(
-                                        "INFO",
-                                        app.packageName,
-                                        "RULE_SAVED",
-                                        "规则已停用",
+                                val disableRule: () -> Unit = action@{
+                                    val updated = rule.copy(
+                                        enabled = false,
+                                        sessionPlanningEnabled = false,
                                     )
+                                    if (!repository.save(updated)) {
+                                        Toast.makeText(
+                                            context,
+                                            localizedText(
+                                                context,
+                                                "规则保存失败，请重试",
+                                                "Failed to save the rule. Try again.",
+                                            ),
+                                            Toast.LENGTH_LONG,
+                                        ).show()
+                                        return@action
+                                    }
+                                    if (repository.getGlobalSettings().diagnosticsEnabled) {
+                                        diagnosticsRepository.append(
+                                            "INFO",
+                                            app.packageName,
+                                            "RULE_SAVED",
+                                            "规则已停用",
+                                        )
+                                    }
+                                    rules[app.packageName] = repository.getRule(app.packageName)
+                                    usageRevision++
                                 }
-                                rules[app.packageName] = repository.getRule(app.packageName)
-                                usageRevision++
+                                if (childLockSnapshot.enabled && !managerUnlocked) {
+                                    pendingProtectedAction = disableRule
+                                    showManagerPinPrompt = true
+                                } else {
+                                    disableRule()
+                                }
                             }
                         },
                     )
@@ -1072,14 +1151,23 @@ private fun TimeLimiterScreen(
                 usageAccessGranted = usageAccessGranted,
                 onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
                 onClear = {
-                    usageStatsRepository.clearAll()
-                    usageRevision++
+                    val clearAction = {
+                        usageStatsRepository.clearAll()
+                        usageRevision++
+                        Unit
+                    }
+                    if (childLockSnapshot.enabled && !managerUnlocked) {
+                        pendingProtectedAction = clearAction
+                        showManagerPinPrompt = true
+                    } else {
+                        clearAction()
+                    }
                 },
             )
         }
     }
 
-    editingApp?.let { app ->
+    editingApp?.takeIf { !childLockSnapshot.enabled || managerUnlocked }?.let { app ->
         RuleDialog(
             app = app,
             initialRule = rules.getValue(app.packageName),
@@ -1123,7 +1211,7 @@ private fun TimeLimiterScreen(
         )
     }
 
-    editingGroup?.let { group ->
+    editingGroup?.takeIf { !childLockSnapshot.enabled || managerUnlocked }?.let { group ->
         GroupEditorDialog(
             initialGroup = group,
             apps = selectableApps,
@@ -1178,15 +1266,25 @@ private fun TimeLimiterScreen(
         DiagnosticLogDialog(
             repository = diagnosticsRepository,
             onFeedback = { FeedbackSender.send(context, diagnosticsRepository) },
+            onClear = { clear ->
+                if (childLockSnapshot.enabled && !managerUnlocked) {
+                    showLogs = false
+                    pendingProtectedAction = clear
+                    showManagerPinPrompt = true
+                } else {
+                    clear()
+                }
+            },
             onDismiss = { showLogs = false },
         )
     }
 
-    if (showSettings) {
+    if (showSettings && (!childLockSnapshot.enabled || managerUnlocked)) {
         SettingsDialog(
             initialSettings = repository.getGlobalSettings().copy(
                 launcherIconHidden = LauncherIconController.isHidden(context),
             ),
+            childLockSnapshot = childLockSnapshot,
             xposedAvailable = xposedSettingsAvailable,
             usageAccessGranted = usageAccessGranted,
             accessibilityEnabled = nonRootSnapshot.accessibilityEnabled,
@@ -1285,6 +1383,29 @@ private fun TimeLimiterScreen(
                     "PERMISSION_REPAIR_PROMPT_ACTION",
                     "action=restore",
                 )
+            },
+            onEnableChildLock = {
+                showSettings = false
+                pendingChildLockAction = "enable"
+                showChildPinSetup = true
+            },
+            onDisableChildLock = {
+                showSettings = false
+                managerUnlocked = false
+                pendingChildLockAction = "disable"
+                showManagerPinPrompt = true
+            },
+            onChangeChildPin = {
+                showSettings = false
+                managerUnlocked = false
+                pendingChildLockAction = "change"
+                showManagerPinPrompt = true
+            },
+            onSetBiometricRecovery = { enabled ->
+                showSettings = false
+                managerUnlocked = false
+                pendingChildLockAction = if (enabled) "biometric_on" else "biometric_off"
+                showManagerPinPrompt = true
             },
             onOpenOemCompatibilitySettings = {
                 val result = OemCompatibilityNavigator.open(context)
@@ -1840,6 +1961,540 @@ private fun TimeLimiterScreen(
             },
         )
     }
+
+    if (showManagerPinPrompt) {
+        ChildLockPinDialog(
+            title = localizedText(context, "验证家长 PIN", "Verify parent PIN"),
+            repository = childLockRepository,
+            onBiometricRecovery = if (childLockSnapshot.biometricRecoveryEnabled) {
+                {
+                    val activity = context as? FragmentActivity
+                    if (activity != null) {
+                        biometricRecoveryManager.authenticate(
+                            activity,
+                            localizedText(context, "找回儿童锁", "Recover child lock"),
+                            localizedText(
+                                context,
+                                "验证后只能设置新 PIN，不会显示旧 PIN",
+                                "Verification only allows a new PIN; the old PIN is never shown",
+                            ),
+                        ) { result ->
+                            when (result) {
+                                BiometricRecoveryResult.Success -> {
+                                    diagnosticsRepository.append(
+                                        "INFO",
+                                        context.packageName,
+                                        "BIOMETRIC_RECOVERY_SUCCEEDED",
+                                        "source=manager_unlock",
+                                    )
+                                    showManagerPinPrompt = false
+                                    pendingChildLockAction = "recovery_setup"
+                                    showChildPinSetup = true
+                                }
+                                BiometricRecoveryResult.Invalidated -> {
+                                    childLockRepository
+                                        .setBiometricRecoveryEnabledAfterAuthentication(false)
+                                    childLockRevision++
+                                    diagnosticsRepository.append(
+                                        "WARN",
+                                        context.packageName,
+                                        "BIOMETRIC_RECOVERY_INVALIDATED",
+                                        "source=manager_unlock",
+                                    )
+                                }
+                                else -> diagnosticsRepository.append(
+                                    "WARN",
+                                    context.packageName,
+                                    "BIOMETRIC_RECOVERY_FAILED",
+                                    "result=${result.javaClass.simpleName}",
+                                )
+                            }
+                        }
+                    }
+                }
+            } else null,
+            onSuccess = {
+                managerUnlocked = true
+                showManagerPinPrompt = false
+                when (pendingChildLockAction) {
+                    "disable" -> {
+                        val privateCleared = childLockRepository.disableAfterAuthentication()
+                        val saved = privateCleared && repository.saveGlobalSettings(
+                            repository.getGlobalSettings().copy(childLockEnabled = false),
+                        )
+                        if (privateCleared) {
+                            ParentAuthStore.clear()
+                            biometricRecoveryManager.deleteRecoveryKey()
+                        }
+                        if (saved) {
+                            diagnosticsRepository.append(
+                                "INFO",
+                                context.packageName,
+                                "CHILD_LOCK_DISABLED",
+                                "source=settings",
+                            )
+                            childLockRevision++
+                            managerUnlocked = false
+                        } else {
+                            Toast.makeText(
+                                context,
+                                localizedText(
+                                    context,
+                                    "关闭儿童锁失败，请重试",
+                                    "Failed to disable child lock. Try again.",
+                                ),
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            childLockRevision++
+                        }
+                        pendingChildLockAction = null
+                        showSettings = true
+                    }
+                    "change" -> {
+                        pendingChildLockAction = "change_setup"
+                        showChildPinSetup = true
+                    }
+                    "biometric_on", "biometric_off" -> {
+                        val enabled = pendingChildLockAction == "biometric_on"
+                        if (!enabled) {
+                            biometricRecoveryManager.deleteRecoveryKey()
+                            childLockRepository.setBiometricRecoveryEnabledAfterAuthentication(false)
+                            diagnosticsRepository.append(
+                                "INFO",
+                                context.packageName,
+                                "BIOMETRIC_RECOVERY_DISABLED",
+                                "source=settings",
+                            )
+                            childLockRevision++
+                            pendingChildLockAction = null
+                            showSettings = true
+                        } else {
+                            val activity = context as? FragmentActivity
+                            if (activity != null && biometricRecoveryManager.createRecoveryKey()) {
+                                biometricRecoveryManager.authenticate(
+                                    activity,
+                                    localizedText(
+                                        context,
+                                        "启用强生物识别找回",
+                                        "Enable strong-biometric recovery",
+                                    ),
+                                    localizedText(
+                                        context,
+                                        "验证后可在忘记 PIN 时重设 PIN",
+                                        "Use it to reset a forgotten PIN",
+                                    ),
+                                ) { result ->
+                                    if (result == BiometricRecoveryResult.Success) {
+                                        childLockRepository
+                                            .setBiometricRecoveryEnabledAfterAuthentication(true)
+                                        diagnosticsRepository.append(
+                                            "INFO",
+                                            context.packageName,
+                                            "BIOMETRIC_RECOVERY_ENABLED",
+                                            "source=settings",
+                                        )
+                                        childLockRevision++
+                                    } else {
+                                        biometricRecoveryManager.deleteRecoveryKey()
+                                    }
+                                    pendingChildLockAction = null
+                                    showSettings = true
+                                }
+                            } else {
+                                Toast.makeText(
+                                    context,
+                                    localizedText(
+                                        context,
+                                        "设备没有可用的强生物识别",
+                                        "No strong biometric is available",
+                                    ),
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                                pendingChildLockAction = null
+                                showSettings = true
+                            }
+                        }
+                    }
+                    else -> {
+                        pendingChildLockAction = null
+                        pendingProtectedAction?.also { pendingProtectedAction = null }?.invoke()
+                    }
+                }
+            },
+            onDismiss = {
+                showManagerPinPrompt = false
+                pendingProtectedAction = null
+                if (pendingChildLockAction != null) {
+                    pendingChildLockAction = null
+                    showSettings = true
+                } else if (!managerUnlocked) {
+                    showSettings = false
+                    editingApp = null
+                    editingGroup = null
+                }
+            },
+        )
+    }
+
+    if (showChildPinSetup) {
+        ChildLockPinSetupDialog(
+            replacing = pendingChildLockAction in setOf("change_setup", "recovery_setup"),
+            saving = childPinSaveInProgress,
+            onConfirm = { pin ->
+                if (!childPinSaveInProgress) {
+                    childPinSaveInProgress = true
+                    val action = pendingChildLockAction
+                    screenScope.launch {
+                        val replacing = action in setOf("change_setup", "recovery_setup")
+                        val privateSaved = withContext(Dispatchers.Default) {
+                            runCatching {
+                                if (replacing) {
+                                    childLockRepository.replacePinAfterAuthentication(pin)
+                                } else {
+                                    childLockRepository.enable(pin)
+                                }
+                            }.getOrDefault(false)
+                        }
+                        val settingsSaved = if (privateSaved) {
+                            withContext(Dispatchers.IO) {
+                                repository.saveGlobalSettings(
+                                    repository.getGlobalSettings().copy(childLockEnabled = true),
+                                )
+                            }
+                        } else false
+                        childPinSaveInProgress = false
+                        if (privateSaved && settingsSaved) {
+                            diagnosticsRepository.append(
+                                "INFO",
+                                context.packageName,
+                                if (replacing) "CHILD_LOCK_PIN_CHANGED" else "CHILD_LOCK_ENABLED",
+                                "source=settings",
+                            )
+                            managerUnlocked = true
+                            childLockRevision++
+                            showChildPinSetup = false
+                            pendingChildLockAction = null
+                            showSettings = true
+                        } else {
+                            if (privateSaved && !replacing) {
+                                withContext(Dispatchers.IO) {
+                                    childLockRepository.disableAfterAuthentication()
+                                }
+                            }
+                            childLockRevision++
+                            android.util.Log.e(
+                                "TimeStopChildLock",
+                                "Child-lock PIN save failed; privateSaved=$privateSaved, replacing=$replacing",
+                            )
+                            diagnosticsRepository.append(
+                                "ERROR",
+                                context.packageName,
+                                "CHILD_LOCK_PIN_SAVE_FAILED",
+                                "privateSaved=$privateSaved, replacing=$replacing",
+                            )
+                            Toast.makeText(
+                                context,
+                                localizedText(
+                                    context,
+                                    if (replacing && privateSaved) {
+                                        "PIN 已更新，但设置同步失败；请重新打开设置确认"
+                                    } else {
+                                        "儿童锁保存失败，请重试"
+                                    },
+                                    if (replacing && privateSaved) {
+                                        "The PIN changed, but settings sync failed. Reopen settings to verify."
+                                    } else {
+                                        "Failed to save child lock. Try again."
+                                    },
+                                ),
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                    }
+                }
+            },
+            onDismiss = {
+                if (!childPinSaveInProgress) {
+                    showChildPinSetup = false
+                    pendingChildLockAction = null
+                    showSettings = true
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun ChildLockPinDialog(
+    title: String,
+    repository: ChildLockRepository,
+    onBiometricRecovery: (() -> Unit)?,
+    onSuccess: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    SecurePinWindowEffect()
+    var pin by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf("") }
+    var verificationInProgress by remember { mutableStateOf(false) }
+    var lockoutUntilMillis by remember {
+        mutableLongStateOf(repository.snapshot().lockoutUntilMillis)
+    }
+    var lockoutNowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    val lockoutRemainingMillis = (lockoutUntilMillis - lockoutNowMillis).coerceAtLeast(0L)
+    val lockoutRemainingSeconds = (lockoutRemainingMillis + 999L) / 1_000L
+    LaunchedEffect(lockoutUntilMillis) {
+        while (lockoutUntilMillis > System.currentTimeMillis()) {
+            lockoutNowMillis = System.currentTimeMillis()
+            delay(1_000L)
+        }
+        lockoutNowMillis = System.currentTimeMillis()
+    }
+    fun verify() {
+        if (verificationInProgress || lockoutRemainingMillis > 0L) return
+        if (!repository.isValidPinFormat(pin)) {
+            error = localizedText(context, "请输入 4–8 位数字", "Enter 4-8 digits")
+            return
+        }
+        verificationInProgress = true
+        val submittedPin = pin
+        scope.launch {
+            val result = withContext(Dispatchers.Default) {
+                runCatching { repository.verify(submittedPin) }
+                    .getOrElse { failure ->
+                        PinVerificationResult.Error(failure.javaClass.simpleName.take(80))
+                    }
+            }
+            verificationInProgress = false
+            when (result) {
+                PinVerificationResult.Success -> onSuccess()
+                PinVerificationResult.NotConfigured -> {
+                    error = localizedText(
+                        context,
+                        "儿童锁配置不可用",
+                        "Child lock is unavailable",
+                    )
+                }
+                is PinVerificationResult.Rejected -> {
+                    error = localizedText(context, "PIN 不正确", "Incorrect PIN")
+                    android.util.Log.w("TimeStopChildLock", "Manager PIN rejected")
+                    DiagnosticsRepository(context).append(
+                        "WARN",
+                        context.packageName,
+                        "MANAGER_PIN_REJECTED",
+                        "reason=incorrect_pin",
+                    )
+                }
+                is PinVerificationResult.Locked -> {
+                    val seconds = (result.remainingMillis + 999L) / 1_000L
+                    lockoutUntilMillis = System.currentTimeMillis() + result.remainingMillis
+                    lockoutNowMillis = System.currentTimeMillis()
+                    error = localizedText(
+                        context,
+                        "$seconds 秒后再试",
+                        "Try again in $seconds seconds",
+                    )
+                    android.util.Log.w(
+                        "TimeStopChildLock",
+                        "Manager PIN locked; remainingMs=${result.remainingMillis}",
+                    )
+                    DiagnosticsRepository(context).append(
+                        "WARN",
+                        context.packageName,
+                        "MANAGER_PIN_LOCKED_OUT",
+                        "remainingMs=${result.remainingMillis}",
+                    )
+                }
+                is PinVerificationResult.Error -> {
+                    error = localizedText(
+                        context,
+                        "PIN 验证异常，请重试",
+                        "PIN verification failed. Try again.",
+                    )
+                    android.util.Log.e(
+                        "TimeStopChildLock",
+                        "Manager PIN verification failed: ${result.cause}",
+                    )
+                    DiagnosticsRepository(context).append(
+                        "ERROR",
+                        context.packageName,
+                        "MANAGER_PIN_VERIFY_ERROR",
+                        "cause=${result.cause.take(80)}",
+                    )
+                }
+            }
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    localizedText(
+                        context,
+                        "请输入 4–8 位数字 PIN。连续输错会触发递增等待。",
+                        "Enter the 4-8 digit PIN. Repeated failures trigger escalating delays.",
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                TextField(
+                    value = pin,
+                    onValueChange = {
+                        pin = it.filter(Char::isDigit).take(ChildLockRepository.MAX_PIN_LENGTH)
+                        error = ""
+                    },
+                    singleLine = true,
+                    label = { Text("PIN") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    keyboardActions = KeyboardActions(onDone = { verify() }),
+                    isError = error.isNotBlank() || lockoutRemainingMillis > 0L,
+                    supportingText = if (lockoutRemainingMillis > 0L) {
+                        {
+                            Text(
+                                localizedText(
+                                    context,
+                                    "$lockoutRemainingSeconds 秒后再试",
+                                    "Try again in $lockoutRemainingSeconds seconds",
+                                ),
+                            )
+                        }
+                    } else if (error.isNotBlank()) ({ Text(error) }) else null,
+                    enabled = !verificationInProgress && lockoutRemainingMillis == 0L,
+                )
+                if (onBiometricRecovery != null) {
+                    TextButton(onClick = onBiometricRecovery) {
+                        Text(
+                            localizedText(
+                                context,
+                                "忘记 PIN？使用指纹/强生物识别重设",
+                                "Forgot PIN? Reset with a strong biometric",
+                            ),
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = ::verify,
+                enabled = !verificationInProgress &&
+                    lockoutRemainingMillis == 0L &&
+                    pin.length in ChildLockRepository.MIN_PIN_LENGTH..
+                    ChildLockRepository.MAX_PIN_LENGTH,
+            ) {
+                Text(
+                    if (verificationInProgress) {
+                        localizedText(context, "正在验证…", "Verifying…")
+                    } else {
+                        localizedText(context, "验证", "Verify")
+                    },
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(localizedText(context, "取消", "Cancel")) }
+        },
+    )
+}
+
+@Composable
+private fun ChildLockPinSetupDialog(
+    replacing: Boolean,
+    saving: Boolean,
+    onConfirm: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    SecurePinWindowEffect()
+    var pin by remember { mutableStateOf("") }
+    var confirmation by remember { mutableStateOf("") }
+    val valid = pin.length in ChildLockRepository.MIN_PIN_LENGTH..
+        ChildLockRepository.MAX_PIN_LENGTH && pin == confirmation
+    AlertDialog(
+        onDismissRequest = { if (!saving) onDismiss() },
+        title = {
+            Text(
+                localizedText(
+                    context,
+                    if (replacing) "设置新 PIN" else "创建儿童锁 PIN",
+                    if (replacing) "Set a new PIN" else "Create a child-lock PIN",
+                ),
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    localizedText(
+                        context,
+                        "PIN 必须为 4–8 位数字。时停不会保存或显示原 PIN。",
+                        "The PIN must contain 4-8 digits. Time Stop never stores or displays the original PIN.",
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                TextField(
+                    value = pin,
+                    onValueChange = {
+                        pin = it.filter(Char::isDigit).take(ChildLockRepository.MAX_PIN_LENGTH)
+                    },
+                    label = { Text(localizedText(context, "新 PIN", "New PIN")) },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    enabled = !saving,
+                )
+                TextField(
+                    value = confirmation,
+                    onValueChange = {
+                        confirmation = it.filter(Char::isDigit)
+                            .take(ChildLockRepository.MAX_PIN_LENGTH)
+                    },
+                    label = { Text(localizedText(context, "再次输入 PIN", "Confirm PIN")) },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    isError = confirmation.isNotEmpty() && confirmation != pin,
+                    supportingText = if (confirmation.isNotEmpty() && confirmation != pin) {
+                        { Text(localizedText(context, "两次输入不一致", "PINs do not match")) }
+                    } else null,
+                    enabled = !saving,
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = { onConfirm(pin) }, enabled = valid && !saving) {
+                Text(
+                    if (saving) {
+                        localizedText(context, "正在保存…", "Saving…")
+                    } else {
+                        localizedText(context, "保存", "Save")
+                    },
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !saving) {
+                Text(localizedText(context, "取消", "Cancel"))
+            }
+        },
+    )
+}
+
+@Composable
+private fun SecurePinWindowEffect() {
+    val activity = LocalContext.current as? Activity ?: return
+    DisposableEffect(activity) {
+        val decor = activity.window.decorView
+        val previousAutofill = decor.importantForAutofill
+        activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        decor.importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+        onDispose {
+            activity.window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+            decor.importantForAutofill = previousAutofill
+        }
+    }
 }
 
 private enum class MainSection(val label: String) {
@@ -1894,6 +2549,13 @@ private fun HomeDashboard(
                     onClick = onManageApps,
                 )
             }
+        }
+        item {
+            Text(
+                "今日限制触发按自然日重置；同一额度或时段事件反复进入只记录一次。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         item {
             Text("快捷操作", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
@@ -2163,7 +2825,7 @@ private fun UsageStatisticsScreen(
                             }
                             Text(
                                 if (controlled) {
-                                    "启动 ${summary.launchCount} 次 · 限制触发 ${summary.limitHitCount} 次"
+                                    "启动 ${summary.launchCount} 次 · 今日限制触发 ${summary.limitHitCount} 次"
                                 } else {
                                     "Android 系统使用统计"
                                 },
@@ -3114,6 +3776,7 @@ private fun SetupGuideDialog(
 @Composable
 private fun SettingsDialog(
     initialSettings: GlobalSettings,
+    childLockSnapshot: ChildLockSnapshot,
     xposedAvailable: Boolean,
     usageAccessGranted: Boolean,
     accessibilityEnabled: Boolean,
@@ -3141,6 +3804,10 @@ private fun SettingsDialog(
     onRequestScope: (Set<String>) -> Unit,
     onRestorePermissionPrompts: () -> Unit,
     onOpenOemCompatibilitySettings: () -> Unit,
+    onEnableChildLock: () -> Unit,
+    onDisableChildLock: () -> Unit,
+    onChangeChildPin: () -> Unit,
+    onSetBiometricRecovery: (Boolean) -> Unit,
     onSave: (GlobalSettings) -> Unit,
 ) {
     val context = LocalContext.current
@@ -3212,6 +3879,97 @@ private fun SettingsDialog(
                 modifier = Modifier.heightIn(max = 520.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
+                item {
+                    SettingsSectionTitle(
+                        localizedText(context, "安全与儿童锁", "Security and child lock"),
+                    )
+                }
+                item {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainer,
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        localizedText(context, "儿童锁", "Child lock"),
+                                        fontWeight = FontWeight.Bold,
+                                    )
+                                    Text(
+                                        if (childLockSnapshot.enabled) {
+                                            localizedText(
+                                                context,
+                                                "已保护规则、分组、设置及 1–60 分钟家长临时放行",
+                                                "Protects rules, groups, settings, and 1-60 minute parent overrides",
+                                            )
+                                        } else {
+                                            localizedText(
+                                                context,
+                                                "使用 4–8 位数字 PIN 保护管控设置",
+                                                "Protect management settings with a 4-8 digit PIN",
+                                            )
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
+                                Switch(
+                                    checked = childLockSnapshot.enabled,
+                                    onCheckedChange = { enabled ->
+                                        if (enabled) onEnableChildLock() else onDisableChildLock()
+                                    },
+                                )
+                            }
+                            if (childLockSnapshot.enabled) {
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(onClick = onChangeChildPin) {
+                                        Text(localizedText(context, "修改 PIN", "Change PIN"))
+                                    }
+                                    OutlinedButton(
+                                        onClick = {
+                                            onSetBiometricRecovery(
+                                                !childLockSnapshot.biometricRecoveryEnabled,
+                                            )
+                                        },
+                                    ) {
+                                        Text(
+                                            if (childLockSnapshot.biometricRecoveryEnabled) {
+                                                localizedText(
+                                                    context,
+                                                    "关闭生物识别找回",
+                                                    "Disable biometric recovery",
+                                                )
+                                            } else {
+                                                localizedText(
+                                                    context,
+                                                    "开启生物识别找回",
+                                                    "Enable biometric recovery",
+                                                )
+                                            },
+                                        )
+                                    }
+                                }
+                                Text(
+                                    localizedText(
+                                        context,
+                                        "每次验证可选择 1–60 分钟，默认 5 分钟且不记忆上次选择；时间到期、目标应用真正进入后台、息屏或进程结束时立即撤销。清除时停数据、撤销权限或关闭模块仍可绕过，本功能不是设备所有者级家长控制。",
+                                        "Each verification allows 1-60 minutes, defaults to 5 minutes, and does not remember the previous choice. The override ends when time expires, the target app truly enters the background, the screen locks, or the process ends. Clearing Time Stop data, revoking permissions, or disabling the module can bypass it; this is not device-owner parental control.",
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+                item { HorizontalDivider() }
                 item {
                     SettingsSectionTitle("保护方式")
                 }
@@ -3804,6 +4562,12 @@ private fun SettingsDialog(
                             ) {
                                 Text(
                                     "达到限制后打开独立休息页，使目标界面自然暂停，并尽力暂停常见媒体。休息页不提供延时；单次额度配合冷却时，结束后可继续原页面。切换方式后请强停并重开目标应用。",
+                                    color = MaterialTheme.colorScheme.primary,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            } else {
+                                Text(
+                                    "强制退出会关闭目标任务并结束当前 Hook 进程；多进程应用的独立后台服务可能继续运行，需整包强停时请使用普通保护 + Shizuku。",
                                     color = MaterialTheme.colorScheme.primary,
                                     style = MaterialTheme.typography.bodySmall,
                                 )
@@ -4743,6 +5507,7 @@ private fun foregroundSourceLabel(
 private fun DiagnosticLogDialog(
     repository: DiagnosticsRepository,
     onFeedback: () -> Unit,
+    onClear: (() -> Unit) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var logs by remember { mutableStateOf(repository.readLatest()) }
@@ -4771,8 +5536,10 @@ private fun DiagnosticLogDialog(
                 TextButton(onClick = { logs = repository.readLatest() }) { Text("刷新") }
                 TextButton(
                     onClick = {
-                        repository.clear()
-                        logs = emptyList()
+                        onClear {
+                            repository.clear()
+                            logs = emptyList()
+                        }
                     },
                 ) { Text("清空") }
             }

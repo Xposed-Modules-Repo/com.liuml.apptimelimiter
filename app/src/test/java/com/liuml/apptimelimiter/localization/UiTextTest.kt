@@ -32,8 +32,8 @@ class UiTextTest {
             UiText.translate("已启用 3 个应用", SupportedLanguage.ENGLISH),
         )
         assertEquals(
-            "2 launches · 1 limit hits",
-            UiText.translate("启动 2 次 · 限制触发 1 次", SupportedLanguage.ENGLISH),
+            "2 launches · 1 limit hits today",
+            UiText.translate("启动 2 次 · 今日限制触发 1 次", SupportedLanguage.ENGLISH),
         )
         assertEquals(
             "3/20 lines, up to 80 characters each",

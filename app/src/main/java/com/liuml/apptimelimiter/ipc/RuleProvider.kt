@@ -13,11 +13,18 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.provider.Settings
 import android.util.Base64
 import com.liuml.apptimelimiter.core.BreakSessionPolicy
+import com.liuml.apptimelimiter.core.PackageNamePolicy
+import com.liuml.apptimelimiter.core.ParentOverrideDurationPolicy
 import com.liuml.apptimelimiter.core.ProtectionExecutionPolicy
+import com.liuml.apptimelimiter.core.RuleActivationPolicy
+import com.liuml.apptimelimiter.core.TemporaryOverrideIdentity
 import com.liuml.apptimelimiter.core.GroupUsagePolicy
 import com.liuml.apptimelimiter.core.SharedCooldownClaimStatus
+import com.liuml.apptimelimiter.core.SharedGroupSessionAction
+import com.liuml.apptimelimiter.core.SharedGroupSessionPolicy
 import com.liuml.apptimelimiter.core.TimeQuotePolicy
 import com.liuml.apptimelimiter.core.UsageReportingPolicy
 import com.liuml.apptimelimiter.data.LimitEnforcementMode
@@ -26,6 +33,9 @@ import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
+import com.liuml.apptimelimiter.security.ChildLockRepository
+import com.liuml.apptimelimiter.security.ParentAuthStatus
+import com.liuml.apptimelimiter.security.ParentAuthStore
 import java.time.LocalDate
 import java.security.SecureRandom
 import java.util.concurrent.Executors
@@ -53,6 +63,30 @@ class RuleProvider : ContentProvider() {
         val appContext = context ?: return Bundle().apply { putBoolean(RuleContract.KEY_OK, false) }
         val ruleRepository = RuleRepository(appContext)
         return when (method) {
+            RuleContract.METHOD_ENSURE_RULE_ACCESS -> {
+                val packageName = arg.orEmpty()
+                if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
+                if (!isCallerAllowed(packageName)) return denied("caller_mismatch")
+                if (!isConfiguredPackage(ruleRepository, packageName)) {
+                    return denied("rule_not_configured")
+                }
+                val identity = Binder.clearCallingIdentity()
+                val granted = try {
+                    ruleRepository.grantRuleAccess(packageName)
+                } finally {
+                    Binder.restoreCallingIdentity(identity)
+                }
+                if (!granted) return denied("grant_failed")
+                val settings = ruleRepository.getGlobalSettings()
+                diagnosticParentAuth(
+                    appContext,
+                    settings.diagnosticsEnabled,
+                    packageName,
+                    "RULE_PROVIDER_ACCESS_REPAIRED",
+                    "temporary_grant=true",
+                )
+                Bundle().apply { putBoolean(RuleContract.KEY_OK, true) }
+            }
             RuleContract.METHOD_GET_RULE -> {
                 val packageName = arg.orEmpty()
                 if (!isCallerAllowed(packageName)) return denied()
@@ -177,6 +211,10 @@ class RuleProvider : ContentProvider() {
                         ruleRepository.rulesetGeneration(),
                     )
                     putBoolean(RuleContract.KEY_EXIT_WARNING_ENABLED, settings.exitWarningEnabled)
+                    putBoolean(
+                        RuleContract.KEY_CHILD_LOCK_ENABLED,
+                        settings.childLockEnabled && ChildLockRepository(appContext).isEnabled(),
+                    )
                     putBoolean(
                         RuleContract.KEY_FULL_SCREEN_EXIT_WARNING_ENABLED,
                         settings.fullScreenExitWarningEnabled,
@@ -365,6 +403,119 @@ class RuleProvider : ContentProvider() {
                 }
             }
 
+            RuleContract.METHOD_SYNC_GROUP_PER_LAUNCH_SESSION -> {
+                val packageName = arg.orEmpty()
+                if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
+                if (!isCallerAllowed(packageName)) return denied("caller_mismatch")
+                if (
+                    !ProtectionExecutionPolicy.acceptHookSideEffect(
+                        ruleRepository.getGlobalSettings().protectionMode,
+                    )
+                ) {
+                    return denied("inactive_protection_mode")
+                }
+                val request = extras ?: return denied("missing_group_session_request")
+                val groupId = request.getString(RuleContract.KEY_GROUP_ID).orEmpty()
+                val group = ruleRepository.groupForPackage(packageName)
+                    ?.takeIf {
+                        it.id == groupId && it.enabled && it.perLaunchEnabled &&
+                            packageName in it.packageNames
+                    }
+                    ?: return denied("group_session_not_configured")
+                val action = request.getString(RuleContract.KEY_GROUP_SESSION_ACTION)
+                    ?.let { runCatching { SharedGroupSessionAction.valueOf(it) }.getOrNull() }
+                    ?: return denied("invalid_group_session_action")
+                val ownerId = request.getString(RuleContract.KEY_GROUP_SESSION_OWNER_ID)
+                    .orEmpty().take(MAX_SESSION_ID_LENGTH)
+                val expectedSessionId = request.getString(RuleContract.KEY_GROUP_SESSION_ID)
+                    .orEmpty().take(MAX_SESSION_ID_LENGTH)
+                val segmentId = request.getString(RuleContract.KEY_GROUP_SESSION_SEGMENT_ID)
+                    .orEmpty().take(MAX_SESSION_ID_LENGTH)
+                if (
+                    ownerId.isBlank() || !ownerId.startsWith("$packageName|") ||
+                    ownerId.hasLineBreak() ||
+                    expectedSessionId.hasLineBreak() || segmentId.hasLineBreak()
+                ) return denied("invalid_group_session_fields")
+                val segmentMillis = request.getLong(RuleContract.KEY_DURATION_MS, 0L)
+                    .coerceIn(0L, MAX_GROUP_SESSION_SEGMENT_MILLIS)
+                val resetGapMillis = if (group.cooldownEnabled) {
+                    group.cooldownSeconds.coerceIn(
+                        RuleRepository.MIN_COOLDOWN_SECONDS,
+                        RuleRepository.MAX_COOLDOWN_SECONDS,
+                    ) * 1_000L
+                } else {
+                    SharedGroupSessionPolicy.DEFAULT_RESET_GAP_MILLIS
+                }
+                val bootCount = Settings.Global.getInt(
+                    appContext.contentResolver,
+                    Settings.Global.BOOT_COUNT,
+                    -1,
+                )
+                val update = runCatching {
+                    ruleRepository.updateGroupPerLaunchSession(
+                        groupId = group.id,
+                        action = action,
+                        groupVersion = group.version,
+                        bootCount = bootCount,
+                        ownerId = ownerId,
+                        expectedSessionId = expectedSessionId,
+                        segmentId = segmentId,
+                        segmentMillis = segmentMillis,
+                        nowElapsedMillis = SystemClock.elapsedRealtime(),
+                        resetGapMillis = resetGapMillis,
+                    )
+                }.getOrElse { error ->
+                    diagnosticParentAuth(
+                        appContext,
+                        ruleRepository.getGlobalSettings().diagnosticsEnabled,
+                        packageName,
+                        "GROUP_SESSION_SYNC_FAILED",
+                        "action=$action error=${error.javaClass.simpleName}",
+                    )
+                    return denied("group_session_persist_failed")
+                }
+                val event = when {
+                    update.staleRequest -> "GROUP_SESSION_STALE_UPDATE"
+                    update.restarted -> "GROUP_SESSION_STARTED"
+                    update.ownerTransferred -> "GROUP_SESSION_HANDOFF"
+                    action == SharedGroupSessionAction.LEAVE -> "GROUP_SESSION_PAUSED"
+                    else -> "GROUP_SESSION_SYNCED"
+                }
+                if (
+                    update.restarted || update.ownerTransferred || update.staleRequest ||
+                    action == SharedGroupSessionAction.LEAVE
+                ) {
+                    diagnosticParentAuth(
+                        appContext,
+                        ruleRepository.getGlobalSettings().diagnosticsEnabled,
+                        packageName,
+                        event,
+                        "group=${group.id} session=${update.record.sessionId.take(48)} " +
+                            "used=${update.record.usedMillis} action=$action " +
+                            "accepted=${update.segmentAccepted}",
+                    )
+                }
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, true)
+                    putString(RuleContract.KEY_EVENT, event)
+                    putString(RuleContract.KEY_GROUP_SESSION_ID, update.record.sessionId)
+                    putLong(RuleContract.KEY_GROUP_SESSION_USED_MS, update.record.usedMillis)
+                    putBoolean(RuleContract.KEY_GROUP_SESSION_RESTARTED, update.restarted)
+                    putBoolean(
+                        RuleContract.KEY_GROUP_SESSION_OWNER_TRANSFERRED,
+                        update.ownerTransferred,
+                    )
+                    putBoolean(
+                        RuleContract.KEY_GROUP_SESSION_SEGMENT_ACCEPTED,
+                        update.segmentAccepted,
+                    )
+                    putBoolean(
+                        RuleContract.KEY_GROUP_SESSION_STALE_REQUEST,
+                        update.staleRequest,
+                    )
+                }
+            }
+
             RuleContract.METHOD_CREATE_BREAK_SESSION -> {
                 val packageName = arg.orEmpty()
                 if (!isCallerAllowed(packageName)) return denied()
@@ -450,6 +601,211 @@ class RuleProvider : ContentProvider() {
                     consumed.accepted && persisted
                 }
                 Bundle().apply { putBoolean(RuleContract.KEY_OK, accepted) }
+            }
+
+            RuleContract.METHOD_CREATE_PARENT_AUTH_CHALLENGE -> {
+                val packageName = arg.orEmpty()
+                if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
+                val ownRequest = Binder.getCallingUid() == Process.myUid()
+                if (!ownRequest && !isCallerAllowed(packageName)) {
+                    return denied("caller_mismatch")
+                }
+                if (!isConfiguredPackage(ruleRepository, packageName)) {
+                    return denied("rule_not_configured")
+                }
+                val settings = ruleRepository.getGlobalSettings()
+                if (!ownRequest && settings.protectionMode.usesNonRoot) {
+                    return denied("hook_not_controller")
+                }
+                if (!settings.childLockEnabled) return denied("child_lock_disabled")
+                if (!ChildLockRepository(appContext).isEnabled()) {
+                    return denied("child_lock_pin_missing")
+                }
+                val sessionId = extras?.getString(RuleContract.KEY_PROCESS_SESSION_ID)
+                    .orEmpty().take(MAX_SESSION_ID_LENGTH)
+                val incidentId = extras?.getString(RuleContract.KEY_INCIDENT_ID)
+                    .orEmpty().take(MAX_INCIDENT_ID_LENGTH)
+                val reason = extras?.getString(RuleContract.KEY_PARENT_AUTH_REASON)
+                    .orEmpty().take(MAX_AUTH_REASON_LENGTH)
+                if (
+                    sessionId.isBlank() || incidentId.isBlank() || reason.isBlank() ||
+                    sessionId.hasLineBreak() || incidentId.hasLineBreak() || reason.hasLineBreak()
+                ) return denied("invalid_challenge_fields")
+                val rule = ruleRepository.getRule(packageName)
+                val groupVersion = ruleRepository.groupForPackage(packageName)?.version ?: 0L
+                val identity = TemporaryOverrideIdentity(
+                    packageName = packageName,
+                    processSessionId = sessionId,
+                    ruleVersion = rule.version,
+                    groupVersion = groupVersion,
+                    protectionModeGeneration = settings.protectionModeGeneration,
+                )
+                val nowMillis = System.currentTimeMillis()
+                val token = generateBreakSessionToken()
+                val challenge = ParentAuthStore.issue(
+                    token = token,
+                    identity = identity,
+                    incidentId = incidentId,
+                    reason = reason,
+                    nowMillis = nowMillis,
+                )
+                diagnosticParentAuth(
+                    appContext,
+                    settings.diagnosticsEnabled,
+                    packageName,
+                    "PARENT_AUTH_CHALLENGE_STARTED",
+                    "reason=$reason, incident=${incidentId.take(80)}",
+                )
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, true)
+                    putString(RuleContract.KEY_PARENT_AUTH_TOKEN, token)
+                    putLong(RuleContract.KEY_BREAK_SESSION_EXPIRES_AT_MS, challenge.expiresAtMillis)
+                }
+            }
+
+            RuleContract.METHOD_CONSUME_PARENT_AUTH_CHALLENGE -> {
+                if (Binder.getCallingUid() != Process.myUid()) return denied()
+                val token = extras?.getString(RuleContract.KEY_PARENT_AUTH_TOKEN)
+                    .orEmpty().take(MAX_BREAK_SESSION_TOKEN_LENGTH)
+                val challenge = ParentAuthStore.consumeForUi(token, System.currentTimeMillis())
+                    ?: return denied()
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, true)
+                    putString(RuleContract.KEY_PARENT_AUTH_TOKEN, challenge.token)
+                    putString(RuleContract.KEY_PROCESS_SESSION_ID, challenge.identity.processSessionId)
+                    putString(RuleContract.KEY_INCIDENT_ID, challenge.incidentId)
+                    putString(RuleContract.KEY_PARENT_AUTH_REASON, challenge.reason)
+                    putString("target_package", challenge.identity.packageName)
+                    putLong(
+                        RuleContract.KEY_BREAK_SESSION_EXPIRES_AT_MS,
+                        challenge.expiresAtMillis,
+                    )
+                }
+            }
+
+            RuleContract.METHOD_COMPLETE_PARENT_AUTH_CHALLENGE -> {
+                if (Binder.getCallingUid() != Process.myUid()) return denied()
+                val token = extras?.getString(RuleContract.KEY_PARENT_AUTH_TOKEN)
+                    .orEmpty().take(MAX_BREAK_SESSION_TOKEN_LENGTH)
+                val granted = extras?.getBoolean(RuleContract.KEY_PARENT_AUTH_GRANTED, false) == true
+                val requestedMinutes = extras?.getInt(
+                    RuleContract.KEY_PARENT_OVERRIDE_DURATION_MINUTES,
+                    ParentOverrideDurationPolicy.DEFAULT_MINUTES,
+                ) ?: ParentOverrideDurationPolicy.DEFAULT_MINUTES
+                val durationMinutes = ParentOverrideDurationPolicy.normalizeMinutes(requestedMinutes)
+                val completed = ParentAuthStore.complete(
+                    token = token,
+                    granted = granted,
+                    durationMillis = ParentOverrideDurationPolicy.durationMillis(durationMinutes),
+                    nowMillis = System.currentTimeMillis(),
+                    nowElapsedMillis = SystemClock.elapsedRealtime(),
+                )
+                    ?: return denied()
+                val settings = ruleRepository.getGlobalSettings()
+                diagnosticParentAuth(
+                    appContext,
+                    settings.diagnosticsEnabled,
+                    completed.challenge.identity.packageName,
+                    if (granted) "PARENT_AUTH_SUCCEEDED" else "PARENT_AUTH_FAILED",
+                    "reason=${completed.challenge.reason}, incident=${completed.challenge.incidentId.take(80)}, " +
+                        "durationMinutes=${if (granted) durationMinutes else 0}",
+                )
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, true)
+                    completed.parentOverride?.let { parentOverride ->
+                        putInt(
+                            RuleContract.KEY_PARENT_OVERRIDE_DURATION_MINUTES,
+                            durationMinutes,
+                        )
+                        putLong(
+                            RuleContract.KEY_PARENT_OVERRIDE_GRANTED_AT_ELAPSED_MS,
+                            parentOverride.grantedAtElapsedMillis,
+                        )
+                        putLong(
+                            RuleContract.KEY_PARENT_OVERRIDE_EXPIRES_AT_ELAPSED_MS,
+                            parentOverride.expiresAtElapsedMillis,
+                        )
+                    }
+                }
+            }
+
+            RuleContract.METHOD_GET_PARENT_AUTH_STATUS -> {
+                val packageName = arg.orEmpty()
+                val ownRequest = Binder.getCallingUid() == Process.myUid()
+                if (!ownRequest && !isCallerAllowed(packageName)) return denied()
+                val token = extras?.getString(RuleContract.KEY_PARENT_AUTH_TOKEN)
+                    .orEmpty().take(MAX_BREAK_SESSION_TOKEN_LENGTH)
+                val sessionId = extras?.getString(RuleContract.KEY_PROCESS_SESSION_ID)
+                    .orEmpty().take(MAX_SESSION_ID_LENGTH)
+                val status = ParentAuthStore.status(
+                    token,
+                    packageName,
+                    sessionId,
+                    System.currentTimeMillis(),
+                )
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, status != ParentAuthStatus.INVALID)
+                    putString(RuleContract.KEY_PARENT_AUTH_STATUS, status.name)
+                }
+            }
+
+            RuleContract.METHOD_HAS_PARENT_OVERRIDE -> {
+                val packageName = arg.orEmpty()
+                val ownRequest = Binder.getCallingUid() == Process.myUid()
+                if (!ownRequest && !isCallerAllowed(packageName)) return denied()
+                val identity = currentOverrideIdentity(ruleRepository, packageName, extras)
+                    ?: return denied()
+                val interactive = runCatching {
+                    appContext.getSystemService(android.os.PowerManager::class.java)?.isInteractive
+                }.getOrNull() == true
+                val nowElapsedMillis = SystemClock.elapsedRealtime()
+                val parentOverride = ParentAuthStore.getOverride(
+                    identity = identity,
+                    screenInteractive = interactive,
+                    nowMillis = System.currentTimeMillis(),
+                    nowElapsedMillis = nowElapsedMillis,
+                )
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, true)
+                    putBoolean(
+                        RuleContract.KEY_PARENT_AUTH_GRANTED,
+                        parentOverride != null,
+                    )
+                    parentOverride?.let {
+                        putLong(
+                            RuleContract.KEY_PARENT_OVERRIDE_GRANTED_AT_ELAPSED_MS,
+                            it.grantedAtElapsedMillis,
+                        )
+                        putLong(
+                            RuleContract.KEY_PARENT_OVERRIDE_EXPIRES_AT_ELAPSED_MS,
+                            it.expiresAtElapsedMillis,
+                        )
+                        putLong(
+                            RuleContract.KEY_PARENT_OVERRIDE_REMAINING_MS,
+                            (it.expiresAtElapsedMillis - nowElapsedMillis).coerceAtLeast(0L),
+                        )
+                    }
+                }
+            }
+
+            RuleContract.METHOD_REVOKE_PARENT_OVERRIDE -> {
+                val packageName = arg.orEmpty()
+                val ownRequest = Binder.getCallingUid() == Process.myUid()
+                if (!ownRequest && !isCallerAllowed(packageName)) return denied()
+                val sessionId = extras?.getString(RuleContract.KEY_PROCESS_SESSION_ID)
+                    .orEmpty().take(MAX_SESSION_ID_LENGTH)
+                if (sessionId.isBlank()) return denied()
+                val revoked = ParentAuthStore.revoke(packageName, sessionId)
+                if (revoked) {
+                    diagnosticParentAuth(
+                        appContext,
+                        ruleRepository.getGlobalSettings().diagnosticsEnabled,
+                        packageName,
+                        "TEMPORARY_OVERRIDE_REVOKED",
+                        "session=${sessionId.take(40)}",
+                    )
+                }
+                Bundle().apply { putBoolean(RuleContract.KEY_OK, true) }
             }
 
             RuleContract.METHOD_APPEND_LOG -> {
@@ -595,10 +951,20 @@ class RuleProvider : ContentProvider() {
         }.getOrDefault(false)
     }
 
-    private fun isConfiguredPackage(repository: RuleRepository, packageName: String): Boolean =
-        Binder.getCallingUid() == Process.myUid() || packageName in repository.configuredPackages()
+    private fun isConfiguredPackage(repository: RuleRepository, packageName: String): Boolean {
+        if (Binder.getCallingUid() == Process.myUid()) return true
+        if (!PackageNamePolicy.isValid(packageName)) return false
+        return RuleActivationPolicy.hasEffectiveRule(
+            rule = repository.getRule(packageName),
+            assignedGroup = repository.groupForPackage(packageName),
+        )
+    }
 
     private fun denied() = Bundle().apply { putBoolean(RuleContract.KEY_OK, false) }
+
+    private fun denied(reason: String) = denied().apply {
+        putString(RuleContract.KEY_MESSAGE, reason.take(MAX_MESSAGE_LENGTH))
+    }
 
     private fun generateBreakSessionToken(): String {
         val bytes = ByteArray(BREAK_SESSION_TOKEN_BYTES)
@@ -607,6 +973,40 @@ class RuleProvider : ContentProvider() {
             bytes,
             Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP,
         )
+    }
+
+    private fun currentOverrideIdentity(
+        repository: RuleRepository,
+        packageName: String,
+        extras: Bundle?,
+    ): TemporaryOverrideIdentity? {
+        if (!PackageNamePolicy.isValid(packageName) || packageName !in repository.configuredPackages()) {
+            return null
+        }
+        val sessionId = extras?.getString(RuleContract.KEY_PROCESS_SESSION_ID)
+            .orEmpty().take(MAX_SESSION_ID_LENGTH)
+        if (sessionId.isBlank() || sessionId.hasLineBreak()) return null
+        val rule = repository.getRule(packageName)
+        return TemporaryOverrideIdentity(
+            packageName = packageName,
+            processSessionId = sessionId,
+            ruleVersion = rule.version,
+            groupVersion = repository.groupForPackage(packageName)?.version ?: 0L,
+            protectionModeGeneration = repository.getGlobalSettings().protectionModeGeneration,
+        )
+    }
+
+    private fun String.hasLineBreak(): Boolean = any { it == '\n' || it == '\r' }
+
+    private fun diagnosticParentAuth(
+        context: android.content.Context,
+        enabled: Boolean,
+        packageName: String,
+        event: String,
+        message: String,
+    ) {
+        if (!enabled) return
+        DiagnosticsRepository(context).append("INFO", packageName, event, message)
     }
 
     private fun lookupSystemUsage(
@@ -734,6 +1134,9 @@ class RuleProvider : ContentProvider() {
         const val KEY_BREAK_SESSION_RECORDS = "records"
         const val BREAK_SESSION_TOKEN_BYTES = 24
         const val MAX_BREAK_SESSION_TOKEN_LENGTH = 128
+        const val MAX_SESSION_ID_LENGTH = 160
+        const val MAX_AUTH_REASON_LENGTH = 80
+        const val MAX_GROUP_SESSION_SEGMENT_MILLIS = 24L * 60L * 60L * 1_000L
         val ALLOWED_LOG_LEVELS = setOf("DEBUG", "INFO", "WARN", "ERROR")
     }
 

@@ -74,6 +74,22 @@
             android:taskAffinity="${applicationId}.restriction"
             android:theme="@style/Theme.AppTimeLimiter.BreakPage" />
 
+        <activity
+            android:name=".ParentUnlockActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:launchMode="standard"
+            android:noHistory="false"
+            android:theme="@style/Theme.AppTimeLimiter.BreakPage" />
+
+        <activity
+            android:name=".ParentAuthBootstrapActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:launchMode="standard"
+            android:noHistory="true"
+            android:theme="@style/Theme.AppTimeLimiter.Bootstrap" />
+
         <activity-alias
             android:name=".LauncherAlias"
             android:enabled="true"
@@ -100,6 +116,12 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/non_root_accessibility_service" />
         </service>
+
+        <service
+            android:name=".ipc.RuleAccessBridgeService"
+            android:enabled="true"
+            android:exported="true"
+            android:stopWithTask="true" />
 
         <provider
             android:name="rikka.shizuku.ShizukuProvider"

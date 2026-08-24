@@ -1,6 +1,7 @@
 package com.liuml.apptimelimiter.nonroot
 
 import com.liuml.apptimelimiter.core.LimitBlockReason
+import com.liuml.apptimelimiter.core.QuotaBoundaryPolicy
 import com.liuml.apptimelimiter.core.QuotaKind
 
 enum class NonRootBlockReason {
@@ -24,6 +25,7 @@ data class NonRootRuleSnapshot(
     val groupPerSessionEnabled: Boolean,
     val groupPerSessionLimitMillis: Long,
     val sessionUsedMillis: Long,
+    val groupSessionUsedMillis: Long = sessionUsedMillis,
     val planActive: Boolean,
     val planRemainingMillis: Long,
 )
@@ -49,19 +51,19 @@ object NonRootRuleEvaluator {
         val reachedKinds = buildSet {
             if (
                 snapshot.appDailyEnabled &&
-                snapshot.appDailyUsedMillis >= snapshot.appDailyLimitMillis
+                reached(snapshot.appDailyLimitMillis, snapshot.appDailyUsedMillis)
             ) add(QuotaKind.APP_DAILY)
             if (
                 snapshot.appPerSessionEnabled &&
-                snapshot.sessionUsedMillis >= snapshot.appPerSessionLimitMillis
+                reached(snapshot.appPerSessionLimitMillis, snapshot.sessionUsedMillis)
             ) add(QuotaKind.APP_PER_LAUNCH)
             if (
                 snapshot.groupDailyEnabled &&
-                snapshot.groupDailyUsedMillis >= snapshot.groupDailyLimitMillis
+                reached(snapshot.groupDailyLimitMillis, snapshot.groupDailyUsedMillis)
             ) add(QuotaKind.GROUP_DAILY)
             if (
                 snapshot.groupPerSessionEnabled &&
-                snapshot.sessionUsedMillis >= snapshot.groupPerSessionLimitMillis
+                reached(snapshot.groupPerSessionLimitMillis, snapshot.groupSessionUsedMillis)
             ) add(QuotaKind.GROUP_PER_LAUNCH)
         }
         val blockingReason = when {
@@ -75,16 +77,21 @@ object NonRootRuleEvaluator {
         val permanentRemaining = if (blockingReason == null) {
             buildList {
                 if (snapshot.appDailyEnabled) {
-                    add(snapshot.appDailyLimitMillis - snapshot.appDailyUsedMillis)
+                    add(remaining(snapshot.appDailyLimitMillis, snapshot.appDailyUsedMillis))
                 }
                 if (snapshot.appPerSessionEnabled) {
-                    add(snapshot.appPerSessionLimitMillis - snapshot.sessionUsedMillis)
+                    add(remaining(snapshot.appPerSessionLimitMillis, snapshot.sessionUsedMillis))
                 }
                 if (snapshot.groupDailyEnabled) {
-                    add(snapshot.groupDailyLimitMillis - snapshot.groupDailyUsedMillis)
+                    add(remaining(snapshot.groupDailyLimitMillis, snapshot.groupDailyUsedMillis))
                 }
                 if (snapshot.groupPerSessionEnabled) {
-                    add(snapshot.groupPerSessionLimitMillis - snapshot.sessionUsedMillis)
+                    add(
+                        remaining(
+                            snapshot.groupPerSessionLimitMillis,
+                            snapshot.groupSessionUsedMillis,
+                        ),
+                    )
                 }
             }.filter { it > 0L }.minOrNull()
         } else {
@@ -111,6 +118,12 @@ object NonRootRuleEvaluator {
             sessionPlanIsNextThreshold = sessionPlanIsNextThreshold,
         )
     }
+
+    private fun reached(limitMillis: Long, usedMillis: Long): Boolean =
+        remaining(limitMillis, usedMillis) == 0L
+
+    private fun remaining(limitMillis: Long, usedMillis: Long): Long =
+        QuotaBoundaryPolicy.normalizeRemainingMillis(limitMillis - usedMillis)
 }
 
 object NonRootLimitHitPolicy {

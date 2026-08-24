@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -19,6 +20,7 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import com.liuml.apptimelimiter.data.AppThemeColor
 import com.liuml.apptimelimiter.data.AppThemeMode
+import com.liuml.apptimelimiter.core.WarningBannerLayoutPolicy
 import com.liuml.apptimelimiter.ui.TargetUiColors
 import com.liuml.apptimelimiter.ui.TargetUiPalette
 import kotlin.math.max
@@ -64,14 +66,31 @@ internal class TopWarningBanner private constructor(
             themeColor: AppThemeColor = AppThemeColor.GREEN,
             quote: String? = null,
             actionLabel: String? = null,
+            actionContentDescription: String? = null,
             onAction: (() -> Unit)? = null,
+            secondaryActionLabel: String? = null,
+            secondaryActionContentDescription: String? = null,
+            onSecondaryAction: (() -> Unit)? = null,
             exitLabel: String? = null,
+            exitContentDescription: String? = null,
             onExit: (() -> Unit)? = null,
         ): TopWarningBanner {
             val decor = activity.window.decorView as ViewGroup
             val colors = TargetUiPalette.resolve(activity, themeMode, themeColor)
             val density = activity.resources.displayMetrics.density
             fun dp(value: Int): Int = (value * density + 0.5f).toInt()
+            val availableWidthDp = (windowWidth(activity) / density).toInt()
+            val actionCount = listOf(
+                exitLabel to onExit,
+                actionLabel to onAction,
+                secondaryActionLabel to onSecondaryAction,
+            ).count { (label, action) -> label != null && action != null }
+            val stackCompactActions = WarningBannerLayoutPolicy.shouldStackActions(
+                fullScreen = fullScreen,
+                availableWidthDp = availableWidthDp,
+                actionCount = actionCount,
+                fontScale = activity.resources.configuration.fontScale,
+            )
 
             val root = FrameLayout(activity).apply {
                 setPadding(
@@ -99,7 +118,11 @@ internal class TopWarningBanner private constructor(
                 isFocusable = false
             }
             val contentRow = LinearLayout(activity).apply {
-                orientation = if (fullScreen) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+                orientation = if (fullScreen || stackCompactActions) {
+                    LinearLayout.VERTICAL
+                } else {
+                    LinearLayout.HORIZONTAL
+                }
                 gravity = if (fullScreen) Gravity.CENTER_HORIZONTAL else Gravity.CENTER_VERTICAL
                 isClickable = false
                 isFocusable = false
@@ -114,13 +137,15 @@ internal class TopWarningBanner private constructor(
                 setTextColor(if (fullScreen) colors.textPrimary else colors.onPrimaryContainer)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, if (fullScreen) 28f else 15f)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-                maxLines = if (fullScreen) 2 else 1
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.END
                 gravity = if (fullScreen) Gravity.CENTER else Gravity.NO_GRAVITY
             }
             val messageView = TextView(activity).apply {
                 setTextColor(colors.textSecondary)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, if (fullScreen) 16f else 12.5f)
                 maxLines = if (fullScreen) 3 else 2
+                ellipsize = TextUtils.TruncateAt.END
                 gravity = if (fullScreen) Gravity.CENTER else Gravity.NO_GRAVITY
                 setPadding(0, dp(if (fullScreen) 8 else 2), 0, 0)
             }
@@ -162,7 +187,7 @@ internal class TopWarningBanner private constructor(
             }
             contentRow.addView(
                 textColumn,
-                if (fullScreen) {
+                if (fullScreen || stackCompactActions) {
                     LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -176,35 +201,79 @@ internal class TopWarningBanner private constructor(
                 },
             )
 
-            if (!fullScreen && (exitLabel != null || actionLabel != null)) {
+            if (!fullScreen && (
+                    exitLabel != null || actionLabel != null || secondaryActionLabel != null
+                )
+            ) {
                 val actionColumn = LinearLayout(activity).apply {
                     orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
+                    gravity = Gravity.CENTER_VERTICAL or Gravity.END
                 }
+                fun compactActionParams(hasPrevious: Boolean): LinearLayout.LayoutParams =
+                    if (stackCompactActions) {
+                        LinearLayout.LayoutParams(
+                            0,
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            1f,
+                        ).apply { if (hasPrevious) marginStart = dp(6) }
+                    } else {
+                        LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ).apply { if (hasPrevious) marginStart = dp(8) }
+                    }
+                var hasPreviousAction = false
                 if (exitLabel != null && onExit != null) {
                     actionColumn.addView(
                         actionTextView(activity, exitLabel, prominent = false, colors = colors, dp = ::dp).apply {
+                            contentDescription = exitContentDescription ?: exitLabel
                             setOnClickListener { onExit() }
                         },
+                        compactActionParams(hasPreviousAction),
                     )
+                    hasPreviousAction = true
                 }
                 if (actionLabel != null && onAction != null) {
                     actionColumn.addView(
                         actionTextView(activity, actionLabel, prominent = true, colors = colors, dp = ::dp).apply {
+                            contentDescription = actionContentDescription ?: actionLabel
                             setOnClickListener { onAction() }
                         },
-                        LinearLayout.LayoutParams(
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ).apply { marginStart = dp(8) },
+                        compactActionParams(hasPreviousAction),
+                    )
+                    hasPreviousAction = true
+                }
+                if (secondaryActionLabel != null && onSecondaryAction != null) {
+                    actionColumn.addView(
+                        actionTextView(
+                            activity,
+                            secondaryActionLabel,
+                            prominent = false,
+                            colors = colors,
+                            dp = ::dp,
+                        ).apply {
+                            contentDescription = secondaryActionContentDescription ?: secondaryActionLabel
+                            setOnClickListener { onSecondaryAction() }
+                        },
+                        compactActionParams(hasPreviousAction),
                     )
                 }
                 contentRow.addView(
                     actionColumn,
                     LinearLayout.LayoutParams(
+                        if (stackCompactActions) {
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        } else {
+                            ViewGroup.LayoutParams.WRAP_CONTENT
+                        },
                         ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ).apply { marginStart = dp(10) },
+                    ).apply {
+                        if (stackCompactActions) {
+                            topMargin = dp(8)
+                        } else {
+                            marginStart = dp(10)
+                        }
+                    },
                 )
             }
 
@@ -247,14 +316,14 @@ internal class TopWarningBanner private constructor(
                 val actionHitTarget = FrameLayout(activity).apply {
                     isClickable = true
                     isFocusable = true
-                    contentDescription = actionLabel
+                    contentDescription = actionContentDescription ?: actionLabel
                     setOnClickListener { onAction() }
                 }
                 actionHitTarget.addView(
                     actionTextView(activity, actionLabel, prominent = false, colors = colors, dp = ::dp),
                     FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT,
-                        dp(FULL_SCREEN_ACTION_VISUAL_HEIGHT_DP),
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
                         Gravity.CENTER,
                     ),
                 )
@@ -267,18 +336,48 @@ internal class TopWarningBanner private constructor(
                     ),
                 )
             }
+            if (fullScreen && secondaryActionLabel != null && onSecondaryAction != null) {
+                val secondaryHitTarget = FrameLayout(activity).apply {
+                    isClickable = true
+                    isFocusable = true
+                    contentDescription = secondaryActionContentDescription ?: secondaryActionLabel
+                    setOnClickListener { onSecondaryAction() }
+                }
+                secondaryHitTarget.addView(
+                    actionTextView(
+                        activity,
+                        secondaryActionLabel,
+                        prominent = false,
+                        colors = colors,
+                        dp = ::dp,
+                    ),
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        Gravity.CENTER,
+                    ),
+                )
+                root.addView(
+                    secondaryHitTarget,
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        dp(FULL_SCREEN_ACTION_TOUCH_DP),
+                        Gravity.TOP or Gravity.END,
+                    ).apply { topMargin = dp(FULL_SCREEN_ACTION_TOUCH_DP + 4) },
+                )
+            }
             if (fullScreen && exitLabel != null && onExit != null) {
                 val exitHitTarget = FrameLayout(activity).apply {
                     isClickable = true
                     isFocusable = true
-                    contentDescription = exitLabel
+                    contentDescription = exitContentDescription ?: exitLabel
                     setOnClickListener { onExit() }
                 }
                 exitHitTarget.addView(
                     actionTextView(activity, exitLabel, prominent = false, colors = colors, dp = ::dp),
                     FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT,
-                        dp(FULL_SCREEN_ACTION_VISUAL_HEIGHT_DP),
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
                         Gravity.CENTER,
                     ),
                 )
@@ -361,6 +460,9 @@ internal class TopWarningBanner private constructor(
             setTextSize(TypedValue.COMPLEX_UNIT_SP, if (prominent) 13f else 12f)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             gravity = Gravity.CENTER
+            minHeight = dp(48)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
             minWidth = dp(if (prominent) 0 else 56)
             setPadding(dp(if (prominent) 13 else 10), 0, dp(if (prominent) 13 else 10), 0)
             background = roundedBackground(
@@ -494,7 +596,6 @@ internal class TopWarningBanner private constructor(
         private const val TOP_MARGIN_DP = 10
         private const val MAX_LANDSCAPE_WIDTH_DP = 520
         private const val FULL_SCREEN_PADDING_DP = 20
-        private const val FULL_SCREEN_ACTION_VISUAL_HEIGHT_DP = 36
         private const val FULL_SCREEN_ACTION_TOUCH_DP = 48
     }
 }

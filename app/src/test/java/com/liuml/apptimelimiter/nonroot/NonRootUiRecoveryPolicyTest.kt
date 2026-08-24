@@ -7,6 +7,31 @@ import org.junit.Test
 
 class NonRootUiRecoveryPolicyTest {
     @Test
+    fun `unanswered visible plan is restored when foreground changes`() {
+        assertTrue(
+            NonRootUiRecoveryPolicy.shouldRestoreInterruptedPlanPrompt(
+                uiState = NonRootUiExecutionState.PLAN_VISIBLE,
+                planPromptHandled = true,
+                planActive = false,
+            ),
+        )
+        assertFalse(
+            NonRootUiRecoveryPolicy.shouldRestoreInterruptedPlanPrompt(
+                uiState = NonRootUiExecutionState.IDLE,
+                planPromptHandled = true,
+                planActive = false,
+            ),
+        )
+        assertFalse(
+            NonRootUiRecoveryPolicy.shouldRestoreInterruptedPlanPrompt(
+                uiState = NonRootUiExecutionState.PLAN_VISIBLE,
+                planPromptHandled = true,
+                planActive = true,
+            ),
+        )
+    }
+
+    @Test
     fun `visible unanswered plan is restored after service restart`() {
         assertTrue(
             NonRootUiRecoveryPolicy.shouldRestorePlanAfterServiceRestart(

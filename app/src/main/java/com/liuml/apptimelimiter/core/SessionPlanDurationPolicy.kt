@@ -1,54 +1,40 @@
 package com.liuml.apptimelimiter.core
 
-enum class SessionPlanDurationStatus {
-    VALID,
-    EMPTY,
-    NON_NUMERIC,
-    ZERO,
-    OUT_OF_RANGE,
-    EXCEEDS_MAX,
-}
-
-data class SessionPlanDurationEvaluation(
-    val totalMinutes: Int?,
-    val status: SessionPlanDurationStatus,
-)
-
 object SessionPlanDurationPolicy {
-    const val MAX_TOTAL_MINUTES = 24 * 60
+    const val MIN_TOTAL_MINUTES = 1
+    const val MAX_TOTAL_MINUTES = 60
+    const val DEFAULT_TOTAL_MINUTES = 5
     const val MAX_TOTAL_MILLIS = MAX_TOTAL_MINUTES * 60_000L
-
-    fun evaluate(rawMinutes: String, maxAllowedMillis: Long?): SessionPlanDurationEvaluation {
-        val normalized = rawMinutes.trim()
-        if (normalized.isEmpty()) {
-            return SessionPlanDurationEvaluation(null, SessionPlanDurationStatus.EMPTY)
-        }
-        if (normalized.any { !it.isDigit() }) {
-            return SessionPlanDurationEvaluation(null, SessionPlanDurationStatus.NON_NUMERIC)
-        }
-        val minutes = normalized.toLongOrNull()
-            ?: return SessionPlanDurationEvaluation(null, SessionPlanDurationStatus.OUT_OF_RANGE)
-        if (minutes == 0L) {
-            return SessionPlanDurationEvaluation(null, SessionPlanDurationStatus.ZERO)
-        }
-        if (minutes !in 1L..MAX_TOTAL_MINUTES.toLong()) {
-            return SessionPlanDurationEvaluation(null, SessionPlanDurationStatus.OUT_OF_RANGE)
-        }
-        val durationMillis = minutes * 60_000L
-        return SessionPlanDurationEvaluation(
-            totalMinutes = minutes.toInt(),
-            status = if (maxAllowedMillis != null && durationMillis > maxAllowedMillis) {
-                SessionPlanDurationStatus.EXCEEDS_MAX
-            } else {
-                SessionPlanDurationStatus.VALID
-            },
-        )
-    }
 
     fun durationAllowed(durationMillis: Long, maxAllowedMillis: Long?): Boolean =
         durationMillis in 1L..MAX_TOTAL_MILLIS &&
             (maxAllowedMillis == null || durationMillis <= maxAllowedMillis)
 
-    fun maxSelectableMinutes(maxAllowedMillis: Long): Long =
-        maxAllowedMillis.coerceIn(0L, MAX_TOTAL_MILLIS) / 60_000L
+    fun maxSelectableMinutes(maxAllowedMillis: Long?): Int =
+        if (maxAllowedMillis == null) {
+            MAX_TOTAL_MINUTES
+        } else {
+            (maxAllowedMillis.coerceAtLeast(0L) / 60_000L)
+                .coerceAtMost(MAX_TOTAL_MINUTES.toLong())
+                .toInt()
+        }
+
+    fun defaultSelectableMinutes(maxAllowedMillis: Long?): Int? =
+        maxSelectableMinutes(maxAllowedMillis)
+            .takeIf { it >= MIN_TOTAL_MINUTES }
+            ?.let { minOf(DEFAULT_TOTAL_MINUTES, it) }
+
+    fun defaultSliderMinutes(maxAllowedMillis: Long?): Int =
+        defaultSelectableMinutes(maxAllowedMillis) ?: MIN_TOTAL_MINUTES
+
+    fun normalizeSliderMinutes(minutes: Int): Int =
+        minutes.coerceIn(MIN_TOTAL_MINUTES, MAX_TOTAL_MINUTES)
+
+    fun minutesAllowed(minutes: Int, maxAllowedMillis: Long?): Boolean =
+        durationAllowed(normalizeSliderMinutes(minutes) * 60_000L, maxAllowedMillis)
+
+    fun normalizeSelectableMinutes(minutes: Int, maxAllowedMillis: Long?): Int? =
+        maxSelectableMinutes(maxAllowedMillis)
+            .takeIf { it >= MIN_TOTAL_MINUTES }
+            ?.let { minutes.coerceIn(MIN_TOTAL_MINUTES, it) }
 }

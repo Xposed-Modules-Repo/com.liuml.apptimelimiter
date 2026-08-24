@@ -1,5 +1,6 @@
 package com.liuml.apptimelimiter.nonroot
 
+import com.liuml.apptimelimiter.BuildConfig
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.content.Intent
@@ -12,10 +13,14 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.widget.Toast
 import com.liuml.apptimelimiter.LimitBlockActivity
+import com.liuml.apptimelimiter.ParentUnlockActivity
 import com.liuml.apptimelimiter.core.GroupUsagePolicy
 import com.liuml.apptimelimiter.core.QuotaIncidentPolicy
 import com.liuml.apptimelimiter.core.QuotaKind
 import com.liuml.apptimelimiter.core.ScheduleBlockPolicy
+import com.liuml.apptimelimiter.core.SharedGroupSessionAction
+import com.liuml.apptimelimiter.core.SharedGroupSessionPolicy
+import com.liuml.apptimelimiter.core.SharedGroupSessionRecord
 import com.liuml.apptimelimiter.core.RuleActivationPolicy
 import com.liuml.apptimelimiter.core.ScheduleConstraint
 import com.liuml.apptimelimiter.core.ScheduleEvaluator
@@ -27,11 +32,13 @@ import com.liuml.apptimelimiter.data.GlobalSettings
 import com.liuml.apptimelimiter.data.RuleRepository
 import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
 import com.liuml.apptimelimiter.ipc.RuleContract
+import com.liuml.apptimelimiter.security.ChildLockRepository
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.ZonedDateTime
+import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -58,10 +65,16 @@ class ForegroundControlCoordinator(
     private val generation = AtomicLong(0L)
     private val foregroundGeneration = AtomicLong(0L)
     private val sessions = mutableMapOf<String, NonRootSessionState>()
+    private val groupPerLaunchSessions = Collections.synchronizedMap(
+        mutableMapOf<String, SharedGroupSessionRecord>(),
+    )
     private val planPromptAttempts = mutableMapOf<String, Int>()
     private val recordedLimitIncidents = linkedSetOf<String>()
     private val lastSignalElapsedMillis = mutableMapOf<String, Long>()
     private val compatibilityRetryAfterElapsedMillis = mutableMapOf<String, Long>()
+    private val activeParentOverridePackages = mutableSetOf<String>()
+    private var parentAuthTargetPackage: String? = null
+    private var parentAuthTargetSessionId: String? = null
     private var lastRuntimeWarningToken = ""
     private var suppressNextGenericBreakPageToast = false
     private var lastRuntimeWarningAtElapsedMillis = Long.MIN_VALUE
@@ -139,6 +152,7 @@ class ForegroundControlCoordinator(
         pendingBreakPageAttempt = null
         visibleRestrictionPackage = null
         sessions.clear()
+        groupPerLaunchSessions.clear()
         planPromptAttempts.clear()
         runtimeStore.clearAllSessions()
         foregroundPackage = null
@@ -284,7 +298,10 @@ class ForegroundControlCoordinator(
             "NON_ROOT_FOREGROUND_SIGNAL",
             "source=$source, eventType=$eventType, kind=$kind, previous=${previous.orEmpty()}",
         )
-        if (previous != null) pauseSession(previous, nowElapsed)
+        if (previous != null) {
+            pauseSession(previous, nowElapsed)
+            restoreInterruptedPlanPrompt(previous, "foreground_changed_to_$kind")
+        }
         cancelPendingActionForForeground(packageName, kind, "foreground_changed")
         overlay.dismiss("foreground_changed:$previous->$packageName")
         if (
@@ -323,6 +340,10 @@ class ForegroundControlCoordinator(
         if (
             packageName == appContext.packageName
         ) return
+        if (parentAuthTargetPackage == packageName) {
+            parentAuthTargetPackage = null
+            parentAuthTargetSessionId = null
+        }
         val settings = repository.getGlobalSettings()
         val rule = repository.getRule(packageName)
         val group = repository.groupForPackage(packageName)
@@ -383,6 +404,14 @@ class ForegroundControlCoordinator(
             planPromptAttempts.remove(packageName)
         }
         sessions[packageName] = resumed
+        if (group?.perLaunchEnabled == true) {
+            syncNonRootGroupSession(
+                packageName,
+                resumed,
+                group,
+                SharedGroupSessionAction.ENTER,
+            )
+        }
         persistSession(resumed, "foreground")
         splitActiveSessionAtDayBoundary(packageName, nowElapsed)
         if (restrictionReentry) {
@@ -699,7 +728,38 @@ class ForegroundControlCoordinator(
         )
     }
 
+    private fun restoreInterruptedPlanPrompt(packageName: String, reason: String) {
+        val current = sessions[packageName] ?: runtimeStore.loadSession(packageName) ?: return
+        if (
+            !NonRootUiRecoveryPolicy.shouldRestoreInterruptedPlanPrompt(
+                uiState = uiState,
+                planPromptHandled = current.planPromptHandled,
+                planActive = current.planActive,
+            )
+        ) return
+        val retryable = current.copy(planPromptHandled = false)
+        sessions[packageName] = retryable
+        persistSession(retryable, "plan_prompt_interrupted")
+        planPromptAttempts.remove(packageName)
+        log(
+            packageName,
+            "SESSION_PLAN_PROMPT_INTERRUPTED",
+            "engine=accessibility, reason=$reason, session=${current.sessionId.take(40)}",
+            "WARN",
+        )
+    }
+
     private fun pauseSession(packageName: String, nowElapsed: Long) {
+        if (activeParentOverridePackages.remove(packageName)) {
+            val sessionId = sessions[packageName]?.sessionId
+                ?: runtimeStore.loadSession(packageName)?.sessionId.orEmpty()
+            if (sessionId.isNotBlank()) revokeParentOverride(packageName, sessionId)
+            log(
+                packageName,
+                "TEMPORARY_OVERRIDE_REVOKED",
+                "reason=non_root_background session=${sessionId.take(40)}",
+            )
+        }
         val state = sessions[packageName] ?: runtimeStore.loadSession(packageName) ?: return
         if (state.foregroundStartedAtElapsedMillis <= 0L) return
         val paused = NonRootSessionPolicy.background(state, nowElapsed)
@@ -710,6 +770,18 @@ class ForegroundControlCoordinator(
             paused.accumulatedForegroundMillis - state.accumulatedForegroundMillis
             ).coerceAtLeast(0L)
         sessions[packageName] = paused
+        val group = repository.groupForPackage(packageName)?.takeIf {
+            it.enabled && it.perLaunchEnabled && packageName in it.packageNames
+        }
+        if (group != null) {
+            syncNonRootGroupSession(
+                packageName,
+                state,
+                group,
+                SharedGroupSessionAction.LEAVE,
+                segment,
+            )
+        }
         persistSession(paused, "background")
         recordForegroundDuration(packageName, segment, segmentDayToken)
     }
@@ -919,6 +991,16 @@ class ForegroundControlCoordinator(
         val activeSegment = (
             sessionUsed - session.accumulatedForegroundMillis
             ).coerceAtLeast(0L)
+        val groupSession = group?.takeIf { it.perLaunchEnabled }?.let {
+            groupPerLaunchSessions[it.id]
+                ?: syncNonRootGroupSession(
+                    packageName,
+                    session,
+                    it,
+                    SharedGroupSessionAction.ENTER,
+                )
+        }
+        val groupSessionUsed = safeAdd(groupSession?.usedMillis ?: 0L, activeSegment)
         val appModuleUsed = safeAdd(
             moduleSummaries[packageName]?.durationMillis ?: 0L,
             activeSegment,
@@ -993,6 +1075,7 @@ class ForegroundControlCoordinator(
                 group?.perLaunchLimitSeconds ?: RuleRepository.DEFAULT_LIMIT_SECONDS,
             ),
             sessionUsedMillis = sessionUsed,
+            groupSessionUsedMillis = groupSessionUsed,
             planActive = session.planActive,
             planRemainingMillis = NonRootSessionPolicy.planRemainingMillis(session, nowElapsed),
         )
@@ -1009,6 +1092,7 @@ class ForegroundControlCoordinator(
             ),
             scheduleIncidentToken = scheduleIncidentToken,
             cooldownEndsAtMillis = effectiveCooldownEnd,
+            groupPerLaunchSessionId = groupSession?.sessionId.orEmpty(),
         )
     }
 
@@ -1057,6 +1141,32 @@ class ForegroundControlCoordinator(
                 "planEnabled=${result.rule.sessionPlanningEnabled}, " +
                 "planHandled=${result.session.planPromptHandled}",
         )
+        val parentOverride = if (
+            result.decision.blockingReason != null &&
+            result.settings.childLockEnabled
+        ) {
+            getParentOverride(result.packageName, result.session.sessionId)
+        } else {
+            ParentOverrideStatus.NONE
+        }
+        if (parentOverride.granted) {
+            activeParentOverridePackages += result.packageName
+            clearActiveRestriction(result.packageName, "parent_override")
+            log(
+                result.packageName,
+                "TEMPORARY_OVERRIDE_ACTIVATED",
+                "engine=accessibility session=${result.session.sessionId.take(40)} " +
+                    "remainingMs=${parentOverride.remainingMillis}",
+            )
+            scheduleEvaluation(result.packageName, parentOverride.remainingMillis.coerceAtLeast(1L))
+            return
+        } else if (activeParentOverridePackages.remove(result.packageName)) {
+            log(
+                result.packageName,
+                "TEMPORARY_OVERRIDE_EXPIRED",
+                "engine=accessibility session=${result.session.sessionId.take(40)}",
+            )
+        }
         when (result.decision.blockingReason) {
             null -> {
                 clearActiveRestriction(result.packageName, "restriction_released")
@@ -1188,7 +1298,11 @@ class ForegroundControlCoordinator(
                     "plan_selected",
                 )
                 val current = sessions[packageName] ?: result.session
-                val planned = NonRootSessionPolicy.withPlan(current, durationMillis)
+                val planned = NonRootSessionPolicy.withPlan(
+                    state = current,
+                    durationMillis = durationMillis,
+                    allowDebugShortChoice = BuildConfig.DEBUG,
+                )
                 sessions[packageName] = planned
                 persistSession(planned, "plan_selected")
                 planPromptAttempts.remove(packageName)
@@ -1434,7 +1548,13 @@ class ForegroundControlCoordinator(
                 groupId = result.group?.id.orEmpty(),
                 groupVersion = result.group?.version ?: 0L,
                 dayToken = LocalDate.now().toString(),
-                processSessionId = result.session.sessionId,
+                processSessionId = if (
+                    QuotaKind.GROUP_PER_LAUNCH in result.decision.reachedKinds
+                ) {
+                    result.groupPerLaunchSessionId.ifBlank { result.session.sessionId }
+                } else {
+                    result.session.sessionId
+                },
                 reachedKinds = result.decision.reachedKinds,
             ).orEmpty()
             if (incidentId.isNotBlank()) {
@@ -1526,8 +1646,7 @@ class ForegroundControlCoordinator(
             scheduleIncidentIsNew = scheduleIncidentIsNew,
         )
         if (recordHit && result.settings.usageStatsEnabled) {
-            if (
-                !usageRepository.record(
+            val statsPersisted = usageRepository.record(
                     packageName = packageName,
                     durationMillis = 0L,
                     launchIncrement = 0,
@@ -1535,7 +1654,15 @@ class ForegroundControlCoordinator(
                     hookVersionCode = 0,
                     dayToken = LocalDate.now().toString(),
                 )
-            ) {
+            log(
+                packageName,
+                "STATS_LIMIT_HIT_PERSISTED",
+                "day=${LocalDate.now()}, increment=1, incident=" +
+                    "${if (reason == NonRootBlockReason.SCHEDULE) result.scheduleIncidentToken else incidentId}, " +
+                    "persisted=$statsPersisted",
+                if (statsPersisted) "INFO" else "WARN",
+            )
+            if (!statsPersisted) {
                 log(
                     packageName,
                     "NON_ROOT_USAGE_PERSIST_FAILED",
@@ -1632,6 +1759,7 @@ class ForegroundControlCoordinator(
                 }
             }
         }
+        val executeRestriction = {
         if (
             result.settings.protectionMode.usesShizuku &&
             shizuku.state.value == ShizukuExecutionState.READY
@@ -1664,6 +1792,235 @@ class ForegroundControlCoordinator(
             }
         } else {
             finishAction(false)
+        }
+        }
+        if (
+            result.settings.childLockEnabled &&
+            ChildLockRepository(appContext).isEnabled() &&
+            result.settings.protectionMode.usesShizuku &&
+            shizuku.state.value == ShizukuExecutionState.READY &&
+            showNonRootParentUnlockGate(result, incidentId, reason.name, executeRestriction)
+        ) return
+        executeRestriction()
+    }
+
+    private fun showNonRootParentUnlockGate(
+        result: EvaluationResult,
+        incidentId: String,
+        reason: String,
+        onExpired: () -> Unit,
+    ): Boolean {
+        val packageName = result.packageName
+        val sessionId = result.session.sessionId
+        val terminal = AtomicBoolean(false)
+        val launchStarted = AtomicBoolean(false)
+        val timeout = Runnable {
+            if (!terminal.compareAndSet(false, true)) return@Runnable
+            overlay.dismiss("parent_unlock_timeout")
+            log(packageName, "PARENT_AUTH_TIMEOUT", "engine=accessibility_shizuku")
+            onExpired()
+        }
+        val shown = overlay.showParentUnlockWarning(
+            packageName = packageName,
+            english = isEnglish(result.settings),
+            onPinUnlock = {
+                if (!launchStarted.compareAndSet(false, true)) {
+                    log(
+                        packageName,
+                        "PARENT_AUTH_DUPLICATE_TAP_SUPPRESSED",
+                        "engine=accessibility_shizuku",
+                    )
+                    return@showParentUnlockWarning
+                }
+                handler.removeCallbacks(timeout)
+                val tokenResult = runCatching {
+                    appContext.contentResolver.call(
+                        RuleContract.CONTENT_URI,
+                        RuleContract.METHOD_CREATE_PARENT_AUTH_CHALLENGE,
+                        packageName,
+                        Bundle().apply {
+                            putString(RuleContract.KEY_PROCESS_SESSION_ID, sessionId)
+                            putString(
+                                RuleContract.KEY_INCIDENT_ID,
+                                incidentId.ifBlank { "non-root:$packageName:$reason:$sessionId" },
+                            )
+                            putString(RuleContract.KEY_PARENT_AUTH_REASON, reason)
+                        },
+                    )
+                }.getOrNull()
+                val token = tokenResult?.takeIf {
+                    it.getBoolean(RuleContract.KEY_OK, false)
+                }?.getString(RuleContract.KEY_PARENT_AUTH_TOKEN).orEmpty()
+                if (token.isBlank()) {
+                    val failure = tokenResult?.getString(RuleContract.KEY_MESSAGE)
+                        .orEmpty().ifBlank { "unknown" }
+                    log(
+                        packageName,
+                        "PARENT_AUTH_CHALLENGE_FAILED",
+                        "engine=accessibility_shizuku failure=${failure.take(120)}",
+                        "ERROR",
+                    )
+                    android.widget.Toast.makeText(
+                        appContext,
+                        if (isEnglish(result.settings)) {
+                            "Could not open parent verification"
+                        } else {
+                            "无法打开家长验证"
+                        },
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                    if (terminal.compareAndSet(false, true)) onExpired()
+                    return@showParentUnlockWarning
+                }
+                val intent = Intent(appContext, ParentUnlockActivity::class.java).apply {
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_NO_ANIMATION or
+                            Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS,
+                    )
+                    putExtra(ParentUnlockActivity.EXTRA_TOKEN, token)
+                }
+                runCatching { service.startActivity(intent) }
+                    .onSuccess {
+                        parentAuthTargetPackage = packageName
+                        parentAuthTargetSessionId = sessionId
+                        log(
+                            packageName,
+                            "PARENT_AUTH_ACTIVITY_LAUNCH_REQUESTED",
+                            "engine=accessibility_shizuku",
+                        )
+                        pollNonRootParentAuth(
+                            packageName,
+                            sessionId,
+                            token,
+                            terminal,
+                            onExpired,
+                        )
+                    }
+                    .onFailure { error ->
+                        log(
+                            packageName,
+                            "PARENT_AUTH_ACTIVITY_FAILED",
+                            "engine=accessibility_shizuku exception=${error.javaClass.simpleName}:${error.message}",
+                            "ERROR",
+                        )
+                        android.widget.Toast.makeText(
+                            appContext,
+                            if (isEnglish(result.settings)) {
+                                "Unable to open PIN verification"
+                            } else {
+                                "无法打开 PIN 验证页面"
+                            },
+                            android.widget.Toast.LENGTH_LONG,
+                        ).show()
+                        if (terminal.compareAndSet(false, true)) onExpired()
+                    }
+            },
+            onExit = {
+                handler.removeCallbacks(timeout)
+                if (terminal.compareAndSet(false, true)) onExpired()
+            },
+        )
+        if (!shown) return false
+        handler.postDelayed(timeout, WARNING_LEAD_MILLIS)
+        return true
+    }
+
+    private fun pollNonRootParentAuth(
+        packageName: String,
+        sessionId: String,
+        token: String,
+        terminal: AtomicBoolean,
+        onDenied: () -> Unit,
+    ) {
+        val startedAt = SystemClock.elapsedRealtime()
+        val poll = object : Runnable {
+            override fun run() {
+                if (terminal.get()) return
+                val status = runCatching {
+                    appContext.contentResolver.call(
+                        RuleContract.CONTENT_URI,
+                        RuleContract.METHOD_GET_PARENT_AUTH_STATUS,
+                        packageName,
+                        Bundle().apply {
+                            putString(RuleContract.KEY_PARENT_AUTH_TOKEN, token)
+                            putString(RuleContract.KEY_PROCESS_SESSION_ID, sessionId)
+                        },
+                    )
+                }.getOrNull()?.getString(RuleContract.KEY_PARENT_AUTH_STATUS).orEmpty()
+                when (status) {
+                    "GRANTED" -> {
+                        if (!terminal.compareAndSet(false, true)) return
+                        activeParentOverridePackages += packageName
+                        clearActiveRestriction(packageName, "parent_override")
+                        log(packageName, "TEMPORARY_OVERRIDE_GRANTED", "engine=accessibility_shizuku")
+                    }
+                    "DENIED", "TIMED_OUT", "INVALID" -> {
+                        parentAuthTargetPackage = null
+                        parentAuthTargetSessionId = null
+                        if (terminal.compareAndSet(false, true)) onDenied()
+                    }
+                    else -> if (
+                        SystemClock.elapsedRealtime() - startedAt <
+                        ParentUnlockActivity.MAX_WAIT_MILLIS + 1_000L
+                    ) {
+                        handler.postDelayed(this, PARENT_AUTH_POLL_MILLIS)
+                    } else if (terminal.compareAndSet(false, true)) {
+                        onDenied()
+                    }
+                }
+            }
+        }
+        handler.post(poll)
+    }
+
+    private fun getParentOverride(packageName: String, sessionId: String): ParentOverrideStatus {
+        val response = runCatching {
+            appContext.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_HAS_PARENT_OVERRIDE,
+                packageName,
+                Bundle().apply {
+                    putString(RuleContract.KEY_PROCESS_SESSION_ID, sessionId)
+                },
+            )
+        }.getOrNull() ?: return ParentOverrideStatus.NONE
+        val granted = response.getBoolean(RuleContract.KEY_OK, false) &&
+            response.getBoolean(RuleContract.KEY_PARENT_AUTH_GRANTED, false)
+        if (!granted) return ParentOverrideStatus.NONE
+        return ParentOverrideStatus(
+            granted = true,
+            expiresAtElapsedMillis = response.getLong(
+                RuleContract.KEY_PARENT_OVERRIDE_EXPIRES_AT_ELAPSED_MS,
+                0L,
+            ),
+            remainingMillis = response.getLong(
+                RuleContract.KEY_PARENT_OVERRIDE_REMAINING_MS,
+                0L,
+            ).coerceAtLeast(0L),
+        )
+    }
+
+    private fun revokeParentOverride(packageName: String, sessionId: String) {
+        runCatching {
+            appContext.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_REVOKE_PARENT_OVERRIDE,
+                packageName,
+                Bundle().apply {
+                    putString(RuleContract.KEY_PROCESS_SESSION_ID, sessionId)
+                },
+            )
+        }
+    }
+
+    private data class ParentOverrideStatus(
+        val granted: Boolean,
+        val expiresAtElapsedMillis: Long,
+        val remainingMillis: Long,
+    ) {
+        companion object {
+            val NONE = ParentOverrideStatus(false, 0L, 0L)
         }
     }
 
@@ -1749,6 +2106,7 @@ class ForegroundControlCoordinator(
             putExtra(LimitBlockActivity.EXTRA_DAY_TOKEN, LocalDate.now().toString())
             putExtra(LimitBlockActivity.EXTRA_ENGLISH, english)
             putExtra(LimitBlockActivity.EXTRA_NON_ROOT, true)
+            putExtra(LimitBlockActivity.EXTRA_CONTROL_SESSION_ID, result.session.sessionId)
         }
         val attempt = BreakPageAttempt(
             attemptId = attemptId,
@@ -2137,6 +2495,72 @@ class ForegroundControlCoordinator(
     private fun safeAdd(left: Long, right: Long): Long =
         if (right > 0L && left > Long.MAX_VALUE - right) Long.MAX_VALUE else left + right
 
+    private fun syncNonRootGroupSession(
+        packageName: String,
+        session: NonRootSessionState,
+        group: AppGroup,
+        action: SharedGroupSessionAction,
+        segmentMillis: Long = 0L,
+    ): SharedGroupSessionRecord? {
+        val existing = groupPerLaunchSessions[group.id]
+            ?: repository.getGroupPerLaunchSession(group.id)
+        val ownerId = "nonroot|$packageName|${session.sessionId}"
+        val segmentId = if (action == SharedGroupSessionAction.ENTER) {
+            ""
+        } else {
+            "${session.sessionId}|${session.accumulatedForegroundMillis}|$segmentMillis|$action"
+        }
+        return runCatching {
+            repository.updateGroupPerLaunchSession(
+                groupId = group.id,
+                action = action,
+                groupVersion = group.version,
+                bootCount = Settings.Global.getInt(
+                    appContext.contentResolver,
+                    Settings.Global.BOOT_COUNT,
+                    -1,
+                ),
+                ownerId = ownerId,
+                expectedSessionId = existing.sessionId,
+                segmentId = segmentId,
+                segmentMillis = segmentMillis.coerceAtLeast(0L),
+                nowElapsedMillis = SystemClock.elapsedRealtime(),
+                resetGapMillis = if (group.cooldownEnabled) {
+                    group.cooldownSeconds.coerceIn(
+                        RuleRepository.MIN_COOLDOWN_SECONDS,
+                        RuleRepository.MAX_COOLDOWN_SECONDS,
+                    ) * 1_000L
+                } else {
+                    SharedGroupSessionPolicy.DEFAULT_RESET_GAP_MILLIS
+                },
+            )
+        }.onSuccess { update ->
+            groupPerLaunchSessions[group.id] = update.record
+            if (update.restarted || update.ownerTransferred || update.staleRequest) {
+                log(
+                    packageName,
+                    when {
+                        update.staleRequest -> "GROUP_SESSION_STALE_UPDATE"
+                        update.restarted -> "GROUP_SESSION_STARTED"
+                        else -> "GROUP_SESSION_HANDOFF"
+                    },
+                    "engine=accessibility group=${group.id} " +
+                        "session=${update.record.sessionId.take(48)} " +
+                        "used=${update.record.usedMillis} action=$action",
+                    if (update.staleRequest) "WARN" else "INFO",
+                )
+            }
+        }.onFailure { error ->
+            log(
+                packageName,
+                "GROUP_SESSION_SYNC_FAILED",
+                "engine=accessibility group=${group.id} action=$action " +
+                    "error=${error.javaClass.simpleName}",
+                "ERROR",
+            )
+        }.getOrNull()?.record
+    }
+
     private fun recordTransientIncident(token: String): Boolean {
         if (!recordedLimitIncidents.add(token)) return false
         while (recordedLimitIncidents.size > MAX_TRANSIENT_INCIDENTS) {
@@ -2289,6 +2713,7 @@ class ForegroundControlCoordinator(
         val scheduleNextTransitionMillis: Long?,
         val scheduleIncidentToken: String,
         val cooldownEndsAtMillis: Long,
+        val groupPerLaunchSessionId: String,
     )
 
     private data class BreakPageAttempt(
@@ -2300,6 +2725,7 @@ class ForegroundControlCoordinator(
 
     private companion object {
         const val WARNING_LEAD_MILLIS = 5_000L
+        const val PARENT_AUTH_POLL_MILLIS = 250L
         const val THRESHOLD_SLOP_MILLIS = 80L
         const val BREAK_PAGE_CONFIRM_TIMEOUT_MILLIS = 2_500L
         const val HOME_FALLBACK_CONFIRM_MILLIS = 700L

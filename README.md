@@ -4,14 +4,14 @@
 
 ![Android 8.1+](https://img.shields.io/badge/Android-8.1%2B-3DDC84?logo=android&logoColor=white)
 ![LSPosed API 93+](https://img.shields.io/badge/LSPosed-API%2093%2B-5C6BC0)
-![Version 0.10.15](https://img.shields.io/badge/version-0.10.15-2E7D5B)
+![Version 0.11.10](https://img.shields.io/badge/version-0.11.10-2E7D5B)
 ![License GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
 Stock screen-time tools are usually built for reports, daily caps, and focus modes. **Time Stop** is built for people who want sharper controls: per-app quotas, per-launch timers, weekly allow/block windows, shared group budgets, cooldowns after forced exits, Hook verification, and diagnostics that show what is actually happening inside the target process.
 
 [Latest release](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed module page](https://modules.lsposed.org/module/com.liuml.apptimelimiter/) · [Obtainium](#obtainium) · [中文说明](#中文说明)
 
-Current version: `0.10.15`
+Current version: `0.11.10`
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -34,21 +34,22 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Capability | What it does |
 | --- | --- |
 | Independent app rules | Each app keeps its own enabled state, daily quota, per-launch quota, schedule windows, warning style, and cooldown behavior. |
-| App groups and shared allowance | Put multiple apps into one group with shared daily, per-launch, schedule, and cooldown rules. Group members run only the group policy; saved personal rules are suspended and resume after removal. |
+| App groups and shared allowance | Put multiple apps into one group with shared daily, continuous per-launch, schedule, and cooldown rules. Switching directly between members keeps one per-launch balance; leaving the group for the configured rest starts a new cycle. Group members run only the group policy. |
+| Child lock and parent override | Optionally protects rule-changing settings with a private 4–8 digit PIN. PIN derivation runs off the UI thread, repeated submissions are suppressed, and an active lockout shows a live countdown instead of freezing or closing the manager. At a hard limit, a parent can temporarily allow only the current app session. |
 | Non-root basic protection | Uses a content-blind accessibility service for foreground package changes plus Android usage access for daily calibration. An opt-in enhanced compatibility mode adds package-only content-change events for ROMs that miss normal window events; it still retrieves no nodes, text, input, or notifications and uses no foreground service or continuous polling. |
 | Optional Shizuku enhancement | Shizuku only executes a validated force-stop for configured third-party targets. Missing permission, a stopped service, binder failure, or a protected system package falls back to the normal restriction page. |
 | Daily cumulative mode | Uses the stronger source for each app: Android system usage when available, or Hook-local foreground accounting, then resets at local midnight. |
-| Per-launch mode | Starts a fresh timer when the target app's main process begins a foreground session. |
-| Session planning | Optionally asks for a 5, 10, 15, 30, or custom 1–1440 minute plan when the target process first opens. Quick choices and a direct numeric minute field share one compact page, while the fixed footer keeps exit and skip actions visible. Values beyond the earliest remaining timed quota are rejected. |
+| Per-launch mode | Starts a fresh foreground timer for the target process. If the process survives in the background, staying away for at least the configured cooldown counts as an effective rest and starts a new cycle. |
+| Session planning | Optionally asks for a 5, 10, 15, 30, or custom 1–60 minute plan when the target process first opens. Quick choices and a one-minute-step slider share one compact page, while the fixed footer keeps exit and skip actions visible. Values beyond the earliest remaining timed quota are rejected. |
 | Weekly schedules | Supports allow-only and block-during windows across multiple weekdays, including overnight ranges. Schedule blocks cannot be bypassed with the delay action. |
 | Foreground-only accounting | Counts only the `onResume` to `onPause` phase. Background residency does not burn the quota. |
 | Warning UI | Shows a five-second top banner or opt-in full-screen warning matching the selected global color, with an optional one-shot long vibration, an exit action, and layout handling for portrait, landscape, display cutouts, and immersive apps. |
-| Enforcement mode | Defaults to closing the task and safe third-party target process. The themed standalone break page uses a 30-second, single-use internal token, offers an exit-to-Home action, and attempts to pause common media. Media-object hooks are installed only when a target process starts in break-page mode, so force-stop and reopen managed apps after switching modes. |
+| Enforcement mode | Defaults to closing the task and terminating the current safe third-party Hook process. Separate background processes may survive; package-wide force-stop requires Standard protection + Shizuku. The themed standalone break page uses a 30-second, single-use internal token, offers an exit-to-Home action, and attempts to pause common media. Media-object hooks are installed only when a target process starts in break-page mode, so force-stop and reopen managed apps after switching modes. |
 | Language | Supports system-default, Simplified Chinese, and English UI; Hook warnings use the same preference. |
 | Appearance | Offers health green, calm blue, and focus purple across management and target-side surfaces, each with follow-system, light, and dark modes. |
 | Delay action | Lets the user add 1-60 minutes for normal time limits while keeping schedule blocks strict. |
 | Post-exit cooldown | Blocks reopening for 1-1,440 minutes after a daily or per-launch quota event. A group uses one fixed shared cooldown window for all members; repeated openings never refresh its start or inflate limit-hit counts. Schedule denials do not start cooldown. |
-| Group sync loop | Grouped foreground apps synchronize usage every 15 seconds without keeping the manager app alive. |
+| Group sync loop | Grouped foreground apps synchronize daily and per-launch usage every 15 seconds without keeping the manager app alive. Cross-member handoff uses one persisted session and one incident ID. |
 | Hook and scope status | Reads framework and scope state through the optional libxposed service when supported, can request missing scope with framework confirmation, and keeps the current-version Hook heartbeat as the compatibility fallback. |
 | Diagnostics | Logs Hook setup, rule reads, timer starts, sync events, stats writes, and limit exits so configuration problems are traceable. |
 | System-app guardrails | Third-party apps can have their target process terminated; system apps only have their UI closed. |
@@ -93,6 +94,7 @@ Key source files:
 - `app/src/main/java/com/liuml/apptimelimiter/xposed/AppTimeLimitHook.kt`: lifecycle hooks, timers, group sync, cooldowns, warnings, and exit execution.
 - `app/src/main/java/com/liuml/apptimelimiter/nonroot/`: accessibility coordination, 30-second sessions, plan overlay, restriction fallback, and restricted Shizuku execution.
 - `app/src/main/java/com/liuml/apptimelimiter/core/`: pure policy helpers covered by unit tests.
+- `app/src/main/java/com/liuml/apptimelimiter/security/`: private PIN verification, biometric recovery, one-time challenges, and session-bound parent overrides. PIN material is never mirrored to Hook-readable preferences.
 - `xposed-stubs/`: compile-time Xposed API signatures; they are not packaged into the APK.
 
 ## Build
@@ -162,6 +164,7 @@ Open **Diagnostic Logs** from the home screen and check:
 - `EXTERNAL_BREAK_PAGE_SHOWN/UPDATED/REMOVED/FAILED`: standalone break-page display, rule changes, recovery, and safe-exit fallback.
 - `MEDIA_PAUSE_ATTEMPT/MEDIA_PAUSE_FAILED`: best-effort pause result for common platform, ExoPlayer/Media3, and web media.
 - `REST_CYCLE_RESUMED`: a per-launch break ended and a fresh foreground cycle started.
+- `PER_LAUNCH_REST_RESET`: the target stayed genuinely in the background for the configured cooldown and returned in a fresh per-launch cycle.
 - `GROUP_COOLDOWN_STARTED/REUSED/EXPIRED` and `QUOTA_INCIDENT_DUPLICATE`: shared group cooldown ownership, reuse, expiry, and duplicate suppression.
 - `SESSION_PLAN_WAITING_USAGE`, `SESSION_PLAN_REJECTED_OVER_QUOTA`, and `SESSION_PLAN_UNAVAILABLE`: authoritative usage wait, over-quota rejection, or plan unavailability.
 - `SESSION_PLAN_SUPPRESSED_BLOCKED`: a schedule, cooldown, or exhausted quota correctly prevented the plan dialog.
@@ -197,7 +200,7 @@ The lifecycle Hook remains on the [legacy Xposed Framework API](https://api.xpos
 - A session plan must fit within the earliest remaining app or group timed quota. Longer choices are rejected with the available balance, and exhausted quotas, cooldowns, or blocked schedules can never be bypassed.
 - The standalone break page pauses the target Activity and attempts to pause common MediaPlayer, ExoPlayer/Media3, and web media. Vendor ROMs may ask before opening Time Stop. Custom players, background services, rendering, or game logic may continue; use force-exit mode when execution must stop completely.
 - Rules, statistics, diagnostics, and runtime state are excluded from Android backup and device transfer.
-- Per-launch and group per-launch limits start a fresh cycle after configured cooldown. Daily and group-daily quotas remain hard limits until the daily reset; blocked schedules remain active until the allowed period.
+- Per-launch and group per-launch limits start a fresh cycle after configured cooldown. In LSPosed mode, voluntarily staying in the background for the full configured cooldown also counts as an effective rest even if the target process survives; shorter app switches continue the old cycle. Daily and group-daily quotas remain hard limits until the daily reset, and blocked schedules remain active until the allowed period.
 - While the standalone page is visible, the target Activity is paused, so Hook-local foreground accumulation also pauses. Playback is never force-resumed by the module.
 
 - Lifecycle tracking uses `Instrumentation.callActivityOnResume/Pause` with a deduplicated `Activity.onResume/onPause` fallback across target processes; diagnostics show the process and bitness that host the UI.
@@ -219,11 +222,11 @@ This tool should be used only by the device owner or on explicitly authorized ma
 
 > 把时间留给真正重要的事。
 
-系统自带的屏幕时间管理通常更侧重**查看使用统计、设置每日限额或开启专注模式**。**时停**则专注于更精细、可组合的单应用规则：不仅能限制一天总共使用多久，还能限制每次连续打开多久，还能规定每周哪些时段允许或禁止使用，并支持应用分组共享额度与退出后冷却。用户可全局选择 LSPosed、普通保护或普通保护 + Shizuku，所有管控应用统一使用所选链路。
+系统自带的屏幕时间管理通常更侧重**查看使用统计、设置每日限额或开启专注模式**。**时停**则专注于更精细、可组合的单应用规则：不仅能限制一天总共使用多久，还能限制每次连续打开多久，还能规定每周哪些时段允许或禁止使用，并支持应用分组共享额度、退出后冷却和儿童锁。用户可全局选择 LSPosed、普通保护或普通保护 + Shizuku，所有管控应用统一使用所选链路。
 
 [下载最新版本](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed 模块页面](https://modules.lsposed.org/module/com.liuml.apptimelimiter/)
 
-当前版本：`0.10.15`
+当前版本：`0.11.10`
 
 ## 它和系统屏幕时间有什么不同？
 
@@ -248,30 +251,32 @@ This tool should be used only by the device owner or on explicitly authorized ma
 | 能力 | 说明 |
 | --- | --- |
 | 独立应用规则 | 每个应用分别保存启用状态、时间额度和时段计划，互不影响。 |
-| 应用分组与统一规则 | 可为一组应用统一开启共享每日额度、单次打开、可用时段和退出后冷却。组内成员只执行分组规则；已有个人配置会保留但暂停，移出分组后自动恢复。 |
+| 应用分组与统一规则 | 可为一组应用统一开启共享每日额度、连续单次打开、可用时段和退出后冷却。组内成员切换时共享同一份单次余额；全组真正休息后才开始新轮次。 |
 | 全局保护模式 | 设置中三选一：LSPosed、普通保护、普通保护 + Shizuku。模式切换后目标应用需强停并重开，面板通过模式代次确认 Hook 已加载新配置。 |
 | 非 Root 普通保护 | 通过无障碍服务感知前台包名，通过系统使用情况访问校准每日累计；可选“增强兼容检测”为漏发普通窗口事件的系统增加包名级内容变化事件，但仍不读取页面节点、文字、输入内容或通知，不启动前台常驻服务，也不持续轮询。 |
 | Shizuku 强停模式 | Shizuku 只负责在到限后强停已配置的第三方应用，不参与计时；未安装、未授权、服务未运行、Binder 断开或执行失败时自动回退普通限制页，不切换到 LSPosed。 |
 | 设置内保护状态 | 设置顶部同时展示所选模式、实际执行链路、明确异常和修复入口；LSPosed 未取得权威证据时显示“等待验证”而不是误报未生效，Shizuku 不可用时明确回退普通保护独立限制页。 |
 | 应用列表过滤 | 应用管理默认只显示第三方应用；需要管理系统应用时可手动开启“显示系统应用”。 |
 | 每日累计限制 | 为每个应用设置 1-1440 分钟的每日额度；有“使用情况访问权限”时，以 Android 系统时长和 Hook 本地计时的较大值判定，跨零点自动重置。 |
-| 单次打开限制 | 每次目标应用主进程启动后重新计时，适合控制一次连续使用的时长。 |
-| 本次使用计划 | 可为单个应用开启“打开时制定计划”；同一页面提供 5、10、15、30 分钟快捷选择和 1–1440 分钟数字输入。LSPosed 与非 Root 共用同一界面组件，固定底栏确保退出和跳过按钮始终可见；超过最早剩余额度的选项与输入会被拒绝，最终提交仍再次校验。 |
+| 单次打开限制 | 目标应用进程首次进入前台时开始计时；进程即使仍驻留后台，只要真正离开达到所设冷静时长，也视为完成有效休息并开始新的单次轮次。短暂切换仍延续原轮次。 |
+| 本次使用计划 | 可为单个应用开启“打开时制定计划”；同一页面提供 5、10、15、30 分钟快捷选择和 1–60 分钟拖动条，默认5分钟、每次调整1分钟。LSPosed 与非 Root 共用同一界面组件，固定底栏确保退出和跳过按钮始终可见；选择超过最早剩余额度时会即时提示并禁用提交，最终提交仍再次校验。 |
 | 每周时段规则 | 支持“仅指定时段允许”和“指定时段禁止”，可组合多个星期并覆盖跨午夜时段。 |
 | 精确前台计时 | 仅统计 Activity 处于前台的时间，应用切到后台后暂停计时。 |
 | 到期提醒与延时 | LSPosed Hook 目标到期前 5 秒可显示与全局颜色主题一致的顶部或全屏倒计时、触发一次长震动，并提供退出应用或临时延长 1-60 分钟；纯非 Root 模式不显示这些 Hook 专属设置，本次计划在结束前 5 秒提供退出或重新计划入口。 |
-| 限制执行方式 | 设置页按引擎分别显示有效选项：LSPosed 可选“强制退出”或“独立休息页”；非 Root 普通保护可选“独立限制页”或需要 Shizuku 的“强制退出”。独立页跟随全局颜色和明暗主题并提供退出到桌面的按钮；Shizuku 不可用或执行失败时自动回退限制页。 |
+| 限制执行方式 | 设置页按引擎分别显示有效选项：LSPosed 可选“强制退出”或“独立休息页”；非 Root 普通保护可选“独立限制页”或需要 Shizuku 的“强制退出”。LSPosed 强制退出会关闭任务并结束当前 Hook 进程，但多进程应用的独立后台服务仍可能存活；需要整包强停时使用普通保护 + Shizuku。独立页跟随全局颜色和明暗主题并提供退出到桌面的按钮；Shizuku 不可用或执行失败时自动回退限制页。 |
+| 家长临时放行 | 儿童锁开启后，每次 PIN 验证可选择 1–60 分钟，默认 5 分钟且不记忆上次选择。时间到期、真正离开目标应用、息屏、进程结束或规则/模式变化时立即撤销，任一条件先到即结束。 |
+| 儿童锁与安全验证 | 使用私有 4–8 位 PIN 保护规则、分组和设置修改；PIN 派生不在主线程执行，失败次数递增锁定并显示实时倒计时。可选强生物识别找回，但只能重设 PIN，不能显示旧 PIN。 |
 | 语言 | 支持跟随系统、简体中文和 English，管理界面与目标应用内 Hook 提醒使用同一设置。 |
 | 外观 | 提供健康绿、宁静蓝、专注紫三套全局颜色，并分别支持跟随系统、浅色和深色；计划弹窗、全屏提醒和独立限制页还可随机显示内置或自定义时间短句。 |
 | 退出后冷却 | 每日或单次额度触发限制后，可在 1-1440 分钟内禁止再次打开。分组使用一份固定的共享冷却状态：任一成员触发后，全组看到相同剩余时间；反复打开不会刷新起点或重复统计。禁止时段拒绝不会启动冷却。 |
 | 使用统计 | 首页和统计页按需读取 Android `UsageStatsManager`，根据前台事件计算各应用时长和启动次数；熄屏会清除厂商系统遗漏的旧前台状态，“今日总使用”按所有应用前台区间的并集去重，因此不会因分屏或事件重叠而超过当天已过去的时间。 |
 | Hook 与作用域状态 | 支持的框架可通过 libxposed 服务直接读取作用域并向框架申请补充作用域；旧框架继续使用当前版本 Hook 回传作为兼容验证。 |
-| 多级规则回退 | 优先通过受控 Provider 读取规则，并提供 `XSharedPreferences` 与本地缓存回退，增强不同 ROM 下的可用性。 |
+| 多级规则回退 | 优先通过受控 Provider 读取规则，并提供 `XSharedPreferences` 与本地缓存回退；重启后可通过无命令、无数据的显式访问桥接恢复目标进程的包可见性。 |
 | 诊断日志 | 记录 Hook 安装、规则来源、计时开始与暂停、统计写入和限制触发，方便快速定位配置问题。 |
 | 系统安全保护 | 第三方应用到期后结束自身进程；系统应用只关闭界面，不结束系统进程，并记录开机诊断锚点。 |
 | 个性化设置 | 可选择顶部或全屏退出提醒、长震动，并控制主题、语言、诊断记录和默认延时时长；修改规则后会重置 Hook 本地累计，系统当日时长仍保留。 |
 | 隐藏桌面入口 | 只在可确认 LSPosed 模块设置入口时提供隐藏选项；`MainActivity` 保留标准模块入口并提供 ADB 恢复。纯非 Root 模式不会显示无效的隐藏开关，旧配置已隐藏时只提供恢复入口。 |
-| 功能导览与联系 | 每次打开管理应用时可左右滑动查看主要功能；每个新版本首次运行会依次显示一次内测和自愿捐赠公告。设置与“关于”页支持邮件或 QQ 群 `1009712674` 反馈，并提供加入内测和软件声明入口。 |
+| 功能导览与设置 | 每次打开管理应用时可左右滑动查看主要功能；设置与“关于”页集中提供权限状态、保护模式、诊断和软件声明。 |
 | 更新与反馈 | 默认在打开管理应用时限频检查 GitHub Releases，发现稳定新版后主动提醒；可关闭自动检查，并可调用系统下载管理器更新、通过邮件附带诊断日志反馈问题。 |
 
 Hook 计时仅覆盖 `Activity.onResume` 到 `Activity.onPause` 的前台阶段，切到后台会暂停。修改规则时会重置该应用的 Hook 本地累计；如果已授权系统使用统计，Android 记录的当日时长仍会参与每日限制，不能通过修改规则清零。
@@ -381,6 +386,7 @@ Obtainium 是第三方更新工具，只负责检查 Release 页面并由用户�
 - `EXTERNAL_BREAK_PAGE_SHOWN/UPDATED/REMOVED/FAILED`：独立休息页显示、规则变化、解除或启动失败后回退退出。
 - `MEDIA_PAUSE_ATTEMPT/MEDIA_PAUSE_FAILED`：常见系统播放器、ExoPlayer/Media3 与网页媒体的尽力暂停结果。
 - `REST_CYCLE_RESUMED`：单次额度冷静结束，已开始新的前台使用轮次。
+- `PER_LAUNCH_REST_RESET`：目标应用真正进入后台并停留达到冷静时长，返回时已开始新的单次轮次。
 - `GROUP_COOLDOWN_STARTED/REUSED/EXPIRED` 与 `QUOTA_INCIDENT_DUPLICATE`：分组共享冷却的认领、复用、到期及重复事件去重。
 - `SESSION_PLAN_WAITING_USAGE`、`SESSION_PLAN_REJECTED_OVER_QUOTA` 与 `SESSION_PLAN_UNAVAILABLE`：等待权威用量、超过剩余额度被拒绝，或因规则变化、额度耗尽而不可制定计划的链路。
 - `SESSION_PLAN_SUPPRESSED_BLOCKED`：禁止时段、冷却或额度耗尽正确阻止了计划弹窗。
@@ -422,7 +428,7 @@ Obtainium 是第三方更新工具，只负责检查 Release 页面并由用户�
 - 计划到期不增加限制触发次数，也不启动冷却；系统应用到期时只关闭界面。
 - 本次计划只能在现有自由额度内制定；所选时长超过应用或分组中最早到期的剩余额度时会被拒绝并提示选择更短时长。额度已耗尽、处于冷却或禁止时段时也不能通过计划绕过。
 - 独立休息页会让目标 Activity 进入暂停，并尽力暂停常见 MediaPlayer、ExoPlayer/Media3 与网页媒体。部分系统可能先询问是否允许打开时停；自研播放器、后台服务、渲染或游戏引擎仍可能继续，需要彻底停止运行时请使用“强制退出”。
-- 单次和分组单次额度配合冷却时，冷静结束后会清零当前轮次并继续使用；每日和分组每日额度仍限制到次日重置，禁止时段仍限制到允许时间。
+- 单次和分组单次额度配合冷却时，冷静结束后会清零当前轮次并继续使用；在 LSPosed 模式下，即使进程仍驻留后台，只要用户主动离开达到完整冷静时长，也会在返回时开始新轮次，短暂切换不会重置。每日和分组每日额度仍限制到次日重置，禁止时段仍限制到允许时间。
 - 独立休息页显示时目标 Activity 已暂停，因此 Hook 本地前台累计也暂停；模块不会在休息结束后强制恢复播放。
 - 规则、统计、诊断和运行状态不参与 Android 系统备份或设备迁移。
 

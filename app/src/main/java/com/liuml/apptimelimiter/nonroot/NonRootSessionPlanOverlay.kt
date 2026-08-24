@@ -188,6 +188,73 @@ class NonRootSessionPlanOverlay(
         )
     }
 
+    fun showParentUnlockWarning(
+        packageName: String,
+        english: Boolean,
+        onPinUnlock: () -> Unit,
+        onExit: () -> Unit,
+    ): Boolean {
+        dismiss()
+        val settings = RuleRepository(service).getGlobalSettings()
+        val ui = OverlayUi(
+            service,
+            english,
+            TargetUiPalette.resolve(service, settings.themeMode, settings.themeColor),
+        )
+        val root = LinearLayout(service).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(ui.dp(16), ui.dp(10), ui.dp(10), ui.dp(10))
+            background = ui.rounded(ui.colors.primaryContainer, 18, ui.colors.outline)
+        }
+        root.addView(
+            TextView(service).apply {
+                text = ui.text(
+                    "限制已触发，5 秒后执行 · 家长可输入 PIN 临时放行",
+                    "Limit reached. Enforcing in 5 seconds · parent PIN available",
+                )
+                setTextColor(ui.colors.onPrimaryContainer)
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+            },
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        root.addView(
+            ui.compactAction(ui.text("退出", "Exit"), filled = false) {
+                dismiss()
+                onExit()
+            },
+        )
+        root.addView(
+            ui.compactAction(ui.text("PIN 解锁", "PIN unlock"), filled = true) {
+                dismiss()
+                onPinUnlock()
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                ui.dp(40),
+            ).apply { marginStart = ui.dp(8) },
+        )
+        return attach(
+            packageName = packageName,
+            kind = "PARENT_UNLOCK_WARNING",
+            view = root,
+            params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT,
+            ).apply {
+                gravity = Gravity.TOP
+                x = ui.dp(12)
+                y = ui.dp(12)
+            },
+            onShown = {},
+        )
+    }
+
     fun dismiss(reason: String = "requested") {
         val view = attachedView ?: return
         val packageName = attachedPackageName

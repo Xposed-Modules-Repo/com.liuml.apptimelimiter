@@ -7,6 +7,10 @@ import android.content.SharedPreferences
 import com.liuml.apptimelimiter.core.SharedCooldownClaim
 import com.liuml.apptimelimiter.core.SharedCooldownPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownRecord
+import com.liuml.apptimelimiter.core.SharedGroupSessionAction
+import com.liuml.apptimelimiter.core.SharedGroupSessionPolicy
+import com.liuml.apptimelimiter.core.SharedGroupSessionRecord
+import com.liuml.apptimelimiter.core.SharedGroupSessionUpdate
 import com.liuml.apptimelimiter.core.CooldownPolicy
 import com.liuml.apptimelimiter.core.LimitEnforcementPolicy
 import com.liuml.apptimelimiter.core.MonotonicVersionPolicy
@@ -425,6 +429,9 @@ class RuleRepository(context: Context) {
         if (!effectiveGroupEnabled || !cooldownEnabled) {
             removeGroupCooldownRuntime(editor, prefix)
         }
+        if (!effectiveGroupEnabled || !group.perLaunchEnabled) {
+            removeGroupSessionRuntime(editor, prefix)
+        }
         previousMembers.filterNot { it in members }.forEach { packageName ->
             if (prefs.getString("$KEY_PACKAGE_GROUP_PREFIX$packageName", null) == groupId) {
                 editor.remove("$KEY_PACKAGE_GROUP_PREFIX$packageName")
@@ -522,6 +529,81 @@ class RuleRepository(context: Context) {
         claim
     }
 
+    fun getGroupPerLaunchSession(groupId: String): SharedGroupSessionRecord {
+        if (groupId.isBlank()) return SharedGroupSessionRecord()
+        val prefix = groupPrefix(groupId)
+        return SharedGroupSessionRecord(
+            groupVersion = prefs.getLong("${prefix}runtime_session_group_version", Long.MIN_VALUE),
+            bootCount = prefs.getInt("${prefix}runtime_session_boot_count", Int.MIN_VALUE),
+            sessionId = prefs.getString("${prefix}runtime_session_id", null).orEmpty(),
+            usedMillis = prefs.getLong("${prefix}runtime_session_used_ms", 0L),
+            activeOwnerId = prefs.getString("${prefix}runtime_session_owner", null).orEmpty(),
+            ownerLastSeenElapsedMillis = prefs.getLong(
+                "${prefix}runtime_session_owner_seen_elapsed_ms",
+                0L,
+            ),
+            inactiveSinceElapsedMillis = prefs.getLong(
+                "${prefix}runtime_session_inactive_elapsed_ms",
+                0L,
+            ),
+            handledSegmentIds = prefs.getString(
+                "${prefix}runtime_session_handled_segments",
+                null,
+            ).orEmpty().lineSequence().filter(String::isNotBlank).toList(),
+        )
+    }
+
+    fun updateGroupPerLaunchSession(
+        groupId: String,
+        action: SharedGroupSessionAction,
+        groupVersion: Long,
+        bootCount: Int,
+        ownerId: String,
+        expectedSessionId: String,
+        segmentId: String,
+        segmentMillis: Long,
+        nowElapsedMillis: Long,
+        resetGapMillis: Long,
+    ): SharedGroupSessionUpdate = synchronized(GROUP_SESSION_LOCK) {
+        val prefix = groupPrefix(groupId)
+        val update = SharedGroupSessionPolicy.update(
+            existing = getGroupPerLaunchSession(groupId),
+            action = action,
+            groupVersion = groupVersion,
+            bootCount = bootCount,
+            ownerId = ownerId,
+            expectedSessionId = expectedSessionId,
+            generatedSessionId = UUID.randomUUID().toString(),
+            segmentId = segmentId,
+            segmentMillis = segmentMillis,
+            nowElapsedMillis = nowElapsedMillis,
+            resetGapMillis = resetGapMillis,
+        )
+        val record = update.record
+        check(
+            prefs.edit()
+                .putLong("${prefix}runtime_session_group_version", record.groupVersion)
+                .putInt("${prefix}runtime_session_boot_count", record.bootCount)
+                .putString("${prefix}runtime_session_id", record.sessionId)
+                .putLong("${prefix}runtime_session_used_ms", record.usedMillis)
+                .putString("${prefix}runtime_session_owner", record.activeOwnerId)
+                .putLong(
+                    "${prefix}runtime_session_owner_seen_elapsed_ms",
+                    record.ownerLastSeenElapsedMillis,
+                )
+                .putLong(
+                    "${prefix}runtime_session_inactive_elapsed_ms",
+                    record.inactiveSinceElapsedMillis,
+                )
+                .putString(
+                    "${prefix}runtime_session_handled_segments",
+                    record.handledSegmentIds.joinToString("\n"),
+                )
+                .commit(),
+        ) { "Failed to persist group per-launch session" }
+        update
+    }
+
     fun deleteGroup(groupId: String): Boolean {
         val existing = getGroup(groupId) ?: return true
         val prefix = groupPrefix(groupId)
@@ -550,6 +632,7 @@ class RuleRepository(context: Context) {
     fun getGlobalSettings(): GlobalSettings {
         val protectionMode = readProtectionMode()
         return GlobalSettings(
+        childLockEnabled = prefs.getBoolean(KEY_CHILD_LOCK_ENABLED, false),
         exitWarningEnabled = prefs.getBoolean(KEY_EXIT_WARNING_ENABLED, true),
         fullScreenExitWarningEnabled = prefs.getBoolean(
             KEY_FULL_SCREEN_EXIT_WARNING_ENABLED,
@@ -610,6 +693,7 @@ class RuleRepository(context: Context) {
             wallClockMillis = System.currentTimeMillis(),
         )
         val persisted = prefs.edit()
+            .putBoolean(KEY_CHILD_LOCK_ENABLED, settings.childLockEnabled)
             .putBoolean(KEY_EXIT_WARNING_ENABLED, settings.exitWarningEnabled)
             .putBoolean(
                 KEY_FULL_SCREEN_EXIT_WARNING_ENABLED,
@@ -667,14 +751,33 @@ class RuleRepository(context: Context) {
         legacyShizukuEnabled = prefs.getBoolean(KEY_SHIZUKU_ENHANCEMENT_ENABLED, false),
     )
 
-    fun grantRuleAccess(packageName: String) {
-        runCatching {
+    fun grantRuleAccess(packageName: String): Boolean {
+        if (!PackageNamePolicy.isValid(packageName) || packageName == appContext.packageName) {
+            return false
+        }
+        return runCatching {
             appContext.grantUriPermission(
                 packageName,
                 RuleContract.CONTENT_URI,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
             )
-        }
+            true
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Re-offers provider access after upgrades, data migration, or a reboot that discarded an
+     * older temporary grant. A target process can repeat the visibility bridge handshake after
+     * each reboot; Context.grantUriPermission itself is not persistable.
+     */
+    fun reconcileRuleAccess(): RuleAccessReconciliation {
+        val packages = configuredPackages().sorted()
+        val granted = packages.filter(::grantRuleAccess).toSet()
+        return RuleAccessReconciliation(
+            configuredPackages = packages.toSet(),
+            grantedPackages = granted,
+        )
     }
 
     private fun makePreferencesReadable() {
@@ -753,8 +856,24 @@ class RuleRepository(context: Context) {
             .remove("${prefix}runtime_cooldown_source_package")
     }
 
+    private fun removeGroupSessionRuntime(
+        editor: SharedPreferences.Editor,
+        prefix: String,
+    ) {
+        editor
+            .remove("${prefix}runtime_session_group_version")
+            .remove("${prefix}runtime_session_boot_count")
+            .remove("${prefix}runtime_session_id")
+            .remove("${prefix}runtime_session_used_ms")
+            .remove("${prefix}runtime_session_owner")
+            .remove("${prefix}runtime_session_owner_seen_elapsed_ms")
+            .remove("${prefix}runtime_session_inactive_elapsed_ms")
+            .remove("${prefix}runtime_session_handled_segments")
+    }
+
     companion object {
         private val GROUP_COOLDOWN_LOCK = Any()
+        private val GROUP_SESSION_LOCK = Any()
         private val STORAGE_LIFECYCLE_LOCK = Any()
         private const val STORAGE_LIFECYCLE_PREFS_NAME = "storage_lifecycle"
         private const val KEY_PRIVATE_STORAGE_INITIALIZED = "initialized"
@@ -790,6 +909,7 @@ class RuleRepository(context: Context) {
         const val KEY_AUTOMATIC_UPDATE_CHECK_ENABLED =
             "global.automatic_update_check_enabled"
         const val KEY_PROTECTION_MODE = "global.protection_mode"
+        const val KEY_CHILD_LOCK_ENABLED = "global.child_lock_enabled"
         const val KEY_PROTECTION_MODE_GENERATION = "global.protection_mode_generation"
         const val KEY_NON_ROOT_PROTECTION_ENABLED =
             "global.non_root_protection_enabled"
@@ -815,4 +935,12 @@ class RuleRepository(context: Context) {
         val preferences: SharedPreferences,
         val frameworkBacked: Boolean,
     )
+}
+
+data class RuleAccessReconciliation(
+    val configuredPackages: Set<String>,
+    val grantedPackages: Set<String>,
+) {
+    val failedPackages: Set<String>
+        get() = configuredPackages - grantedPackages
 }

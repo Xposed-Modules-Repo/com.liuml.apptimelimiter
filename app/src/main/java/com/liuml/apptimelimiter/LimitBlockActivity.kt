@@ -13,6 +13,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.view.WindowCompat
 import com.liuml.apptimelimiter.core.BreakSessionPolicy
 import com.liuml.apptimelimiter.core.QuotaKind
@@ -30,6 +31,7 @@ import com.liuml.apptimelimiter.ipc.RuleContract
 import com.liuml.apptimelimiter.nonroot.NonRootProtectionStatusRepository
 import com.liuml.apptimelimiter.nonroot.NonRootRuntimeStore
 import com.liuml.apptimelimiter.nonroot.TimeStopAccessibilityService
+import com.liuml.apptimelimiter.security.ChildLockRepository
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
 import com.liuml.apptimelimiter.ui.TargetUiPalette
 import java.time.LocalDate
@@ -48,6 +50,7 @@ class LimitBlockActivity : Activity() {
     private lateinit var quoteView: TextView
     private lateinit var hintView: TextView
     private lateinit var exitView: TextView
+    private lateinit var parentUnlockView: TextView
     private var targetPackage = ""
     private var launchAttemptId = ""
     private var confirmedAttemptId = ""
@@ -60,9 +63,13 @@ class LimitBlockActivity : Activity() {
     private var english = false
     private var authorized = false
     private var nonRoot = false
+    private var controlSessionId = ""
     private var ruleReadFailures = 0
     private var lastRestrictionState = ""
     private var appliedThemeKey = ""
+    private var parentAuthInFlight = false
+    private var parentAuthToken = ""
+    private var parentAuthPoll: Runnable? = null
     private val deviceUsageStatsRepository by lazy {
         DeviceUsageStatsRepository(applicationContext)
     }
@@ -127,6 +134,7 @@ class LimitBlockActivity : Activity() {
         outState.putString(STATE_DAY_TOKEN, initialDayToken)
         outState.putBoolean(STATE_ENGLISH, english)
         outState.putBoolean(STATE_NON_ROOT, nonRoot)
+        outState.putString(STATE_CONTROL_SESSION_ID, controlSessionId)
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
@@ -183,6 +191,8 @@ class LimitBlockActivity : Activity() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        parentAuthPoll = null
         clearActiveRestrictionTarget()
         if (authorized && nonRoot && isFinishing) {
             TimeStopAccessibilityService.notifyRestrictionPageClosed(targetPackage)
@@ -312,6 +322,19 @@ class LimitBlockActivity : Activity() {
             isFocusable = true
             setOnClickListener { leaveToHome() }
         }
+        parentUnlockView = text(15f, colors.primary, true).apply {
+            gravity = Gravity.CENTER
+            minHeight = dp(50)
+            setPadding(dp(28), dp(10), dp(28), dp(10))
+            background = GradientDrawable().apply {
+                setColor(colors.primaryContainer)
+                cornerRadius = dp(17).toFloat()
+                setStroke(dp(1), colors.outline)
+            }
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { startParentUnlock() }
+        }
         card.addView(titleView)
         card.addView(messageView)
         card.addView(
@@ -323,11 +346,18 @@ class LimitBlockActivity : Activity() {
         )
         card.addView(hintView)
         card.addView(
-            exitView,
+            parentUnlockView,
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(52),
             ).apply { topMargin = dp(24) },
+        )
+        card.addView(
+            exitView,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(52),
+            ).apply { topMargin = dp(12) },
         )
         root.addView(
             card,
@@ -378,6 +408,7 @@ class LimitBlockActivity : Activity() {
         initialDayToken = source.getStringExtra(EXTRA_DAY_TOKEN).orEmpty()
         english = source.getBooleanExtra(EXTRA_ENGLISH, false)
         nonRoot = source.getBooleanExtra(EXTRA_NON_ROOT, false)
+        controlSessionId = source.getStringExtra(EXTRA_CONTROL_SESSION_ID).orEmpty()
         val settings = RuleRepository(this).getGlobalSettings()
         applyPageCopy(settings)
         // The target process can request a token for its own configured package. Never display
@@ -410,6 +441,7 @@ class LimitBlockActivity : Activity() {
         initialDayToken = state.getString(STATE_DAY_TOKEN).orEmpty()
         english = state.getBoolean(STATE_ENGLISH, false)
         nonRoot = state.getBoolean(STATE_NON_ROOT, false)
+        controlSessionId = state.getString(STATE_CONTROL_SESSION_ID).orEmpty()
         lastRestrictionState = ""
         return true
     }
@@ -440,12 +472,31 @@ class LimitBlockActivity : Activity() {
         )
         quoteView.text = quote?.let { "“$it”" }.orEmpty()
         quoteView.visibility = if (quote.isNullOrBlank()) View.GONE else View.VISIBLE
-        hintView.text = if (english) {
+        val baseHint = if (english) {
             "Background media may continue · Home and Recents remain available"
         } else {
             "后台媒体可能继续播放 · 可使用主页或最近任务离开"
         }
+        val privatePinReady = ChildLockRepository(this).isEnabled()
+        val sessionReady = controlSessionId.isNotBlank()
+        hintView.text = when {
+            settings.childLockEnabled && !privatePinReady -> if (english) {
+                "$baseHint\nChild-lock PIN data is unavailable. Open Time Stop and set the PIN again."
+            } else {
+                "$baseHint\n儿童锁 PIN 数据不可用，请打开时停重新设置 PIN"
+            }
+            settings.childLockEnabled && !sessionReady -> if (english) {
+                "$baseHint\nThe target app is still using an older Hook. Force stop and reopen it to use PIN unlock."
+            } else {
+                "$baseHint\n目标应用仍在运行旧版 Hook，强停并重新打开后才能使用 PIN 解锁"
+            }
+            else -> baseHint
+        }
         exitView.text = if (english) "Exit app" else "退出应用"
+        parentUnlockView.text = if (english) "Parent temporary unlock" else "家长临时解锁"
+        parentUnlockView.visibility = if (
+            settings.childLockEnabled && privatePinReady && sessionReady
+        ) View.VISIBLE else View.GONE
     }
 
     private fun refreshRestriction() {
@@ -673,6 +724,249 @@ class LimitBlockActivity : Activity() {
         window.decorView.contentDescription = "$title，$message"
     }
 
+    private fun startParentUnlock() {
+        if (parentAuthInFlight) return
+        diagnostic(
+            "INFO",
+            targetPackage,
+            "PARENT_AUTH_BUTTON_TAPPED",
+            "source=break_page state=${lastRestrictionState.take(80)}",
+        )
+        val settings = RuleRepository(this).getGlobalSettings()
+        val privatePinReady = ChildLockRepository(this).isEnabled()
+        if (!settings.childLockEnabled || !privatePinReady || controlSessionId.isBlank()) {
+            val failure = when {
+                !settings.childLockEnabled -> "child_lock_disabled"
+                !privatePinReady -> "child_lock_pin_missing"
+                else -> "legacy_hook_session_missing"
+            }
+            showParentAuthFeedback(
+                when {
+                    !settings.childLockEnabled && english -> "Child lock is disabled in Time Stop settings"
+                    !settings.childLockEnabled -> "儿童锁尚未开启，请先在时停设置中开启"
+                    !privatePinReady && english -> "Child-lock PIN data is unavailable. Set the PIN again in Time Stop."
+                    !privatePinReady -> "儿童锁 PIN 数据不可用，请打开时停重新设置 PIN"
+                    english -> "The target app is using an older Hook. Force stop and reopen it."
+                    else -> "目标应用仍在运行旧版 Hook，请强停并重新打开后再试"
+                },
+            )
+            diagnostic(
+                "WARN",
+                targetPackage,
+                "PARENT_AUTH_UI_REJECTED",
+                "source=break_page reason=$failure childLock=${settings.childLockEnabled} " +
+                    "privatePinReady=$privatePinReady sessionBlank=${controlSessionId.isBlank()}",
+            )
+            return
+        }
+        setParentAuthBusy(true)
+        val result = runCatching {
+            contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_CREATE_PARENT_AUTH_CHALLENGE,
+                targetPackage,
+                Bundle().apply {
+                    putString(RuleContract.KEY_PROCESS_SESSION_ID, controlSessionId)
+                    putString(
+                        RuleContract.KEY_INCIDENT_ID,
+                        "break-page:$targetPackage:$lastRestrictionState",
+                    )
+                    putString(
+                        RuleContract.KEY_PARENT_AUTH_REASON,
+                        lastRestrictionState.substringBefore(':').ifBlank { "RESTRICTION" },
+                    )
+                },
+            )
+        }.onFailure { error ->
+            diagnostic(
+                "ERROR",
+                targetPackage,
+                "PARENT_AUTH_CHALLENGE_FAILED",
+                "source=break_page exception=${error.javaClass.simpleName}:${error.message}",
+            )
+        }.getOrNull()
+        val token = result?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) }
+            ?.getString(RuleContract.KEY_PARENT_AUTH_TOKEN).orEmpty()
+        if (token.isBlank()) {
+            val failure = result?.getString(RuleContract.KEY_MESSAGE).orEmpty().ifBlank { "unknown" }
+            diagnostic(
+                "ERROR",
+                targetPackage,
+                "PARENT_AUTH_CHALLENGE_FAILED",
+                "source=break_page reason=${failure.take(120)}",
+            )
+            setParentAuthBusy(false)
+            showParentAuthFeedback(parentAuthFailureMessage(failure))
+            return
+        }
+        parentAuthToken = token
+        val intent = Intent(this, ParentUnlockActivity::class.java).apply {
+            putExtra(ParentUnlockActivity.EXTRA_TOKEN, token)
+            addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+        }
+        runCatching {
+            @Suppress("DEPRECATION")
+            startActivityForResult(intent, REQUEST_PARENT_UNLOCK)
+        }.onSuccess {
+            diagnostic(
+                "INFO",
+                targetPackage,
+                "PARENT_AUTH_ACTIVITY_LAUNCH_REQUESTED",
+                "source=break_page",
+            )
+            scheduleParentAuthPoll(token)
+        }.onFailure { error ->
+            diagnostic(
+                "ERROR",
+                targetPackage,
+                "PARENT_AUTH_ACTIVITY_FAILED",
+                "source=break_page exception=${error.javaClass.simpleName}:${error.message}",
+            )
+            setParentAuthBusy(false)
+            showParentAuthFeedback(
+                if (english) "Unable to open PIN verification" else "无法打开 PIN 验证页面",
+            )
+        }
+    }
+
+    @Deprecated("Legacy result callback is sufficient for this private activity flow.")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_PARENT_UNLOCK) return
+        if (resultCode == RESULT_OK) {
+            completeParentOverride()
+        } else {
+            pollParentAuthStatus(parentAuthToken, allowRetry = true)
+        }
+    }
+
+    private fun scheduleParentAuthPoll(token: String) {
+        parentAuthPoll?.let(handler::removeCallbacks)
+        val startedAt = android.os.SystemClock.elapsedRealtime()
+        val poll = object : Runnable {
+            override fun run() {
+                if (!parentAuthInFlight || token != parentAuthToken) return
+                val elapsed = android.os.SystemClock.elapsedRealtime() - startedAt
+                val retry = elapsed < ParentUnlockActivity.MAX_WAIT_MILLIS + 1_000L
+                if (!pollParentAuthStatus(token, retry) && retry) {
+                    handler.postDelayed(this, PARENT_AUTH_POLL_MILLIS)
+                }
+            }
+        }
+        parentAuthPoll = poll
+        handler.post(poll)
+    }
+
+    /** Returns true when the attempt reached a terminal state. */
+    private fun pollParentAuthStatus(token: String, allowRetry: Boolean): Boolean {
+        if (token.isBlank()) {
+            if (!allowRetry) setParentAuthBusy(false)
+            return !allowRetry
+        }
+        val status = runCatching {
+            contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_GET_PARENT_AUTH_STATUS,
+                targetPackage,
+                Bundle().apply {
+                    putString(RuleContract.KEY_PARENT_AUTH_TOKEN, token)
+                    putString(RuleContract.KEY_PROCESS_SESSION_ID, controlSessionId)
+                },
+            )
+        }.getOrNull()?.getString(RuleContract.KEY_PARENT_AUTH_STATUS).orEmpty()
+        return when (status) {
+            "GRANTED" -> {
+                completeParentOverride()
+                true
+            }
+            "DENIED", "TIMED_OUT", "INVALID" -> {
+                diagnostic(
+                    "WARN",
+                    targetPackage,
+                    if (status == "TIMED_OUT") "PARENT_AUTH_TIMEOUT" else "PARENT_AUTH_FAILED",
+                    "source=break_page status=$status",
+                )
+                setParentAuthBusy(false)
+                true
+            }
+            else -> {
+                if (!allowRetry) {
+                    diagnostic(
+                        "WARN",
+                        targetPackage,
+                        "PARENT_AUTH_TIMEOUT",
+                        "source=break_page status_poll_timeout",
+                    )
+                    setParentAuthBusy(false)
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    private fun completeParentOverride() {
+        if (!parentAuthInFlight) return
+        diagnostic(
+            "INFO",
+            targetPackage,
+            "TEMPORARY_OVERRIDE_ACTIVATED",
+            "source=break_page session=${controlSessionId.take(40)}",
+        )
+        setParentAuthBusy(false)
+        finishWithoutAnimation("parent_override_granted")
+    }
+
+    private fun setParentAuthBusy(busy: Boolean) {
+        parentAuthInFlight = busy
+        if (!busy) {
+            parentAuthToken = ""
+            parentAuthPoll?.let(handler::removeCallbacks)
+            parentAuthPoll = null
+        }
+        parentUnlockView.isEnabled = !busy
+        parentUnlockView.alpha = if (busy) 0.6f else 1f
+        parentUnlockView.text = when {
+            busy && english -> "Opening verification…"
+            busy -> "正在打开验证…"
+            english -> "Parent temporary unlock"
+            else -> "家长临时解锁"
+        }
+    }
+
+    private fun showParentAuthFeedback(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    }
+
+    private fun parentAuthFailureMessage(reason: String): String = when (reason) {
+        "child_lock_disabled" -> if (english) {
+            "Child lock is disabled in Time Stop settings"
+        } else {
+            "儿童锁尚未开启，请先在时停设置中开启"
+        }
+        "child_lock_pin_missing" -> if (english) {
+            "Child-lock PIN data is unavailable. Set the PIN again in Time Stop."
+        } else {
+            "儿童锁 PIN 数据不可用，请打开时停重新设置 PIN"
+        }
+        "invalid_challenge_fields" -> if (english) {
+            "The control session is outdated. Force stop and reopen the target app."
+        } else {
+            "当前管控会话已过期，请强停并重新打开目标应用"
+        }
+        "hook_not_controller" -> if (english) {
+            "The protection mode changed. Force stop and reopen the target app."
+        } else {
+            "保护模式已经切换，请强停并重新打开目标应用"
+        }
+        else -> if (english) {
+            "Could not open parent verification. Check child-lock settings."
+        } else {
+            "无法打开家长验证，请检查儿童锁设置"
+        }
+    }
+
     private fun updateRestrictionState(
         state: String,
         title: String,
@@ -781,6 +1075,7 @@ class LimitBlockActivity : Activity() {
         const val EXTRA_DAY_TOKEN = "day_token"
         const val EXTRA_ENGLISH = "english"
         const val EXTRA_NON_ROOT = "non_root"
+        const val EXTRA_CONTROL_SESSION_ID = "control_session_id"
         private const val STATE_AUTHORIZED = "state_authorized"
         private const val STATE_TARGET_PACKAGE = "state_target_package"
         private const val STATE_LAUNCH_ATTEMPT_ID = "state_launch_attempt_id"
@@ -793,6 +1088,9 @@ class LimitBlockActivity : Activity() {
         private const val STATE_DAY_TOKEN = "state_day_token"
         private const val STATE_ENGLISH = "state_english"
         private const val STATE_NON_ROOT = "state_non_root"
+        private const val STATE_CONTROL_SESSION_ID = "state_control_session_id"
+        private const val REQUEST_PARENT_UNLOCK = 901
+        private const val PARENT_AUTH_POLL_MILLIS = 250L
         private const val REFRESH_INTERVAL_MS = 1_000L
     }
 

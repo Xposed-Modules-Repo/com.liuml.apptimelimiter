@@ -2,52 +2,49 @@ package com.liuml.apptimelimiter.core
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SessionPlanDurationPolicyTest {
     @Test
-    fun `empty and non numeric values are rejected`() {
-        assertEquals(
-            SessionPlanDurationStatus.EMPTY,
-            SessionPlanDurationPolicy.evaluate("  ", null).status,
-        )
-        assertEquals(
-            SessionPlanDurationStatus.NON_NUMERIC,
-            SessionPlanDurationPolicy.evaluate("12.5", null).status,
-        )
+    fun `unlimited allowance uses five minute default and sixty minute maximum`() {
+        assertEquals(5, SessionPlanDurationPolicy.defaultSelectableMinutes(null))
+        assertEquals(60, SessionPlanDurationPolicy.maxSelectableMinutes(null))
     }
 
     @Test
-    fun `zero and values above one day are rejected`() {
-        assertEquals(
-            SessionPlanDurationStatus.ZERO,
-            SessionPlanDurationPolicy.evaluate("0000", null).status,
-        )
-        assertEquals(
-            SessionPlanDurationStatus.OUT_OF_RANGE,
-            SessionPlanDurationPolicy.evaluate("1441", null).status,
-        )
+    fun `allowance below default clamps initial value`() {
+        val maxAllowed = 3 * 60_000L + 59_000L
+        assertEquals(3, SessionPlanDurationPolicy.maxSelectableMinutes(maxAllowed))
+        assertEquals(3, SessionPlanDurationPolicy.defaultSelectableMinutes(maxAllowed))
     }
 
     @Test
-    fun `one minute and one day are valid`() {
-        assertEquals(1, SessionPlanDurationPolicy.evaluate("0001", null).totalMinutes)
-        assertEquals(1440, SessionPlanDurationPolicy.evaluate("1440", null).totalMinutes)
+    fun `allowance above one hour is capped at sixty minutes`() {
+        val maxAllowed = 24 * 60 * 60_000L
+        assertEquals(60, SessionPlanDurationPolicy.maxSelectableMinutes(maxAllowed))
+        assertEquals(5, SessionPlanDurationPolicy.defaultSelectableMinutes(maxAllowed))
     }
 
     @Test
-    fun `permanent allowance is enforced in whole minutes`() {
-        val maxAllowed = 9 * 60_000L + 59_000L
-        assertEquals(
-            SessionPlanDurationStatus.VALID,
-            SessionPlanDurationPolicy.evaluate("9", maxAllowed).status,
-        )
-        assertEquals(
-            SessionPlanDurationStatus.EXCEEDS_MAX,
-            SessionPlanDurationPolicy.evaluate("10", maxAllowed).status,
-        )
-        assertEquals(9L, SessionPlanDurationPolicy.maxSelectableMinutes(maxAllowed))
+    fun `allowance below one whole minute disables custom plan`() {
+        val maxAllowed = 59_999L
+        assertEquals(0, SessionPlanDurationPolicy.maxSelectableMinutes(maxAllowed))
+        assertNull(SessionPlanDurationPolicy.defaultSelectableMinutes(maxAllowed))
+        assertNull(SessionPlanDurationPolicy.normalizeSelectableMinutes(5, maxAllowed))
+        assertEquals(1, SessionPlanDurationPolicy.defaultSliderMinutes(maxAllowed))
+        assertFalse(SessionPlanDurationPolicy.minutesAllowed(1, maxAllowed))
+    }
+
+    @Test
+    fun `slider normalization clamps to current selectable range`() {
+        val maxAllowed = 12 * 60_000L
+        assertEquals(1, SessionPlanDurationPolicy.normalizeSliderMinutes(0))
+        assertEquals(60, SessionPlanDurationPolicy.normalizeSliderMinutes(61))
+        assertEquals(7, SessionPlanDurationPolicy.normalizeSliderMinutes(7))
+        assertTrue(SessionPlanDurationPolicy.minutesAllowed(7, maxAllowed))
+        assertFalse(SessionPlanDurationPolicy.minutesAllowed(13, maxAllowed))
     }
 
     @Test
@@ -57,5 +54,6 @@ class SessionPlanDurationPolicyTest {
         assertFalse(SessionPlanDurationPolicy.durationAllowed(15 * 60_000L, maxAllowed))
         assertTrue(SessionPlanDurationPolicy.durationAllowed(10_000L, maxAllowed))
         assertFalse(SessionPlanDurationPolicy.durationAllowed(0L, maxAllowed))
+        assertFalse(SessionPlanDurationPolicy.durationAllowed(61 * 60_000L, null))
     }
 }

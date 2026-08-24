@@ -1,13 +1,17 @@
 package com.liuml.apptimelimiter.xposed
 
 import android.app.Activity
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.IBinder
+import android.os.Parcel
 import android.os.Process
 import android.os.SystemClock
 import android.os.VibrationEffect
@@ -16,21 +20,28 @@ import android.os.VibratorManager
 import android.widget.Toast
 import com.liuml.apptimelimiter.BuildConfig
 import com.liuml.apptimelimiter.LimitBlockActivity
+import com.liuml.apptimelimiter.ParentAuthBootstrapActivity
+import com.liuml.apptimelimiter.ParentUnlockActivity
 import com.liuml.apptimelimiter.core.ActivityCallbackPolicy
 import com.liuml.apptimelimiter.core.ExitActivityResumeAction
 import com.liuml.apptimelimiter.core.ExitRecoveryAction
 import com.liuml.apptimelimiter.core.ExitReentryPolicy
 import com.liuml.apptimelimiter.core.GroupRulePolicy
+import com.liuml.apptimelimiter.core.HookProcessOwnershipPolicy
 import com.liuml.apptimelimiter.core.LimitBlockReason
 import com.liuml.apptimelimiter.core.LimitEnforcementPolicy
 import com.liuml.apptimelimiter.core.LimitGateSnapshot
+import com.liuml.apptimelimiter.core.PerLaunchRestPolicy
+import com.liuml.apptimelimiter.core.ParentControlSessionPolicy
 import com.liuml.apptimelimiter.core.QuotaIncidentPolicy
+import com.liuml.apptimelimiter.core.QuotaBoundaryPolicy
 import com.liuml.apptimelimiter.core.QuotaKind
 import com.liuml.apptimelimiter.core.RestPagePolicy
 import com.liuml.apptimelimiter.core.ResumedActivityRegistry
 import com.liuml.apptimelimiter.core.RuleSnapshotSelectionPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownRecord
+import com.liuml.apptimelimiter.core.SharedGroupSessionAction
 import com.liuml.apptimelimiter.core.UsageMath
 import com.liuml.apptimelimiter.core.UsageReportingPolicy
 import com.liuml.apptimelimiter.core.DailyUsageStatePolicy
@@ -55,6 +66,7 @@ import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.data.ScheduleMode
 import com.liuml.apptimelimiter.data.ScheduleWindow
 import com.liuml.apptimelimiter.ipc.RuleContract
+import com.liuml.apptimelimiter.ipc.RuleAccessBridgeService
 import com.liuml.apptimelimiter.localization.AppLocaleController
 import com.liuml.apptimelimiter.localization.SupportedLanguage
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -74,6 +86,20 @@ import java.util.Locale
 class AppTimeLimitHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName == MODULE_PACKAGE) return
+        if (!HookProcessOwnershipPolicy.ownsProcess(lpparam.packageName, lpparam.processName)) {
+            XposedBridge.log(
+                "AppTimeLimiter: HOOK_FOREIGN_PACKAGE_SKIPPED package=${lpparam.packageName} " +
+                    "process=${lpparam.processName}",
+            )
+            return
+        }
+        if (!claimProcessHookInstallation()) {
+            XposedBridge.log(
+                "AppTimeLimiter: HOOK_DUPLICATE_INSTALL_SKIPPED package=${lpparam.packageName} " +
+                    "process=${lpparam.processName}",
+            )
+            return
+        }
 
         // Install lifecycle hooks for every package in the LSPosed scope. Rules are read when
         // an Activity resumes, so enabling a rule no longer depends on cross-process prefs at load time.
@@ -198,6 +224,14 @@ class AppTimeLimitHook : IXposedHookLoadPackage {
 
     private companion object {
         const val MODULE_PACKAGE = "com.liuml.apptimelimiter"
+        private var processHookInstallationClaimed = false
+
+        @Synchronized
+        fun claimProcessHookInstallation(): Boolean {
+            if (processHookInstallationClaimed) return false
+            processHookInstallationClaimed = true
+            return true
+        }
     }
 }
 
@@ -216,7 +250,13 @@ private class RuntimeLimiter(
     private var activityHandoffPending = false
     private var foregroundStartedAt = NOT_RUNNING
     private var foregroundDayToken = -1
+    private var processBackgroundedAtElapsedMillis = NOT_RUNNING
     private var perLaunchCommittedMs = 0L
+    private var sharedGroupSessionId = ""
+    private var sharedGroupSessionUsedMs = 0L
+    private var sharedGroupSessionSequence = 0L
+    private var sharedGroupSessionFailureLogged = false
+    private var sharedGroupSessionHandoffRefreshPending = false
     private var loadedRuleVersion = Long.MIN_VALUE
     private var loadedGroupVersion = Long.MIN_VALUE
     private var exitScheduled = false
@@ -264,6 +304,25 @@ private class RuntimeLimiter(
     private var blockingOverlayFallback = false
     private val incidentOccurredAtMillis = mutableMapOf<String, Long>()
     private var perLaunchCycleGeneration = 0L
+    private var temporaryParentOverrideActive = false
+    private var temporaryParentOverrideExpiresAtElapsedMillis = 0L
+    private var parentAuthPending = false
+    private var parentOverrideAwaitingTargetResume = false
+    private var parentAuthToken = ""
+    private var parentAuthReason = ""
+    private var parentUnlockOffered = false
+    private var parentAuthGeneration = 0L
+    private var parentUnlockCountdownGeneration = 0L
+    private var parentAuthPoll: Runnable? = null
+    private var parentAuthBootstrapPoll: Runnable? = null
+    private var parentOverrideExpiry: Runnable? = null
+    private var parentOverrideReturnTimeout: Runnable? = null
+    private var parentAuthFailureAction: (() -> Unit)? = null
+    private var providerBootstrapInFlight = false
+    private var providerBootstrapLastAttemptElapsed = Long.MIN_VALUE
+    private var providerBridgeConnection: ServiceConnection? = null
+    private var providerBootstrapTimeout: Runnable? = null
+    private val providerBootstrapCallbacks = mutableListOf<(Boolean, String) -> Unit>()
 
     private val deadline = Runnable { checkDeadline() }
     private val warningDeadline = Runnable { showExitWarning() }
@@ -316,6 +375,9 @@ private class RuntimeLimiter(
             recoverDetachedSessionPlanDialog(activity)
         }
         activeActivity = WeakReference(activity)
+        if (parentOverrideAwaitingTargetResume) {
+            activateParentOverrideAfterTargetResume(activity)
+        }
         processResumedActivity(
             activity = activity,
             processWasForeground = processWasForeground,
@@ -331,6 +393,7 @@ private class RuntimeLimiter(
         resumedDuringHandoff: Boolean,
     ) {
         val rule = readRule(activity, reloadFallback = true)
+        refreshTemporaryParentOverride(activity, rule)
         if ((processWasForeground || resumedDuringHandoff) && previousActivity !== activity) {
             diagnostic(
                 activity,
@@ -350,6 +413,7 @@ private class RuntimeLimiter(
         }
 
         if (rule.protectionMode != ProtectionMode.XPOSED) {
+            processBackgroundedAtElapsedMillis = NOT_RUNNING
             if (lastYieldedModeGeneration != rule.protectionModeGeneration) {
                 lastYieldedModeGeneration = rule.protectionModeGeneration
                 diagnostic(
@@ -375,6 +439,7 @@ private class RuntimeLimiter(
         }
 
         if (!rule.enabled && !rule.sessionPlanningEnabled) {
+            processBackgroundedAtElapsedMillis = NOT_RUNNING
             cancelSessionPlan(dismissDialog = true, resetPrompt = true)
             if (blockingState != null) {
                 removeBlockingOverlay(activity, "规则已关闭")
@@ -384,6 +449,10 @@ private class RuntimeLimiter(
         }
 
         applyRuleVersionChange(rule)
+        startNewPerLaunchCycleAfterRestIfNeeded(activity, rule)
+        if (rule.groupPerLaunchEnabled && (!processWasForeground || sharedGroupSessionId.isBlank())) {
+            syncGroupPerLaunchSession(activity, rule, SharedGroupSessionAction.ENTER)
+        }
 
         var launchStatsPersisted = true
         if (!sessionLaunchReported) {
@@ -412,14 +481,21 @@ private class RuntimeLimiter(
             }
         }
 
-        if (
-            enforceBlockingConditions(
-                activity = activity,
-                rule = rule,
-                openedDuringBlockedTime = true,
-                launchStatsPersisted = launchStatsPersisted,
-            )
-        ) return
+        val parentControlActive = ParentControlSessionPolicy.ownsSessionUi(
+            authenticationPending = parentAuthPending,
+            overrideAwaitingResume = parentOverrideAwaitingTargetResume,
+            overrideActive = temporaryParentOverrideActive,
+        )
+        if (!parentControlActive) {
+            if (
+                enforceBlockingConditions(
+                    activity = activity,
+                    rule = rule,
+                    openedDuringBlockedTime = true,
+                    launchStatsPersisted = launchStatsPersisted,
+                )
+            ) return
+        }
 
         if (!rule.enabled) {
             stopTimingCallbacks()
@@ -440,7 +516,11 @@ private class RuntimeLimiter(
                 updateGroupSegmentBaseline(rule)
             }
             if (rule.hasTimedQuota()) {
-                scheduleDeadline(activity, rule)
+                if (parentControlActive) {
+                    thresholdStatus(activity, rule).remainingMillis
+                } else {
+                    scheduleDeadline(activity, rule)
+                }
             } else {
                 null
             }
@@ -450,7 +530,9 @@ private class RuntimeLimiter(
             null
         }
         if (exitScheduled || blockingState != null) return
-        val scheduleRemainingMs = if (rule.enabled && !exitScheduled) {
+        val scheduleRemainingMs = if (
+            rule.enabled && !exitScheduled && !parentControlActive
+        ) {
             scheduleScheduleBoundary(activity, rule)
         } else {
             null
@@ -467,6 +549,10 @@ private class RuntimeLimiter(
                     scheduleRemainingMs?.let { append("，时段边界剩余=${it / 1000.0}s") }
                 },
             )
+        }
+        if (parentControlActive) {
+            suspendSessionPlanForParentOverride(activity, "parent_control_active_on_resume")
+            return
         }
         if (!exitScheduled) resumeSessionPlan(activity, rule)
     }
@@ -514,11 +600,26 @@ private class RuntimeLimiter(
 
     private fun finalizeProcessBackground(activity: Activity) {
         if (!resumedActivities.isEmpty) return
+        if (parentAuthPending || parentOverrideAwaitingTargetResume) {
+            diagnostic(
+                activity,
+                event = "PARENT_AUTH_BACKGROUND_DEFERRED",
+                message = "家长验证或返回目标应用正在进行，保留目标会话",
+            )
+            return
+        }
+        revokeTemporaryParentOverride(activity, "process_background")
+        parentUnlockOffered = false
         pauseSessionPlan(activity)
         detachBlockingOverlay()
         val rule = readRule(activity, reloadFallback = true)
         val segmentMs = if (foregroundStartedAt == NOT_RUNNING) 0L else activeSegmentMillis()
-        if (foregroundStartedAt != NOT_RUNNING) commitActiveSegment(activity, rule)
+        if (foregroundStartedAt != NOT_RUNNING) {
+            commitActiveSegment(activity, rule, leaveGroupSession = true)
+        } else if (rule.groupPerLaunchEnabled && sharedGroupSessionId.isNotBlank()) {
+            syncGroupPerLaunchSession(activity, rule, SharedGroupSessionAction.LEAVE)
+        }
+        processBackgroundedAtElapsedMillis = SystemClock.elapsedRealtime()
         activeActivity.clear()
         lastPausedActivity.clear()
         mainHandler.removeCallbacks(deadline)
@@ -549,6 +650,15 @@ private class RuntimeLimiter(
     }
 
     private fun resumeSessionPlan(activity: Activity, rule: HookRule) {
+        if (ParentControlSessionPolicy.ownsSessionUi(
+                authenticationPending = parentAuthPending,
+                overrideAwaitingResume = parentOverrideAwaitingTargetResume,
+                overrideActive = temporaryParentOverrideActive,
+            )
+        ) {
+            suspendSessionPlanForParentOverride(activity, "override_controls_session")
+            return
+        }
         if (blockingState != null) {
             suppressSessionPlanForBlock(activity, blockingState?.reason)
             return
@@ -598,6 +708,41 @@ private class RuntimeLimiter(
         sessionPlanWaitingForUsage = false
         if (!sessionPlanPromptHandled) {
             scheduleInitialSessionPlanPrompt(activity)
+        }
+    }
+
+    /**
+     * Parent verification and a temporary override own the current session UI. Preserve a running
+     * plan's remaining duration so it can resume only if the permanent restriction later clears,
+     * but never let a prompt, warning, or stale plan deadline compete with the PIN flow.
+     */
+    private fun suspendSessionPlanForParentOverride(activity: Activity, phase: String) {
+        val hadPendingPrompt = sessionPlanPromptRunnable != null
+        val hadDialog = sessionPlanDialog?.isShowing == true || activeSessionPlanDialogMode != null
+        val hadWarning = isBannerShowing(WarningBannerKind.SESSION_PLAN)
+        val hadRunningPlan = sessionPlanRemainingMs != NOT_RUNNING
+        cancelPendingSessionPlanPrompt()
+        sessionPlanDialog?.dismiss()
+        sessionPlanDialog = null
+        activeSessionPlanDialogMode = null
+        activeSessionPlanPromptId = null
+        restoreReplanWarningOnResume = false
+        mainHandler.removeCallbacks(sessionPlanDeadline)
+        mainHandler.removeCallbacks(sessionPlanWarningDeadline)
+        if (hadRunningPlan && sessionPlanForegroundStartedAt != NOT_RUNNING) {
+            sessionPlanRemainingMs = sessionPlanRemainingMillis()
+            sessionPlanForegroundStartedAt = NOT_RUNNING
+        }
+        dismissSessionPlanWarning()
+        val promptWasUnhandled = !sessionPlanPromptHandled
+        sessionPlanPromptHandled = true
+        sessionPlanWaitingForUsage = false
+        if (hadPendingPrompt || hadDialog || hadWarning || hadRunningPlan || promptWasUnhandled) {
+            diagnostic(
+                activity,
+                event = "SESSION_PLAN_SUPPRESSED_PARENT_OVERRIDE",
+                message = "PIN 验证或临时放行期间本次计划让位；phase=$phase, running=$hadRunningPlan",
+            )
         }
     }
 
@@ -1093,6 +1238,18 @@ private class RuntimeLimiter(
     }
 
     private fun expireSessionPlan(activity: Activity, rule: HookRule) {
+        if (temporaryParentOverrideActive) refreshTemporaryParentOverride(activity, rule)
+        if (temporaryParentOverrideActive || parentAuthPending || parentOverrideAwaitingTargetResume) return
+        if (rule.childLockEnabled && !parentUnlockOffered) {
+            showParentUnlockCountdown(
+                activity,
+                rule,
+                WarningBannerKind.SESSION_PLAN,
+                "SESSION_PLAN",
+                "session-plan:$processSessionId",
+            ) { expireSessionPlan(activity, readRule(activity, true)) }
+            return
+        }
         if (exitScheduled) return
         exitScheduled = true
         if (foregroundStartedAt != NOT_RUNNING) commitActiveSegment(activity, rule)
@@ -1154,6 +1311,7 @@ private class RuntimeLimiter(
         if (sessionPlanWarningShown || isBannerShowing(WarningBannerKind.SESSION_PLAN)) return
         dismissWarning(resetForCurrentLimit = false)
         sessionPlanWarningShown = true
+        if (rule.childLockEnabled) parentUnlockOffered = true
         runCatching {
             warningBanner = TopWarningBanner.attach(
                 activity = activity,
@@ -1171,13 +1329,31 @@ private class RuntimeLimiter(
                 themeMode = rule.themeMode,
                 themeColor = rule.themeColor,
                 quote = timeQuote(activity, rule, "session-plan-warning:$processSessionId"),
-                actionLabel = hookText(activity, rule, "重新计划", "Replan"),
+                actionLabel = hookText(activity, rule, "重计划", "Replan"),
+                actionContentDescription = hookText(activity, rule, "重新制定本次使用计划", "Replan this session"),
                 onAction = {
                     if (!activity.isFinishing && !activity.isDestroyed && !exitScheduled) {
                         beginSessionReplan(activity, rule)
                     }
                 },
-                exitLabel = hookText(activity, rule, "退出应用", "Exit app"),
+                secondaryActionLabel = if (rule.childLockEnabled) {
+                    hookText(activity, rule, "PIN", "PIN")
+                } else null,
+                secondaryActionContentDescription = if (rule.childLockEnabled) {
+                    hookText(activity, rule, "使用家长 PIN 临时放行", "Temporarily allow with parent PIN")
+                } else null,
+                onSecondaryAction = if (rule.childLockEnabled) {
+                    {
+                        beginParentAuthentication(
+                            activity,
+                            readRule(activity, true),
+                            "SESSION_PLAN",
+                            "session-plan:$processSessionId",
+                        )
+                    }
+                } else null,
+                exitLabel = hookText(activity, rule, "退出", "Exit"),
+                exitContentDescription = hookText(activity, rule, "立即退出应用", "Exit app now"),
                 onExit = { leaveTargetByUser(activity, "session_plan_warning") },
             )
             if (!sessionPlanWarningVibrated) {
@@ -1386,8 +1562,18 @@ private class RuntimeLimiter(
 
     private fun scheduleGroupUsageSync(rule: HookRule) {
         mainHandler.removeCallbacks(groupUsageSync)
-        if (!exitScheduled && rule.groupDailyEnabled && foregroundStartedAt != NOT_RUNNING) {
-            mainHandler.postDelayed(groupUsageSync, GROUP_USAGE_SYNC_INTERVAL_MS)
+        if (
+            !exitScheduled &&
+            (rule.groupDailyEnabled || rule.groupPerLaunchEnabled) &&
+            foregroundStartedAt != NOT_RUNNING
+        ) {
+            val delay = if (sharedGroupSessionHandoffRefreshPending) {
+                sharedGroupSessionHandoffRefreshPending = false
+                GROUP_SESSION_HANDOFF_REFRESH_MS
+            } else {
+                GROUP_USAGE_SYNC_INTERVAL_MS
+            }
+            mainHandler.postDelayed(groupUsageSync, delay)
         }
     }
 
@@ -1396,7 +1582,10 @@ private class RuntimeLimiter(
         if (foregroundStartedAt == NOT_RUNNING) return
         val currentRule = readRule(activity, reloadFallback = true)
         if (!guardXposedUiMode(activity, currentRule, "group_usage_sync")) return
-        if (!currentRule.enabled || !currentRule.groupDailyEnabled) return
+        if (
+            !currentRule.enabled ||
+            (!currentRule.groupDailyEnabled && !currentRule.groupPerLaunchEnabled)
+        ) return
         commitActiveSegment(activity, currentRule)
         foregroundStartedAt = SystemClock.elapsedRealtime()
         foregroundDayToken = dayToken()
@@ -1405,7 +1594,7 @@ private class RuntimeLimiter(
             stopTiming()
             return
         }
-        if (!refreshedRule.groupDailyEnabled) {
+        if (!refreshedRule.groupDailyEnabled && !refreshedRule.groupPerLaunchEnabled) {
             if (refreshedRule.hasTimedQuota()) {
                 scheduleDeadline(activity, refreshedRule)
             }
@@ -1459,6 +1648,542 @@ private class RuntimeLimiter(
         }
     }
 
+    private fun showParentUnlockCountdown(
+        activity: Activity,
+        rule: HookRule,
+        kind: WarningBannerKind,
+        reason: String,
+        incidentId: String,
+        onExpired: () -> Unit,
+    ) {
+        val countdownGeneration = ++parentUnlockCountdownGeneration
+        parentUnlockOffered = true
+        dismissWarning(resetForCurrentLimit = false)
+        dismissScheduleWarning()
+        val startedAt = SystemClock.elapsedRealtime()
+        runCatching {
+            warningBanner = TopWarningBanner.attach(
+                activity = activity,
+                kind = kind,
+                title = hookText(activity, rule, "限制已触发", "Limit reached"),
+                message = hookText(
+                    activity,
+                    rule,
+                    "5 秒后退出 · 家长可输入 PIN 临时放行",
+                    "Exit in 5 seconds · a parent may enter the PIN",
+                ),
+                remainingMillis = WARNING_LEAD_MS,
+                maxProgressMillis = WARNING_LEAD_MS,
+                fullScreen = rule.fullScreenExitWarningEnabled,
+                themeMode = rule.themeMode,
+                themeColor = rule.themeColor,
+                quote = timeQuote(activity, rule, "parent-unlock:$incidentId"),
+                actionLabel = hookText(activity, rule, "PIN", "PIN"),
+                actionContentDescription = hookText(
+                    activity,
+                    rule,
+                    "使用家长 PIN 临时放行",
+                    "Temporarily allow with parent PIN",
+                ),
+                onAction = {
+                    beginParentAuthentication(
+                        activity,
+                        readRule(activity, true),
+                        reason,
+                        incidentId,
+                        onDenied = onExpired,
+                    )
+                },
+                exitLabel = hookText(activity, rule, "退出", "Exit"),
+                exitContentDescription = hookText(activity, rule, "立即退出应用", "Exit app now"),
+                onExit = onExpired,
+            )
+            val countdown = object : Runnable {
+                override fun run() {
+                    if (countdownGeneration != parentUnlockCountdownGeneration) return
+                    if (
+                        parentAuthPending || parentOverrideAwaitingTargetResume ||
+                        temporaryParentOverrideActive
+                    ) return
+                    val elapsed = SystemClock.elapsedRealtime() - startedAt
+                    val remaining = (WARNING_LEAD_MS - elapsed).coerceAtLeast(0L)
+                    if (remaining <= 0L) {
+                        dismissBanner(kind)
+                        if (countdownGeneration == parentUnlockCountdownGeneration) onExpired()
+                        return
+                    }
+                    warningBanner?.takeIf { it.kind == kind }?.update(
+                        hookText(activity, rule, "限制已触发", "Limit reached"),
+                        hookText(
+                            activity,
+                            rule,
+                            "${(remaining + 999L) / 1_000L} 秒后退出 · 家长可输入 PIN 临时放行",
+                            "Exit in ${(remaining + 999L) / 1_000L} seconds · parent PIN available",
+                        ),
+                        remaining,
+                    )
+                    mainHandler.postDelayed(this, COUNTDOWN_REFRESH_MS)
+                }
+            }
+            warningCountdown?.let(mainHandler::removeCallbacks)
+            warningCountdown = countdown
+            mainHandler.post(countdown)
+        }.onFailure {
+            diagnostic(
+                activity,
+                level = "ERROR",
+                event = "PARENT_AUTH_WARNING_FAILED",
+                message = it.toString(),
+            )
+            onExpired()
+        }
+    }
+
+    private fun beginParentAuthentication(
+        activity: Activity,
+        rule: HookRule,
+        reason: String,
+        incidentId: String,
+        onDenied: (() -> Unit)? = null,
+        allowProviderRecovery: Boolean = true,
+    ) {
+        if (
+            !rule.childLockEnabled || parentAuthPending ||
+            parentOverrideAwaitingTargetResume || temporaryParentOverrideActive
+        ) return
+        val authGeneration = ++parentAuthGeneration
+        parentUnlockCountdownGeneration++
+        parentAuthFailureAction = null
+        suspendSessionPlanForParentOverride(activity, "auth_started")
+        diagnostic(
+            activity,
+            event = "PARENT_AUTH_BUTTON_TAPPED",
+            message = "source=hook reason=$reason",
+        )
+        val providerAttempt = runCatching {
+            activity.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_CREATE_PARENT_AUTH_CHALLENGE,
+                packageName,
+                Bundle().apply {
+                    putString(RuleContract.KEY_PROCESS_SESSION_ID, processSessionId)
+                    putString(RuleContract.KEY_INCIDENT_ID, incidentId.take(300))
+                    putString(RuleContract.KEY_PARENT_AUTH_REASON, reason.take(80))
+                },
+            )
+        }
+        val result = providerAttempt.getOrNull()
+        val token = result?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) }
+            ?.getString(RuleContract.KEY_PARENT_AUTH_TOKEN).orEmpty()
+        if (token.isBlank()) {
+            val providerError = providerAttempt.exceptionOrNull()
+            if (allowProviderRecovery && providerError != null) {
+                parentAuthPending = true
+                parentAuthReason = reason
+                parentAuthFailureAction = onDenied
+                warningCountdown?.let(mainHandler::removeCallbacks)
+                warningCountdown = null
+                diagnostic(
+                    activity,
+                    level = "WARN",
+                    event = "RULE_PROVIDER_FOREGROUND_BOOTSTRAP_REQUESTED",
+                    message = "reason=$reason, error=${providerError.javaClass.simpleName}:${providerError.message.orEmpty().take(100)}",
+                )
+                requestForegroundProviderAccessRecovery(activity, authGeneration) { recovered, detail ->
+                    parentAuthPending = false
+                    if (authGeneration != parentAuthGeneration) return@requestForegroundProviderAccessRecovery
+                    parentAuthReason = ""
+                    parentAuthFailureAction = null
+                    if (
+                        recovered && !activity.isFinishing && !activity.isDestroyed &&
+                        resumedActivities.contains(activity)
+                    ) {
+                        beginParentAuthentication(
+                            activity = activity,
+                            rule = readRule(activity, true),
+                            reason = reason,
+                            incidentId = incidentId,
+                            onDenied = onDenied,
+                            allowProviderRecovery = false,
+                        )
+                    } else {
+                        diagnostic(
+                            activity,
+                            level = "ERROR",
+                            event = "RULE_PROVIDER_FOREGROUND_BOOTSTRAP_FAILED",
+                            message = "reason=$reason, detail=${detail.take(120)}",
+                        )
+                        Toast.makeText(
+                            activity,
+                            hookText(
+                                activity,
+                                rule,
+                                "无法启动家长验证，请稍后重试",
+                                "Could not start parent verification. Try again shortly.",
+                            ),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        onDenied?.invoke()
+                    }
+                }
+                return
+            }
+            val failure = result?.getString(RuleContract.KEY_MESSAGE).orEmpty().ifBlank {
+                providerError?.let { "${it.javaClass.simpleName}:${it.message.orEmpty()}" }
+                    ?: "empty_response"
+            }
+            diagnostic(
+                activity,
+                level = "ERROR",
+                event = "PARENT_AUTH_CHALLENGE_FAILED",
+                message = "Provider 未签发挑战；reason=$reason, failure=${failure.take(120)}",
+            )
+            Toast.makeText(
+                activity,
+                hookText(
+                    activity,
+                    rule,
+                    when (failure) {
+                        "child_lock_disabled" -> "儿童锁尚未开启，请先在时停设置中开启"
+                        "child_lock_pin_missing" -> "儿童锁 PIN 数据不可用，请打开时停重新设置 PIN"
+                        "hook_not_controller" -> "保护模式已经切换，请强停并重新打开目标应用"
+                        "invalid_challenge_fields" -> "当前管控会话已过期，请强停并重新打开目标应用"
+                        "rule_not_configured" -> "该应用的规则存储尚未同步，请打开时停重新保存规则"
+                        else -> "无法打开家长验证，请检查儿童锁设置"
+                    },
+                    when (failure) {
+                        "child_lock_disabled" -> "Child lock is disabled in Time Stop settings."
+                        "child_lock_pin_missing" -> "Child-lock PIN data is unavailable. Set the PIN again in Time Stop."
+                        "hook_not_controller" -> "The protection mode changed. Force stop and reopen the target app."
+                        "invalid_challenge_fields" -> "The control session is outdated. Force stop and reopen the target app."
+                        "rule_not_configured" -> "The saved rule has not synchronized. Open Time Stop and save this app's rule again."
+                        else -> "Could not open parent verification. Check child-lock settings."
+                    },
+                ),
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        parentAuthPending = true
+        parentAuthToken = token
+        parentAuthReason = reason
+        parentAuthFailureAction = onDenied
+        warningCountdown?.let(mainHandler::removeCallbacks)
+        warningCountdown = null
+        diagnostic(
+            activity,
+            event = "PARENT_AUTH_CHALLENGE_STARTED",
+            message = "reason=$reason, incident=${incidentId.take(80)}",
+        )
+        val intent = Intent().apply {
+            setClassName(BuildConfig.APPLICATION_ID, ParentUnlockActivity::class.java.name)
+            // Prefer the current target task. The target Activity pause is explicitly treated as
+            // an authentication handoff, so it must not revoke the pending override session.
+            addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            putExtra(ParentUnlockActivity.EXTRA_TOKEN, token)
+        }
+        var usedSeparateTaskFallback = false
+        runCatching { activity.startActivity(intent) }
+            .recoverCatching {
+                usedSeparateTaskFallback = true
+                activity.startActivity(
+                    Intent(intent).addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS,
+                    ),
+                )
+            }
+            .onSuccess {
+                diagnostic(
+                    activity,
+                    event = "PARENT_AUTH_ACTIVITY_LAUNCH_REQUESTED",
+                    message = "source=hook reason=$reason task=${if (usedSeparateTaskFallback) "separate_task_fallback" else "target_task"}",
+                )
+                scheduleParentAuthStatusPoll(activity, rule, authGeneration)
+            }
+            .onFailure { error ->
+                parentAuthPending = false
+                parentAuthToken = ""
+                parentAuthReason = ""
+                val failureAction = parentAuthFailureAction
+                parentAuthFailureAction = null
+                diagnostic(
+                    activity,
+                    level = "ERROR",
+                    event = "PARENT_AUTH_ACTIVITY_FAILED",
+                    message = error.toString(),
+                )
+                Toast.makeText(
+                    activity,
+                    hookText(
+                        activity,
+                        rule,
+                        "无法打开 PIN 验证页面",
+                        "Unable to open PIN verification",
+                    ),
+                    Toast.LENGTH_LONG,
+                ).show()
+                failureAction?.invoke()
+            }
+    }
+
+    private fun scheduleParentAuthStatusPoll(
+        activity: Activity,
+        rule: HookRule,
+        authGeneration: Long,
+    ) {
+        parentAuthPoll?.let(mainHandler::removeCallbacks)
+        val startedAt = SystemClock.elapsedRealtime()
+        val poll = object : Runnable {
+            override fun run() {
+                if (authGeneration != parentAuthGeneration) return
+                val token = parentAuthToken
+                if (!parentAuthPending || token.isBlank()) return
+                val status = runCatching {
+                    activity.contentResolver.call(
+                        RuleContract.CONTENT_URI,
+                        RuleContract.METHOD_GET_PARENT_AUTH_STATUS,
+                        packageName,
+                        Bundle().apply {
+                            putString(RuleContract.KEY_PARENT_AUTH_TOKEN, token)
+                            putString(RuleContract.KEY_PROCESS_SESSION_ID, processSessionId)
+                        },
+                    )
+                }.getOrNull()?.getString(RuleContract.KEY_PARENT_AUTH_STATUS).orEmpty()
+                when (status) {
+                    "GRANTED" -> {
+                        parentAuthPending = false
+                        parentAuthToken = ""
+                        parentOverrideAwaitingTargetResume = true
+                        parentUnlockCountdownGeneration++
+                        dismissWarning(resetForCurrentLimit = false)
+                        dismissScheduleWarning()
+                        exitScheduled = false
+                        parentAuthFailureAction = null
+                        scheduleParentOverrideReturnTimeout(activity, authGeneration)
+                        diagnostic(
+                            activity,
+                            event = "TEMPORARY_OVERRIDE_WAITING_FOR_RESUME",
+                            message = "session=$processSessionId, reason=$parentAuthReason",
+                        )
+                    }
+                    "DENIED", "TIMED_OUT", "INVALID" -> {
+                        parentAuthPending = false
+                        parentAuthToken = ""
+                        parentAuthReason = ""
+                        val failureAction = parentAuthFailureAction
+                        parentAuthFailureAction = null
+                        diagnostic(
+                            activity,
+                            level = "WARN",
+                            event = if (status == "TIMED_OUT") {
+                                "PARENT_AUTH_TIMEOUT"
+                            } else {
+                                "PARENT_AUTH_FAILED"
+                            },
+                            message = "status=$status",
+                        )
+                        failureAction?.invoke()
+                        finalizeBackgroundAfterParentAuth(activity)
+                    }
+                    else -> {
+                        if (
+                            SystemClock.elapsedRealtime() - startedAt <
+                            ParentUnlockActivity.MAX_WAIT_MILLIS + 1_000L
+                        ) {
+                            mainHandler.postDelayed(this, PARENT_AUTH_POLL_MILLIS)
+                        } else {
+                            parentAuthPending = false
+                            parentAuthToken = ""
+                            parentAuthReason = ""
+                            val failureAction = parentAuthFailureAction
+                            parentAuthFailureAction = null
+                            diagnostic(
+                                activity,
+                                level = "WARN",
+                                event = "PARENT_AUTH_TIMEOUT",
+                                message = "status_poll_timeout",
+                            )
+                            failureAction?.invoke()
+                            finalizeBackgroundAfterParentAuth(activity)
+                        }
+                    }
+                }
+            }
+        }
+        parentAuthPoll = poll
+        mainHandler.post(poll)
+    }
+
+    private fun finalizeBackgroundAfterParentAuth(activity: Activity) {
+        mainHandler.postDelayed(
+            {
+                if (
+                    !parentAuthPending && !parentOverrideAwaitingTargetResume &&
+                    resumedActivities.isEmpty
+                ) {
+                    finalizeProcessBackground(activity)
+                }
+            },
+            PARENT_AUTH_RETURN_GRACE_MS,
+        )
+    }
+
+    private fun scheduleParentOverrideReturnTimeout(activity: Activity, authGeneration: Long) {
+        parentOverrideReturnTimeout?.let(mainHandler::removeCallbacks)
+        val timeout = Runnable {
+            if (
+                authGeneration != parentAuthGeneration ||
+                !parentOverrideAwaitingTargetResume ||
+                !resumedActivities.isEmpty
+            ) return@Runnable
+            diagnostic(
+                activity,
+                level = "WARN",
+                event = "TEMPORARY_OVERRIDE_RESUME_TIMEOUT",
+                message = "目标应用未在验证后恢复，撤销尚未激活的临时授权",
+            )
+            revokeTemporaryParentOverride(activity, "target_resume_timeout")
+            parentAuthReason = ""
+            finalizeProcessBackground(activity)
+        }
+        parentOverrideReturnTimeout = timeout
+        mainHandler.postDelayed(timeout, PARENT_OVERRIDE_RESUME_TIMEOUT_MS)
+    }
+
+    private fun activateParentOverrideAfterTargetResume(activity: Activity) {
+        parentOverrideReturnTimeout?.let(mainHandler::removeCallbacks)
+        parentOverrideReturnTimeout = null
+        parentOverrideAwaitingTargetResume = false
+        val reason = parentAuthReason
+        parentAuthReason = ""
+        val rule = readRule(activity, reloadFallback = true)
+        refreshTemporaryParentOverride(activity, rule)
+        if (!temporaryParentOverrideActive) {
+            diagnostic(
+                activity,
+                level = "WARN",
+                event = "TEMPORARY_OVERRIDE_ACTIVATION_FAILED",
+                message = "目标应用已恢复，但临时授权不存在或已失效",
+            )
+            parentUnlockOffered = false
+            return
+        }
+        if (reason == "SESSION_PLAN") cancelSessionPlan(dismissDialog = true)
+        parentUnlockCountdownGeneration++
+        warningCountdown?.let(mainHandler::removeCallbacks)
+        warningCountdown = null
+        suspendSessionPlanForParentOverride(activity, "override_activated")
+        dismissWarning(resetForCurrentLimit = false)
+        dismissScheduleWarning()
+        exitScheduled = false
+        diagnostic(
+            activity,
+            event = "TEMPORARY_OVERRIDE_ACTIVATED",
+            message = "session=$processSessionId, expiresAtElapsed=$temporaryParentOverrideExpiresAtElapsedMillis",
+        )
+    }
+
+    private fun scheduleParentOverrideExpiry(activity: Activity) {
+        cancelParentOverrideExpiry()
+        val delay = (
+            temporaryParentOverrideExpiresAtElapsedMillis - SystemClock.elapsedRealtime()
+            ).coerceAtLeast(0L)
+        if (delay <= 0L) return
+        val expectedExpiry = temporaryParentOverrideExpiresAtElapsedMillis
+        val callback = Runnable {
+            if (
+                !temporaryParentOverrideActive ||
+                temporaryParentOverrideExpiresAtElapsedMillis != expectedExpiry
+            ) return@Runnable
+            val resumed = currentResumedActivity() ?: return@Runnable
+            val latestRule = readRule(resumed, reloadFallback = true)
+            refreshTemporaryParentOverride(resumed, latestRule)
+            if (temporaryParentOverrideActive) return@Runnable
+            parentUnlockOffered = false
+            diagnostic(
+                resumed,
+                event = "TEMPORARY_OVERRIDE_EXPIRED",
+                message = "固定放行时间已到，重新执行当前限制；expiresAtElapsed=$expectedExpiry",
+            )
+            processResumedActivity(
+                activity = resumed,
+                processWasForeground = true,
+                previousActivity = resumed,
+                resumedDuringHandoff = false,
+            )
+        }
+        parentOverrideExpiry = callback
+        mainHandler.postDelayed(callback, delay)
+    }
+
+    private fun cancelParentOverrideExpiry() {
+        parentOverrideExpiry?.let(mainHandler::removeCallbacks)
+        parentOverrideExpiry = null
+    }
+
+    private fun refreshTemporaryParentOverride(activity: Activity, rule: HookRule) {
+        if (!rule.childLockEnabled) {
+            temporaryParentOverrideActive = false
+            temporaryParentOverrideExpiresAtElapsedMillis = 0L
+            cancelParentOverrideExpiry()
+            return
+        }
+        val response = runCatching {
+            activity.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_HAS_PARENT_OVERRIDE,
+                packageName,
+                Bundle().apply {
+                    putString(RuleContract.KEY_PROCESS_SESSION_ID, processSessionId)
+                },
+            )
+        }.getOrNull()
+        temporaryParentOverrideActive = response?.let {
+            it.getBoolean(RuleContract.KEY_OK, false) &&
+                it.getBoolean(RuleContract.KEY_PARENT_AUTH_GRANTED, false)
+        } == true
+        temporaryParentOverrideExpiresAtElapsedMillis = if (temporaryParentOverrideActive) {
+            response?.getLong(
+                RuleContract.KEY_PARENT_OVERRIDE_EXPIRES_AT_ELAPSED_MS,
+                0L,
+            ) ?: 0L
+        } else {
+            0L
+        }
+        if (temporaryParentOverrideActive) {
+            scheduleParentOverrideExpiry(activity)
+        } else {
+            cancelParentOverrideExpiry()
+        }
+    }
+
+    private fun revokeTemporaryParentOverride(activity: Activity, reason: String) {
+        if (!temporaryParentOverrideActive && !parentOverrideAwaitingTargetResume) return
+        runCatching {
+            activity.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_REVOKE_PARENT_OVERRIDE,
+                packageName,
+                Bundle().apply {
+                    putString(RuleContract.KEY_PROCESS_SESSION_ID, processSessionId)
+                },
+            )
+        }
+        temporaryParentOverrideActive = false
+        temporaryParentOverrideExpiresAtElapsedMillis = 0L
+        parentOverrideAwaitingTargetResume = false
+        cancelParentOverrideExpiry()
+        parentOverrideReturnTimeout?.let(mainHandler::removeCallbacks)
+        parentOverrideReturnTimeout = null
+        parentUnlockOffered = false
+        diagnostic(
+            activity,
+            event = "TEMPORARY_OVERRIDE_REVOKED",
+            message = "reason=$reason",
+        )
+    }
+
     private fun forceScheduleExit(
         activity: Activity,
         rule: HookRule,
@@ -1466,6 +2191,26 @@ private class RuntimeLimiter(
         openedDuringBlockedTime: Boolean,
     ) {
         if (!guardXposedUiMode(activity, rule, "schedule_exit")) return
+        if (temporaryParentOverrideActive) refreshTemporaryParentOverride(activity, rule)
+        if (temporaryParentOverrideActive || parentAuthPending || parentOverrideAwaitingTargetResume) return
+        if (rule.childLockEnabled && !parentUnlockOffered) {
+            val incident = "schedule:${rule.version}:${rule.groupVersion}:${decision.nextTransition}"
+            showParentUnlockCountdown(
+                activity,
+                rule,
+                WarningBannerKind.SCHEDULE,
+                "SCHEDULE",
+                incident,
+            ) {
+                forceScheduleExit(
+                    activity,
+                    readRule(activity, true),
+                    decision,
+                    openedDuringBlockedTime,
+                )
+            }
+            return
+        }
         if (exitScheduled) return
         if (
             rule.limitEnforcementMode.usesBreakPage() &&
@@ -1509,6 +2254,19 @@ private class RuntimeLimiter(
 
     private fun forceExit(activity: Activity, rule: HookRule, status: ThresholdStatus) {
         if (!guardXposedUiMode(activity, rule, "quota_exit")) return
+        if (temporaryParentOverrideActive) refreshTemporaryParentOverride(activity, rule)
+        if (temporaryParentOverrideActive || parentAuthPending || parentOverrideAwaitingTargetResume) return
+        if (rule.childLockEnabled && !parentUnlockOffered) {
+            val incident = "quota:${rule.version}:${rule.groupVersion}:${status.reachedKinds.sortedBy { it.name }}"
+            showParentUnlockCountdown(
+                activity,
+                rule,
+                WarningBannerKind.TIME_LIMIT,
+                "QUOTA",
+                incident,
+            ) { forceExit(activity, readRule(activity, true), thresholdStatus(activity, readRule(activity, true))) }
+            return
+        }
         if (exitScheduled) return
         val incidentClaim = claimQuotaIncident(activity, rule, status)
         if (
@@ -1531,6 +2289,7 @@ private class RuntimeLimiter(
             } else {
                 0
             },
+            incidentId = incidentClaim.incidentId,
         )
         if (rule.dailyEnabled) {
             val finalDailyUsed = authoritativeDailyTotalMillis(
@@ -1543,6 +2302,14 @@ private class RuntimeLimiter(
         }
         if (rule.perLaunchEnabled || rule.groupPerLaunchEnabled) {
             perLaunchCommittedMs = safeAdd(perLaunchCommittedMs, segmentMs)
+        }
+        if (rule.groupPerLaunchEnabled) {
+            syncGroupPerLaunchSession(
+                activity,
+                rule,
+                SharedGroupSessionAction.LEAVE,
+                segmentMs,
+            )
         }
         foregroundStartedAt = NOT_RUNNING
         foregroundDayToken = -1
@@ -1579,6 +2346,20 @@ private class RuntimeLimiter(
         statsPersisted: Boolean,
     ) {
         if (!guardXposedUiMode(activity, rule, "cooldown_exit")) return
+        if (temporaryParentOverrideActive) refreshTemporaryParentOverride(activity, rule)
+        if (temporaryParentOverrideActive || parentAuthPending || parentOverrideAwaitingTargetResume) return
+        if (rule.childLockEnabled && !parentUnlockOffered) {
+            showParentUnlockCountdown(
+                activity,
+                rule,
+                WarningBannerKind.TIME_LIMIT,
+                "COOLDOWN",
+                "cooldown:${rule.groupCooldownEndsAtMillis}:$remainingMillis",
+            ) {
+                forceCooldownExit(activity, readRule(activity, true), remainingMillis, statsPersisted)
+            }
+            return
+        }
         if (exitScheduled) return
         if (
             rule.limitEnforcementMode.usesBreakPage() &&
@@ -1830,6 +2611,7 @@ private class RuntimeLimiter(
                 )
                 putExtra(LimitBlockActivity.EXTRA_DAY_TOKEN, LocalDate.now().toString())
                 putExtra(LimitBlockActivity.EXTRA_ENGLISH, isEnglish(activity, rule))
+                putExtra(LimitBlockActivity.EXTRA_CONTROL_SESSION_ID, processSessionId)
                 addFlags(
                     Intent.FLAG_ACTIVITY_NEW_TASK or
                         Intent.FLAG_ACTIVITY_SINGLE_TOP or
@@ -1966,6 +2748,7 @@ private class RuntimeLimiter(
             )
         ) return false
         perLaunchCommittedMs = 0L
+        clearSharedGroupSessionState()
         perLaunchCycleGeneration++
         grantedExtensionMs = 0L
         warningShownForExtensionMs = Long.MIN_VALUE
@@ -1988,16 +2771,59 @@ private class RuntimeLimiter(
         return true
     }
 
+    private fun startNewPerLaunchCycleAfterRestIfNeeded(
+        activity: Activity,
+        rule: HookRule,
+    ) {
+        val backgroundedAt = processBackgroundedAtElapsedMillis
+        processBackgroundedAtElapsedMillis = NOT_RUNNING
+        val decision = PerLaunchRestPolicy.evaluate(
+            hasPerLaunchQuota = rule.perLaunchEnabled || rule.groupPerLaunchEnabled,
+            configuredCooldownMillis = rule.configuredCooldownMillis(),
+            backgroundedAtElapsedMillis = backgroundedAt,
+            nowElapsedMillis = SystemClock.elapsedRealtime(),
+            blockingStateActive = blockingState != null,
+            activeCooldownRemainingMillis = cooldownRemainingMillis(activity, rule),
+        )
+        if (!decision.shouldStartNewCycle) return
+
+        perLaunchCommittedMs = 0L
+        clearSharedGroupSessionState()
+        perLaunchCycleGeneration++
+        grantedExtensionMs = 0L
+        warningShownForExtensionMs = Long.MIN_VALUE
+        warningVibratedForExtensionMs = Long.MIN_VALUE
+        incidentOccurredAtMillis.keys.removeAll { incidentId ->
+            incidentId.startsWith("app-launch|") ||
+                incidentId.startsWith("group-launch|")
+        }
+        cancelSessionPlan(dismissDialog = true, resetPrompt = true)
+        diagnostic(
+            activity,
+            event = "PER_LAUNCH_REST_RESET",
+            message = "离开应用达到冷静时长，开始新的单次轮次；gap=${decision.backgroundGapMillis / 1000.0}s, required=${rule.configuredCooldownMillis() / 1000.0}s, cycle=$perLaunchCycleGeneration, group=${rule.groupEnabled}",
+        )
+    }
+
     private fun applyRuleVersionChange(rule: HookRule) {
         if (loadedRuleVersion == rule.version && loadedGroupVersion == rule.groupVersion) return
         loadedRuleVersion = rule.version
         loadedGroupVersion = rule.groupVersion
         perLaunchCommittedMs = 0L
+        clearSharedGroupSessionState()
         grantedExtensionMs = 0L
         warningShownForExtensionMs = Long.MIN_VALUE
         warningVibratedForExtensionMs = Long.MIN_VALUE
         foregroundStartedAt = NOT_RUNNING
         foregroundDayToken = -1
+    }
+
+    private fun clearSharedGroupSessionState() {
+        sharedGroupSessionId = ""
+        sharedGroupSessionUsedMs = 0L
+        sharedGroupSessionSequence = 0L
+        sharedGroupSessionFailureLogged = false
+        sharedGroupSessionHandoffRefreshPending = false
     }
 
     private fun finishTarget(activity: Activity, message: String, statsPersisted: Boolean) {
@@ -2027,6 +2853,12 @@ private class RuntimeLimiter(
         }
         mainHandler.postDelayed(
             {
+                diagnostic(
+                    activity,
+                    level = "WARN",
+                    event = "PROCESS_TERMINATION_REQUESTED",
+                    message = "请求结束当前 Hook 进程；pid=${Process.myPid()}, process=$processName, scope=current_process_only",
+                )
                 runCatching { Process.killProcess(Process.myPid()) }
                     .onFailure {
                         diagnostic(
@@ -2174,7 +3006,13 @@ private class RuntimeLimiter(
             groupId = rule.groupId,
             groupVersion = rule.groupVersion,
             dayToken = LocalDate.now().toString(),
-            processSessionId = "$processSessionId:$perLaunchCycleGeneration",
+            processSessionId = if (QuotaKind.GROUP_PER_LAUNCH in status.reachedKinds) {
+                sharedGroupSessionId.ifBlank {
+                    "$packageName:$processSessionId:$perLaunchCycleGeneration"
+                }
+            } else {
+                "$processSessionId:$perLaunchCycleGeneration"
+            },
             reachedKinds = status.reachedKinds,
         ) ?: return QuotaIncidentClaim(
             incidentId = "",
@@ -2384,8 +3222,15 @@ private class RuntimeLimiter(
         return when (parts.firstOrNull()) {
             "group-daily" -> QuotaKind.GROUP_DAILY
             "group-launch" -> if (
-                parts.getOrNull(3) == packageName &&
-                isCurrentPerLaunchSession(parts.getOrNull(4))
+                (
+                    parts.size == 4 &&
+                        parts.getOrNull(1) == lastLoadedRule?.groupId &&
+                        parts.getOrNull(2) == lastLoadedRule?.groupVersion?.toString()
+                    ) || (
+                    parts.size >= 5 &&
+                        parts.getOrNull(3) == packageName &&
+                        isCurrentPerLaunchSession(parts.getOrNull(4))
+                    )
             ) {
                 QuotaKind.GROUP_PER_LAUNCH
             } else {
@@ -2444,9 +3289,16 @@ private class RuntimeLimiter(
         mainHandler.removeCallbacks(groupUsageSync)
     }
 
-    private fun commitActiveSegment(activity: Activity, rule: HookRule) {
+    private fun commitActiveSegment(
+        activity: Activity,
+        rule: HookRule,
+        leaveGroupSession: Boolean = false,
+    ) {
         val segmentMs = activeSegmentMillis()
         if (segmentMs <= 0L) {
+            if (leaveGroupSession && rule.groupPerLaunchEnabled) {
+                syncGroupPerLaunchSession(activity, rule, SharedGroupSessionAction.LEAVE)
+            }
             foregroundStartedAt = NOT_RUNNING
             foregroundDayToken = -1
             return
@@ -2461,6 +3313,18 @@ private class RuntimeLimiter(
         if (rule.perLaunchEnabled || rule.groupPerLaunchEnabled) {
             perLaunchCommittedMs = safeAdd(perLaunchCommittedMs, segmentMs)
         }
+        if (rule.groupPerLaunchEnabled) {
+            syncGroupPerLaunchSession(
+                context = activity,
+                rule = rule,
+                action = if (leaveGroupSession) {
+                    SharedGroupSessionAction.LEAVE
+                } else {
+                    SharedGroupSessionAction.COMMIT
+                },
+                segmentMillis = segmentMs,
+            )
+        }
         if (shouldReportUsageDuration(rule)) {
             recordUsageEvent(
                 activity = activity,
@@ -2473,18 +3337,97 @@ private class RuntimeLimiter(
         foregroundDayToken = -1
     }
 
+    private fun syncGroupPerLaunchSession(
+        context: Context,
+        rule: HookRule,
+        action: SharedGroupSessionAction,
+        segmentMillis: Long = 0L,
+    ): Boolean {
+        if (!rule.groupPerLaunchEnabled || rule.groupId.isBlank()) return false
+        val segmentId = if (action == SharedGroupSessionAction.ENTER) {
+            ""
+        } else {
+            sharedGroupSessionSequence++
+            "$processSessionId:$perLaunchCycleGeneration:$sharedGroupSessionSequence"
+        }
+        val extras = Bundle().apply {
+            putString(RuleContract.KEY_GROUP_ID, rule.groupId)
+            putString(RuleContract.KEY_GROUP_SESSION_ACTION, action.name)
+            putString(
+                RuleContract.KEY_GROUP_SESSION_OWNER_ID,
+                "$packageName|$processSessionId:$perLaunchCycleGeneration",
+            )
+            putString(RuleContract.KEY_GROUP_SESSION_ID, sharedGroupSessionId)
+            putString(RuleContract.KEY_GROUP_SESSION_SEGMENT_ID, segmentId)
+            putLong(RuleContract.KEY_DURATION_MS, segmentMillis.coerceAtLeast(0L))
+        }
+        val result = runCatching {
+            context.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_SYNC_GROUP_PER_LAUNCH_SESSION,
+                packageName,
+                extras,
+            )
+        }.getOrNull()?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) }
+        if (result == null) {
+            if (!sharedGroupSessionFailureLogged) {
+                sharedGroupSessionFailureLogged = true
+                diagnostic(
+                    context,
+                    level = "WARN",
+                    event = "GROUP_SESSION_SYNC_FAILED",
+                    message = "分组单次会话同步失败，当前进程暂用本地计时；action=$action group=${rule.groupId}",
+                )
+            }
+            return false
+        }
+        sharedGroupSessionFailureLogged = false
+        val previousSessionId = sharedGroupSessionId
+        sharedGroupSessionId = result.getString(RuleContract.KEY_GROUP_SESSION_ID).orEmpty()
+        sharedGroupSessionUsedMs = result.getLong(
+            RuleContract.KEY_GROUP_SESSION_USED_MS,
+            sharedGroupSessionUsedMs,
+        ).coerceAtLeast(0L)
+        val restarted = result.getBoolean(RuleContract.KEY_GROUP_SESSION_RESTARTED, false)
+        val transferred = result.getBoolean(
+            RuleContract.KEY_GROUP_SESSION_OWNER_TRANSFERRED,
+            false,
+        )
+        val stale = result.getBoolean(RuleContract.KEY_GROUP_SESSION_STALE_REQUEST, false)
+        if (action == SharedGroupSessionAction.ENTER && transferred) {
+            sharedGroupSessionHandoffRefreshPending = true
+        }
+        if (restarted || transferred || stale || previousSessionId != sharedGroupSessionId) {
+            diagnostic(
+                context,
+                level = if (stale) "WARN" else "INFO",
+                event = result.getString(RuleContract.KEY_EVENT).orEmpty()
+                    .ifBlank { "GROUP_SESSION_SYNCED" },
+                message = "group=${rule.groupId} session=${sharedGroupSessionId.take(48)} " +
+                    "used=${sharedGroupSessionUsedMs / 1000.0}s action=$action " +
+                    "restarted=$restarted transferred=$transferred stale=$stale",
+            )
+        }
+        return !stale
+    }
+
     private fun shouldReportUsageDuration(rule: HookRule): Boolean =
         UsageReportingPolicy.shouldReportDuration(
             usageStatsEnabled = rule.usageStatsEnabled,
             groupDailyEnabled = rule.groupDailyEnabled,
         )
 
-    private fun reportLimitHit(activity: Activity, rule: HookRule): Boolean =
+    private fun reportLimitHit(
+        activity: Activity,
+        rule: HookRule,
+        incidentId: String,
+    ): Boolean =
         recordUsageEvent(
             activity = activity,
             durationMillis = 0L,
             launchIncrement = 0,
             limitHitIncrement = if (rule.usageStatsEnabled) 1 else 0,
+            incidentId = incidentId,
         )
 
     private fun reportScheduleLimitHit(
@@ -2505,7 +3448,7 @@ private class RuntimeLimiter(
         val markerPersisted = prefs.edit()
             .putString(KEY_SCHEDULE_BLOCK_TOKEN, blockToken)
             .commit()
-        val statsPersisted = reportLimitHit(activity, rule)
+        val statsPersisted = reportLimitHit(activity, rule, blockToken)
         if (!markerPersisted) {
             diagnostic(
                 activity,
@@ -2523,6 +3466,7 @@ private class RuntimeLimiter(
         launchIncrement: Int,
         limitHitIncrement: Int,
         eventDayToken: String = LocalDate.now().toString(),
+        incidentId: String = "",
     ): Boolean {
         val context = activity.applicationContext
         statsContext = context
@@ -2535,7 +3479,17 @@ private class RuntimeLimiter(
         pending.launches = safeAdd(pending.launches, launchIncrement.coerceAtLeast(0))
         pending.limitHits = safeAdd(pending.limitHits, limitHitIncrement.coerceAtLeast(0))
         persistStatsOutbox(context)
-        return flushUsageEvents(context)
+        val persisted = flushUsageEvents(context)
+        if (limitHitIncrement > 0) {
+            diagnostic(
+                activity,
+                level = if (persisted) "INFO" else "WARN",
+                event = "STATS_LIMIT_HIT_PERSISTED",
+                message = "day=$eventDayToken, increment=$limitHitIncrement, " +
+                    "incident=${incidentId.take(160)}, persisted=$persisted",
+            )
+        }
+        return persisted
     }
 
     private fun reportHookStatus(
@@ -2727,6 +3681,7 @@ private class RuntimeLimiter(
     private fun stopTiming() {
         foregroundStartedAt = NOT_RUNNING
         foregroundDayToken = -1
+        processBackgroundedAtElapsedMillis = NOT_RUNNING
         activeActivity.clear()
         mainHandler.removeCallbacks(deadline)
         mainHandler.removeCallbacks(warningDeadline)
@@ -2771,6 +3726,7 @@ private class RuntimeLimiter(
         val firstPresentation = warningShownForExtensionMs != grantedExtensionMs
         warningShownForExtensionMs = grantedExtensionMs
 
+        if (rule.childLockEnabled) parentUnlockOffered = true
         runCatching {
             warningBanner = TopWarningBanner.attach(
                 activity = activity,
@@ -2795,16 +3751,14 @@ private class RuntimeLimiter(
                 actionLabel = hookText(
                     activity,
                     rule,
-                    if (rule.fullScreenExitWarningEnabled) {
-                        "延时 ${compactMinutes(rule.extensionMillis)}分"
-                    } else {
-                        "延时 ${formatDuration(activity, rule, rule.extensionMillis)}"
-                    },
-                    if (rule.fullScreenExitWarningEnabled) {
-                        "Extend ${compactMinutes(rule.extensionMillis)}m"
-                    } else {
-                        "Extend ${formatDuration(activity, rule, rule.extensionMillis)}"
-                    },
+                    "延时 ${compactMinutes(rule.extensionMillis)}分",
+                    "Extend ${compactMinutes(rule.extensionMillis)}m",
+                ),
+                actionContentDescription = hookText(
+                    activity,
+                    rule,
+                    "延时 ${formatDuration(activity, rule, rule.extensionMillis)}",
+                    "Extend by ${formatDuration(activity, rule, rule.extensionMillis)}",
                 ),
                 onAction = {
                     val latest = readRule(activity, reloadFallback = true)
@@ -2818,7 +3772,24 @@ private class RuntimeLimiter(
                         grantExtension(activity, latest.extensionMillis)
                     }
                 },
-                exitLabel = hookText(activity, rule, "退出应用", "Exit app"),
+                secondaryActionLabel = if (rule.childLockEnabled) {
+                    hookText(activity, rule, "PIN", "PIN")
+                } else null,
+                secondaryActionContentDescription = if (rule.childLockEnabled) {
+                    hookText(activity, rule, "使用家长 PIN 临时放行", "Temporarily allow with parent PIN")
+                } else null,
+                onSecondaryAction = if (rule.childLockEnabled) {
+                    {
+                        beginParentAuthentication(
+                            activity,
+                            readRule(activity, true),
+                            "QUOTA",
+                            "quota-warning:$processSessionId:${rule.version}:${rule.groupVersion}",
+                        )
+                    }
+                } else null,
+                exitLabel = hookText(activity, rule, "退出", "Exit"),
+                exitContentDescription = hookText(activity, rule, "立即退出应用", "Exit app now"),
                 onExit = { leaveTargetByUser(activity, "time_limit_warning") },
             )
             if (warningVibratedForExtensionMs != grantedExtensionMs) {
@@ -2859,6 +3830,7 @@ private class RuntimeLimiter(
         if (isBannerShowing(WarningBannerKind.SCHEDULE)) return
         dismissSessionPlanWarning()
         dismissWarning(resetForCurrentLimit = false)
+        if (rule.childLockEnabled) parentUnlockOffered = true
         runCatching {
             warningBanner = TopWarningBanner.attach(
                 activity = activity,
@@ -2880,7 +3852,24 @@ private class RuntimeLimiter(
                     rule,
                     "schedule-warning:$processSessionId:${dayToken()}",
                 ),
-                exitLabel = hookText(activity, rule, "退出应用", "Exit app"),
+                actionLabel = if (rule.childLockEnabled) {
+                    hookText(activity, rule, "PIN", "PIN")
+                } else null,
+                actionContentDescription = if (rule.childLockEnabled) {
+                    hookText(activity, rule, "使用家长 PIN 临时放行", "Temporarily allow with parent PIN")
+                } else null,
+                onAction = if (rule.childLockEnabled) {
+                    {
+                        beginParentAuthentication(
+                            activity,
+                            readRule(activity, true),
+                            "SCHEDULE",
+                            "schedule-warning:$processSessionId:${rule.version}:${rule.groupVersion}",
+                        )
+                    }
+                } else null,
+                exitLabel = hookText(activity, rule, "退出", "Exit"),
+                exitContentDescription = hookText(activity, rule, "立即退出应用", "Exit app now"),
                 onExit = { leaveTargetByUser(activity, "schedule_warning") },
             )
             vibrateExitWarning(activity, rule)
@@ -3296,7 +4285,7 @@ private class RuntimeLimiter(
                         label = hookText(context, rule, "每日累计", "Daily cumulative"),
                         kind = QuotaKind.APP_DAILY,
                         isGroup = false,
-                        remainingMillis = UsageMath.remainingMillis(
+                        remainingMillis = quotaRemainingMillis(
                             effectiveLimitMillis(rule.dailyLimitMillis),
                             authoritativeDailyTotalMillis(
                                 context,
@@ -3314,7 +4303,7 @@ private class RuntimeLimiter(
                         label = hookText(context, rule, "单次打开", "Per launch"),
                         kind = QuotaKind.APP_PER_LAUNCH,
                         isGroup = false,
-                        remainingMillis = UsageMath.remainingMillis(
+                        remainingMillis = quotaRemainingMillis(
                             effectiveLimitMillis(rule.perLaunchLimitMillis),
                             perLaunchCommittedMs,
                             activeMs,
@@ -3333,7 +4322,7 @@ private class RuntimeLimiter(
                         ),
                         kind = QuotaKind.GROUP_DAILY,
                         isGroup = true,
-                        remainingMillis = UsageMath.remainingMillis(
+                        remainingMillis = quotaRemainingMillis(
                             effectiveLimitMillis(rule.groupDailyLimitMillis),
                             authoritativeGroupTodayUsedMillis(rule),
                             0L,
@@ -3352,9 +4341,11 @@ private class RuntimeLimiter(
                         ),
                         kind = QuotaKind.GROUP_PER_LAUNCH,
                         isGroup = true,
-                        remainingMillis = UsageMath.remainingMillis(
+                        remainingMillis = quotaRemainingMillis(
                             effectiveLimitMillis(rule.groupPerLaunchLimitMillis),
-                            perLaunchCommittedMs,
+                            sharedGroupSessionUsedMs.takeIf {
+                                sharedGroupSessionId.isNotBlank()
+                            } ?: perLaunchCommittedMs,
                             activeMs,
                         ),
                     ),
@@ -3389,6 +4380,14 @@ private class RuntimeLimiter(
             hasThreshold = true,
         )
     }
+
+    private fun quotaRemainingMillis(
+        limitMillis: Long,
+        committedMillis: Long,
+        activeMillis: Long,
+    ): Long = QuotaBoundaryPolicy.normalizeRemainingMillis(
+        UsageMath.remainingMillis(limitMillis, committedMillis, activeMillis),
+    )
 
     private fun authoritativeGroupTodayUsedMillis(rule: HookRule): Long {
         if (!rule.groupDailyEnabled) return 0L
@@ -3448,15 +4447,240 @@ private class RuntimeLimiter(
             .commit()
     }
 
+    /**
+     * OEM background-start controls may reject both a cold provider start and an exported bound
+     * service. A PIN tap is an explicit user action, so briefly opening Time Stop's transparent
+     * bootstrap Activity is the reliable way to start its process and restore this configured
+     * target's temporary provider grant.
+     */
+    private fun requestForegroundProviderAccessRecovery(
+        activity: Activity,
+        authGeneration: Long,
+        callback: (Boolean, String) -> Unit,
+    ) {
+        parentAuthBootstrapPoll?.let(mainHandler::removeCallbacks)
+        parentAuthBootstrapPoll = null
+        val intent = Intent().apply {
+            setClassName(BuildConfig.APPLICATION_ID, ParentAuthBootstrapActivity::class.java.name)
+            putExtra(ParentAuthBootstrapActivity.EXTRA_TARGET_PACKAGE, packageName)
+            addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+        }
+        val launched = runCatching {
+            @Suppress("DEPRECATION")
+            activity.startActivityForResult(intent, PARENT_AUTH_BOOTSTRAP_REQUEST_CODE)
+        }
+        if (launched.isFailure) {
+            val error = launched.exceptionOrNull()
+            callback(
+                false,
+                "activity_launch:${error?.javaClass?.simpleName.orEmpty().ifBlank { "unknown" }}",
+            )
+            return
+        }
+        diagnostic(
+            activity,
+            event = "RULE_PROVIDER_FOREGROUND_BOOTSTRAP_LAUNCHED",
+            message = "reason=$parentAuthReason, task=target_task",
+        )
+        val startedAt = SystemClock.elapsedRealtime()
+        var completed = false
+        fun finish(recovered: Boolean, detail: String) {
+            if (completed) return
+            completed = true
+            parentAuthBootstrapPoll = null
+            if (recovered) providerFailureLogged = false
+            callback(recovered, detail)
+        }
+        val poll = object : Runnable {
+            override fun run() {
+                if (
+                    completed || authGeneration != parentAuthGeneration ||
+                    !parentAuthPending
+                ) return
+                val providerReady = runCatching {
+                    activity.contentResolver.call(
+                        RuleContract.CONTENT_URI,
+                        RuleContract.METHOD_GET_RULE,
+                        packageName,
+                        null,
+                    )?.getBoolean(RuleContract.KEY_OK, false) == true
+                }.getOrDefault(false)
+                val targetResumed = !activity.isFinishing && !activity.isDestroyed &&
+                    resumedActivities.contains(activity)
+                if (providerReady && targetResumed) {
+                    finish(true, "foreground_bootstrap_restored")
+                    return
+                }
+                if (
+                    SystemClock.elapsedRealtime() - startedAt <
+                    PARENT_AUTH_BOOTSTRAP_TIMEOUT_MILLIS
+                ) {
+                    mainHandler.postDelayed(this, PARENT_AUTH_BOOTSTRAP_POLL_MILLIS)
+                } else {
+                    finish(
+                        false,
+                        if (providerReady) "target_not_resumed" else "provider_not_ready",
+                    )
+                }
+            }
+        }
+        parentAuthBootstrapPoll = poll
+        mainHandler.postDelayed(poll, PARENT_AUTH_BOOTSTRAP_POLL_MILLIS)
+    }
+
+    /**
+     * Android 11+ may hide an exported provider from a target process after reboot because the
+     * older URI grant was temporary. Binding this explicit, command-free service establishes
+     * package visibility long enough for the provider to re-offer a fresh temporary grant.
+     */
+    private fun requestProviderAccessRecovery(
+        context: Context,
+        force: Boolean,
+        callback: ((Boolean, String) -> Unit)? = null,
+    ) {
+        callback?.let(providerBootstrapCallbacks::add)
+        if (providerBootstrapInFlight) return
+        val now = SystemClock.elapsedRealtime()
+        if (
+            !force && providerBootstrapLastAttemptElapsed != Long.MIN_VALUE &&
+            now - providerBootstrapLastAttemptElapsed < PROVIDER_BOOTSTRAP_RETRY_MILLIS
+        ) {
+            finishProviderAccessRecovery(context.applicationContext, false, "throttled")
+            return
+        }
+        providerBootstrapInFlight = true
+        providerBootstrapLastAttemptElapsed = now
+        val appContext = context.applicationContext
+        val connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                if (!isCurrentProviderAccessRecovery(this)) return
+                val result = runCatching {
+                    checkNotNull(service) { "missing_bridge_binder" }
+                    val request = Parcel.obtain()
+                    val reply = Parcel.obtain()
+                    try {
+                        request.writeInterfaceToken(RuleAccessBridgeService.DESCRIPTOR)
+                        request.writeString(packageName)
+                        check(
+                            service.transact(
+                                RuleAccessBridgeService.TRANSACTION_ENSURE_ACCESS,
+                                request,
+                                reply,
+                                0,
+                            ),
+                        ) { "bridge_transaction_rejected" }
+                        reply.readException()
+                        val granted = reply.readInt() != 0
+                        val detail = reply.readString().orEmpty()
+                        check(granted) { detail.ifBlank { "bridge_grant_failed" } }
+                        val verification = appContext.contentResolver.call(
+                            RuleContract.CONTENT_URI,
+                            RuleContract.METHOD_GET_RULE,
+                            packageName,
+                            null,
+                        )
+                        check(verification?.getBoolean(RuleContract.KEY_OK, false) == true) {
+                            verification?.getString(RuleContract.KEY_MESSAGE).orEmpty()
+                                .ifBlank { "provider_verification_failed" }
+                        }
+                        detail.ifBlank { "temporary_grant_restored" }
+                    } finally {
+                        request.recycle()
+                        reply.recycle()
+                    }
+                }
+                if (result.isFailure) {
+                    val error = result.exceptionOrNull()
+                    val detail = error?.message.orEmpty()
+                        .ifBlank { error?.javaClass?.simpleName ?: "ensure_failed" }
+                    XposedBridge.log(
+                        "AppTimeLimiter: RULE_PROVIDER_ACCESS_RECOVERY_FAILED package=$packageName process=$processName stage=ensure detail=${detail.take(120)}",
+                    )
+                    finishProviderAccessRecovery(appContext, false, detail, this)
+                    return
+                }
+                providerFailureLogged = false
+                val detail = result.getOrThrow()
+                XposedBridge.log(
+                    "AppTimeLimiter: RULE_PROVIDER_ACCESS_RECOVERED package=$packageName process=$processName $detail",
+                )
+                finishProviderAccessRecovery(appContext, true, detail, this)
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) = Unit
+
+            override fun onBindingDied(name: ComponentName?) {
+                finishProviderAccessRecovery(appContext, false, "binding_died", this)
+            }
+
+            override fun onNullBinding(name: ComponentName?) {
+                finishProviderAccessRecovery(appContext, false, "null_binding", this)
+            }
+        }
+        providerBridgeConnection = connection
+        val bound = runCatching {
+            appContext.bindService(
+                Intent().setClassName(
+                    BuildConfig.APPLICATION_ID,
+                    "${BuildConfig.APPLICATION_ID}.ipc.RuleAccessBridgeService",
+                ),
+                connection,
+                Context.BIND_AUTO_CREATE,
+            )
+        }.getOrElse { error ->
+            XposedBridge.log(
+                "AppTimeLimiter: RULE_PROVIDER_ACCESS_RECOVERY_FAILED package=$packageName process=$processName stage=bind detail=${error.javaClass.simpleName}",
+            )
+            false
+        }
+        if (!bound) {
+            finishProviderAccessRecovery(appContext, false, "bind_rejected")
+            return
+        }
+        val timeout = Runnable {
+            finishProviderAccessRecovery(appContext, false, "timeout", connection)
+        }
+        providerBootstrapTimeout = timeout
+        mainHandler.postDelayed(timeout, PROVIDER_BOOTSTRAP_TIMEOUT_MILLIS)
+    }
+
+    private fun finishProviderAccessRecovery(
+        context: Context,
+        recovered: Boolean,
+        detail: String,
+        expectedConnection: ServiceConnection? = null,
+    ) {
+        if (
+            expectedConnection != null &&
+            providerBridgeConnection !== expectedConnection
+        ) return
+        providerBootstrapTimeout?.let(mainHandler::removeCallbacks)
+        providerBootstrapTimeout = null
+        providerBridgeConnection?.let { connection ->
+            runCatching { context.unbindService(connection) }
+        }
+        providerBridgeConnection = null
+        providerBootstrapInFlight = false
+        val callbacks = providerBootstrapCallbacks.toList()
+        providerBootstrapCallbacks.clear()
+        callbacks.forEach { callback -> runCatching { callback(recovered, detail) } }
+    }
+
+    private fun isCurrentProviderAccessRecovery(connection: ServiceConnection): Boolean =
+        providerBootstrapInFlight && providerBridgeConnection === connection
+
     private fun readRule(context: Context, reloadFallback: Boolean): HookRule {
-        runCatching {
+        val providerAttempt = runCatching {
             context.contentResolver.call(
                 RuleContract.CONTENT_URI,
                 RuleContract.METHOD_GET_RULE,
                 packageName,
                 null,
             )
-        }.getOrNull()?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) }?.let { result ->
+        }
+        providerAttempt.getOrNull()
+            ?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) }
+            ?.let { result ->
             val rule = HookRule(
                 protectionMode = ProtectionModePolicy.parse(
                     storedValue = result.getString(RuleContract.KEY_PROTECTION_MODE),
@@ -3467,6 +4691,10 @@ private class RuntimeLimiter(
                     RuleContract.KEY_PROTECTION_MODE_GENERATION,
                     RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION,
                 ).coerceAtLeast(RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION),
+                childLockEnabled = result.getBoolean(
+                    RuleContract.KEY_CHILD_LOCK_ENABLED,
+                    false,
+                ),
                 enabled = result.getBoolean(RuleContract.KEY_ENABLED, false),
                 sessionPlanningEnabled = result.getBoolean(
                     RuleContract.KEY_SESSION_PLANNING_ENABLED,
@@ -3640,9 +4868,36 @@ private class RuntimeLimiter(
             return rule
         }
 
+        providerAttempt.exceptionOrNull()?.let {
+            requestProviderAccessRecovery(context, force = false) { recovered, detail ->
+                if (!recovered) return@requestProviderAccessRecovery
+                val activity = activeActivity.get()?.takeIf { current ->
+                    !current.isFinishing &&
+                        !current.isDestroyed &&
+                        resumedActivities.contains(current)
+                } ?: return@requestProviderAccessRecovery
+                diagnostic(
+                    activity,
+                    event = "RULE_PROVIDER_RECOVERY_RECHECK",
+                    message = "Provider 通道恢复后立即重读规则；detail=${detail.take(80)}",
+                )
+                processResumedActivity(
+                    activity = activity,
+                    processWasForeground = true,
+                    previousActivity = activity,
+                    resumedDuringHandoff = false,
+                )
+            }
+        }
         if (!providerFailureLogged) {
             providerFailureLogged = true
-            XposedBridge.log("AppTimeLimiter: PROVIDER_UNAVAILABLE package=$packageName, fallback=XSharedPreferences/local_cache")
+            val detail = providerAttempt.exceptionOrNull()?.let {
+                "${it.javaClass.simpleName}:${it.message.orEmpty().take(120)}"
+            } ?: providerAttempt.getOrNull()?.getString(RuleContract.KEY_MESSAGE).orEmpty()
+                .ifBlank { "empty_or_denied" }
+            XposedBridge.log(
+                "AppTimeLimiter: PROVIDER_UNAVAILABLE package=$packageName process=$processName detail=$detail fallback=XSharedPreferences/local_cache",
+            )
         }
         if (reloadFallback) preferences.reload()
         val rawSharedRule = readXSharedRule()
@@ -3770,6 +5025,10 @@ private class RuntimeLimiter(
                 RuleRepository.KEY_PROTECTION_MODE_GENERATION,
                 RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION,
             ).coerceAtLeast(RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION),
+            childLockEnabled = preferences.getBoolean(
+                RuleRepository.KEY_CHILD_LOCK_ENABLED,
+                false,
+            ),
             enabled = if (groupAssigned) {
                 groupEnabled
             } else {
@@ -3934,6 +5193,7 @@ private class RuntimeLimiter(
         val signature = listOf(
             rule.protectionMode,
             rule.protectionModeGeneration,
+            rule.childLockEnabled,
             rule.enabled,
             rule.sessionPlanningEnabled,
             rule.dailyEnabled,
@@ -3987,6 +5247,7 @@ private class RuntimeLimiter(
             .putBoolean(CACHE_PRESENT, true)
             .putString(CACHE_PROTECTION_MODE, rule.protectionMode.name)
             .putLong(CACHE_PROTECTION_MODE_GENERATION, rule.protectionModeGeneration)
+            .putBoolean(CACHE_CHILD_LOCK_ENABLED, rule.childLockEnabled)
             .putBoolean(CACHE_ENABLED, rule.enabled)
             .putBoolean(CACHE_SESSION_PLANNING_ENABLED, rule.sessionPlanningEnabled)
             .putBoolean(CACHE_DAILY_ENABLED, rule.dailyEnabled)
@@ -4084,6 +5345,7 @@ private class RuntimeLimiter(
                 CACHE_PROTECTION_MODE_GENERATION,
                 RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION,
             ).coerceAtLeast(RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION),
+            childLockEnabled = prefs.getBoolean(CACHE_CHILD_LOCK_ENABLED, false),
             enabled = prefs.getBoolean(CACHE_ENABLED, false),
             sessionPlanningEnabled = !groupAssigned &&
                 prefs.getBoolean(CACHE_SESSION_PLANNING_ENABLED, false),
@@ -4231,6 +5493,7 @@ private class RuntimeLimiter(
         protectionModeGeneration = rulesetGeneration.coerceAtLeast(
             RuleRepository.DEFAULT_PROTECTION_MODE_GENERATION,
         ),
+        childLockEnabled = false,
         enabled = false,
         sessionPlanningEnabled = false,
         dailyEnabled = false,
@@ -4325,6 +5588,7 @@ private class RuntimeLimiter(
     private data class HookRule(
         val protectionMode: ProtectionMode,
         val protectionModeGeneration: Long,
+        val childLockEnabled: Boolean,
         val enabled: Boolean,
         val sessionPlanningEnabled: Boolean,
         val dailyEnabled: Boolean,
@@ -4425,6 +5689,7 @@ private class RuntimeLimiter(
     private companion object {
         const val NOT_RUNNING = -1L
         const val ACTIVITY_HANDOFF_GRACE_MS = 350L
+        const val GROUP_SESSION_HANDOFF_REFRESH_MS = 600L
         const val SESSION_PLAN_PROMPT_STABLE_MS = 1_000L
         const val SESSION_PLAN_PROMPT_RETRY_MS = 1_000L
         const val STATE_PREFS = "__app_time_limiter_state__"
@@ -4444,6 +5709,7 @@ private class RuntimeLimiter(
         const val CACHE_SIGNATURE = "signature"
         const val CACHE_PROTECTION_MODE = "protection_mode"
         const val CACHE_PROTECTION_MODE_GENERATION = "protection_mode_generation"
+        const val CACHE_CHILD_LOCK_ENABLED = "child_lock_enabled"
         const val CACHE_ENABLED = "enabled"
         const val CACHE_SESSION_PLANNING_ENABLED = "session_planning_enabled"
         const val CACHE_DAILY_ENABLED = "daily_enabled"
@@ -4503,6 +5769,14 @@ private class RuntimeLimiter(
         const val WARNING_LEAD_MS = 5_000L
         const val EXIT_WARNING_VIBRATION_MS = 1_200L
         const val COUNTDOWN_REFRESH_MS = 1_000L
+        const val PARENT_AUTH_POLL_MILLIS = 250L
+        const val PARENT_AUTH_RETURN_GRACE_MS = 2_000L
+        const val PARENT_OVERRIDE_RESUME_TIMEOUT_MS = 5_000L
+        const val PARENT_AUTH_BOOTSTRAP_REQUEST_CODE = 0x5453
+        const val PARENT_AUTH_BOOTSTRAP_POLL_MILLIS = 150L
+        const val PARENT_AUTH_BOOTSTRAP_TIMEOUT_MILLIS = 3_000L
+        const val PROVIDER_BOOTSTRAP_TIMEOUT_MILLIS = 2_500L
+        const val PROVIDER_BOOTSTRAP_RETRY_MILLIS = 30_000L
         const val SCHEDULE_RECHECK_MAX_MS = 60_000L
         const val RULE_RECHECK_MAX_MS = 60_000L
         const val SYSTEM_USAGE_PENDING_RECHECK_MS = 1_000L

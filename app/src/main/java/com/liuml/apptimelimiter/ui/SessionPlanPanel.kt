@@ -1,25 +1,20 @@
 package com.liuml.apptimelimiter.ui
 
 import android.annotation.SuppressLint
+import android.content.res.ColorStateList
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.text.Editable
-import android.text.InputFilter
-import android.text.InputType
-import android.text.TextWatcher
 import android.util.TypedValue
 import android.view.Gravity
-import android.view.inputmethod.EditorInfo
 import android.view.ViewGroup
-import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.ScrollView
 import android.widget.TextView
 import com.liuml.apptimelimiter.core.SessionPlanDurationPolicy
-import com.liuml.apptimelimiter.core.SessionPlanDurationStatus
 
 data class SessionPlanPanelCopy(
     val eyebrow: String,
@@ -28,7 +23,7 @@ data class SessionPlanPanelCopy(
     val skipLabel: String,
 )
 
-/** Shared compact minute-input plan UI used by Hook dialogs and accessibility overlays. */
+/** Shared compact minute-slider plan UI used by Hook dialogs and accessibility overlays. */
 @SuppressLint("ViewConstructor")
 class SessionPlanPanel(
     context: Context,
@@ -57,6 +52,7 @@ class SessionPlanPanel(
         0,
         1f,
     )
+    private val customActionHost = LinearLayout(context).apply { orientation = VERTICAL }
     private val footer = LinearLayout(context).apply { orientation = HORIZONTAL }
 
     init {
@@ -67,6 +63,7 @@ class SessionPlanPanel(
         addView(titleView, ui.matchWrap())
         addView(descriptionView, ui.matchWrap())
         addView(bodyScroll, bodyWrapLayoutParams)
+        addView(customActionHost, ui.matchWrap(topMargin = 6))
         addView(ui.divider(), ui.matchHeight(1, topMargin = 12, bottomMargin = 10))
         addView(footer, ui.matchWrap())
         showContent()
@@ -119,6 +116,7 @@ class SessionPlanPanel(
         titleView.text = copy.title
         descriptionView.text = copy.description
         bodyHost.removeAllViews()
+        customActionHost.removeAllViews()
         quote?.takeIf(String::isNotBlank)?.let {
             bodyHost.addView(ui.quote(it), ui.matchWrap(bottomMargin = 10))
         }
@@ -144,67 +142,84 @@ class SessionPlanPanel(
         }
         bodyHost.addView(quickGrid, ui.matchWrap())
         bodyHost.addView(
-            ui.sectionLabel(ui.text("自定义分钟", "Custom minutes")),
+            ui.sectionLabel(ui.text("自定义时长", "Custom duration")),
             ui.matchWrap(topMargin = 2, bottomMargin = 6),
         )
 
-        val customRow = LinearLayout(context).apply {
-            orientation = HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val input = ui.minuteInput()
-        val customStart = ui.action(
-            ui.text("开始", "Start"),
-            filled = true,
-            enabled = false,
-        ) {
-            SessionPlanDurationPolicy.evaluate(input.text.toString(), maxAllowedMillis)
-                .takeIf { it.status == SessionPlanDurationStatus.VALID }
-                ?.totalMinutes
-                ?.let { select(it * 60_000L) }
-        }
-        customRow.addView(input, ui.weightedHeight(50, 0, 0))
-        customRow.addView(customStart, ui.fixedHeight(96, 50, 10))
-        bodyHost.addView(customRow, ui.matchWrap())
-        val customHelper = ui.helper(ui.minuteInputMessage("", maxAllowedMillis))
-        bodyHost.addView(customHelper, ui.matchWrap(topMargin = 5, bottomMargin = 4))
+        val maximumAvailableMinutes =
+            SessionPlanDurationPolicy.maxSelectableMinutes(maxAllowedMillis)
+        var selectedCustomMinutes =
+            SessionPlanDurationPolicy.defaultSliderMinutes(maxAllowedMillis)
+        val customValue = ui.customDurationValue(selectedCustomMinutes)
+        bodyHost.addView(customValue, ui.matchWrap(bottomMargin = 2))
 
-        fun refreshCustomInput() {
-            val evaluation = SessionPlanDurationPolicy.evaluate(
-                input.text.toString(),
+        val slider = ui.minuteSlider(
+            selectedMinutes = selectedCustomMinutes,
+        )
+        val customStart = ui.action(
+            ui.text("开始计划", "Start plan"),
+            filled = true,
+            enabled = SessionPlanDurationPolicy.minutesAllowed(
+                selectedCustomMinutes,
+                maxAllowedMillis,
+            ),
+        ) {
+            if (
+                SessionPlanDurationPolicy.minutesAllowed(
+                    selectedCustomMinutes,
+                    maxAllowedMillis,
+                )
+            ) {
+                select(selectedCustomMinutes * 60_000L)
+            }
+        }
+        val helper = ui.helper("")
+        fun updateCustomSelection() {
+            val allowed = SessionPlanDurationPolicy.minutesAllowed(
+                selectedCustomMinutes,
                 maxAllowedMillis,
             )
-            val valid = evaluation.status == SessionPlanDurationStatus.VALID
-            customStart.isEnabled = valid
-            customStart.isClickable = valid
-            customStart.isFocusable = valid
-            customStart.alpha = if (valid) 1f else 0.38f
-            customHelper.text = ui.minuteInputMessage(input.text.toString(), maxAllowedMillis)
-            customHelper.setTextColor(
-                if (
-                    evaluation.status == SessionPlanDurationStatus.ZERO ||
-                    evaluation.status == SessionPlanDurationStatus.NON_NUMERIC ||
-                    evaluation.status == SessionPlanDurationStatus.OUT_OF_RANGE ||
-                    evaluation.status == SessionPlanDurationStatus.EXCEEDS_MAX
-                ) {
-                    colors.primary
-                } else {
-                    colors.textSecondary
-                },
+            customValue.text = ui.customDurationText(selectedCustomMinutes)
+            customValue.setTextColor(if (allowed) colors.primary else ui.warningColor())
+            helper.text = ui.sliderHelper(
+                maximumAvailableMinutes = maximumAvailableMinutes,
+                allowed = allowed,
+            )
+            helper.setTextColor(if (allowed) colors.textSecondary else ui.warningColor())
+            ui.setActionEnabled(customStart, allowed)
+            slider.contentDescription = if (allowed) {
+                ui.customDurationText(selectedCustomMinutes)
+            } else {
+                helper.text
+            }
+        }
+        slider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                selectedCustomMinutes = SessionPlanDurationPolicy.normalizeSliderMinutes(progress)
+                updateCustomSelection()
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+
+            override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+        })
+        bodyHost.addView(slider, ui.matchWrap())
+        val endpoints = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(
+                ui.sliderEndpoint("${SessionPlanDurationPolicy.MIN_TOTAL_MINUTES}"),
+                ui.weightedWrap(),
+            )
+            addView(
+                ui.sliderEndpoint("${SessionPlanDurationPolicy.MAX_TOTAL_MINUTES}", Gravity.END),
+                ui.weightedWrap(),
             )
         }
-        input.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) =
-                Unit
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) =
-                refreshCustomInput()
-            override fun afterTextChanged(s: Editable?) = Unit
-        })
-        input.setOnEditorActionListener { _, actionId, _ ->
-            if (actionId != EditorInfo.IME_ACTION_DONE) return@setOnEditorActionListener false
-            if (customStart.isEnabled) customStart.performClick()
-            true
-        }
+        bodyHost.addView(endpoints, ui.matchWrap(bottomMargin = 2))
+        bodyHost.addView(helper, ui.matchWrap(topMargin = 3, bottomMargin = 7))
+        customActionHost.addView(customStart, ui.matchHeight(48))
+        updateCustomSelection()
         if (includeDebugChoice) {
             bodyHost.addView(
                 ui.compactAction(
@@ -217,7 +232,6 @@ class SessionPlanPanel(
                 ui.centeredHeight(34, topMargin = 4),
             )
         }
-        refreshCustomInput()
         configureFooter()
         bodyScroll.scrollTo(0, 0)
     }
@@ -307,54 +321,71 @@ class SessionPlanPanel(
             background = roundedBackground(colors.surfaceContainer, 14f)
         }
 
-        fun minuteInput() = EditText(context).apply {
-            hint = text("例如 45", "e.g. 45")
-            setTextColor(colors.textPrimary)
-            setHintTextColor(colors.textSecondary)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            gravity = Gravity.CENTER_VERTICAL
-            inputType = InputType.TYPE_CLASS_NUMBER
-            imeOptions = EditorInfo.IME_ACTION_DONE
-            filters = arrayOf(InputFilter.LengthFilter(4))
-            isSingleLine = true
-            setPadding(dp(14), 0, dp(14), 0)
-            background = roundedBackground(colors.surfaceContainer, 16f, 1, colors.outline)
-            contentDescription = text("自定义计划分钟数", "Custom plan minutes")
+        fun customDurationValue(selectedMinutes: Int) =
+            TextView(context).apply {
+                text = customDurationText(selectedMinutes)
+                gravity = Gravity.CENTER
+                setTextColor(colors.primary)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+                typeface = Typeface.DEFAULT_BOLD
+                minHeight = dp(32)
+            }
+
+        fun customDurationText(minutes: Int): String =
+            text("计划使用 $minutes 分钟", "Plan for $minutes min")
+
+        fun minuteSlider(selectedMinutes: Int) = SeekBar(context).apply {
+            min = SessionPlanDurationPolicy.MIN_TOTAL_MINUTES
+            max = SessionPlanDurationPolicy.MAX_TOTAL_MINUTES
+            progress = SessionPlanDurationPolicy.normalizeSliderMinutes(selectedMinutes)
+            splitTrack = false
+            progressTintList = ColorStateList.valueOf(colors.primary)
+            progressBackgroundTintList = ColorStateList.valueOf(colors.outline)
+            thumbTintList = ColorStateList.valueOf(colors.primary)
+            contentDescription = customDurationText(progress)
         }
 
-        fun minuteInputMessage(raw: String, maxAllowedMillis: Long?): String {
-            val evaluation = SessionPlanDurationPolicy.evaluate(raw, maxAllowedMillis)
-            return when (evaluation.status) {
-                SessionPlanDurationStatus.EMPTY ->
-                    maxAllowedMillis?.let(::allowanceText)
-                        ?: text("请输入1–1440分钟", "Enter 1–1440 minutes")
-                SessionPlanDurationStatus.NON_NUMERIC ->
-                    text("请输入整数分钟", "Enter whole minutes")
-                SessionPlanDurationStatus.ZERO ->
-                    text("请至少输入1分钟", "Enter at least 1 minute")
-                SessionPlanDurationStatus.OUT_OF_RANGE ->
-                    text("最多可输入1440分钟", "Maximum: 1440 minutes")
-                SessionPlanDurationStatus.EXCEEDS_MAX ->
-                    maxAllowedMillis?.let {
-                        val minutes = SessionPlanDurationPolicy.maxSelectableMinutes(it)
-                        text(
-                            "超过当前剩余${minutes}分钟",
-                            "Exceeds the remaining $minutes min",
-                        )
-                    } ?: text("当前输入不可用", "This value is unavailable")
-                SessionPlanDurationStatus.VALID ->
-                    maxAllowedMillis?.let(::allowanceText)
-                        ?: text("仅计算前台使用时间", "Foreground time only")
+        fun sliderEndpoint(value: String, textGravity: Int = Gravity.START) = TextView(context).apply {
+            text = value
+            gravity = textGravity
+            setTextColor(colors.textSecondary)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+        }
+
+        fun sliderHelper(
+            maximumAvailableMinutes: Int,
+            allowed: Boolean,
+        ): String = when {
+            !allowed && maximumAvailableMinutes < SessionPlanDurationPolicy.MIN_TOTAL_MINUTES -> {
+                text(
+                    "剩余时间不足，当前可用额度不足1分钟",
+                    "Not enough time remains; less than 1 minute is available",
+                )
+            }
+            !allowed -> {
+                text(
+                    "剩余时间不足，当前最多可计划 $maximumAvailableMinutes 分钟",
+                    "Not enough time remains; up to $maximumAvailableMinutes min is available",
+                )
+            }
+            maximumAvailableMinutes < SessionPlanDurationPolicy.MAX_TOTAL_MINUTES -> {
+                text(
+                    "当前最多可计划 $maximumAvailableMinutes 分钟",
+                    "Up to $maximumAvailableMinutes min available",
+                )
+            }
+            else -> {
+                text("仅计算前台使用时间", "Foreground time only")
             }
         }
 
-        private fun allowanceText(maxAllowedMillis: Long): String {
-            val minutes = SessionPlanDurationPolicy.maxSelectableMinutes(maxAllowedMillis)
-            return if (minutes <= 0L) {
-                text("当前可用额度不足1分钟", "Less than 1 minute remains")
-            } else {
-                text("本次最多可计划${minutes}分钟", "Up to $minutes min available")
-            }
+        fun warningColor(): Int = if (colors.isDark) 0xFFFFB4AB.toInt() else 0xFFB3261E.toInt()
+
+        fun setActionEnabled(view: TextView, enabled: Boolean) {
+            view.isEnabled = enabled
+            view.alpha = if (enabled) 1f else 0.38f
+            view.isClickable = enabled
+            view.isFocusable = enabled
         }
 
         fun action(
@@ -431,6 +462,12 @@ class SessionPlanPanel(
                 marginStart = dp(startMargin)
                 this.bottomMargin = dp(bottomMargin)
             }
+
+        fun weightedWrap() = LinearLayout.LayoutParams(
+            0,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            1f,
+        )
 
         fun fixedHeight(width: Int, height: Int, startMargin: Int) =
             LinearLayout.LayoutParams(dp(width), dp(height)).apply {

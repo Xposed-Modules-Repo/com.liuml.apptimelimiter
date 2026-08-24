@@ -15,9 +15,16 @@ Description: |-
     Time Stop is an Android app-time control tool for device owners who want
     explicit, composable usage boundaries.
 
-    It supports per-app rules, daily quotas, per-launch timers, weekly
-    allow/block windows, shared group budgets, cooldowns after forced exits,
-    session planning, diagnostics, and update checks.
+    It supports per-app rules, daily quotas, continuous per-launch timers,
+    weekly allow/block windows, shared group sessions, cooldowns after forced
+    exits, session planning, child lock, parent-bound temporary overrides,
+    diagnostics, and update checks.
+
+    Child lock keeps its 4-8 digit PIN, failure state, and biometric recovery
+    key in private app storage. A parent override is bound to the target app,
+    current session, rule/group version, and protection-mode generation; it
+    expires when the session ends, the screen turns off, the process ends, or
+    the configuration changes.
 
     On rooted devices, Time Stop can use LSPosed/Xposed hooks for the strongest
     enforcement. On non-root devices, it can use a content-blind Accessibility
@@ -34,14 +41,14 @@ RepoType: git
 Repo: https://github.com/TACPR/com.liuml.apptimelimiter.git
 
 Builds:
-  - versionName: 0.10.15
-    versionCode: 38
-    commit: 38-0.10.15
+  - versionName: 0.11.10
+    versionCode: 49
+    commit: 49-0.11.10
     subdir: .
     gradle:
       - yes
 
 AutoUpdateMode: Version %c-%v
 UpdateCheckMode: Tags
-CurrentVersion: 0.10.15
-CurrentVersionCode: 38
+CurrentVersion: 0.11.10
+CurrentVersionCode: 49

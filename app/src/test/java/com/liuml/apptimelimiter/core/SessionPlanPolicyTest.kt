@@ -46,6 +46,7 @@ class SessionPlanPolicyTest {
             SessionPlanPolicy.MAX_DURATION_MILLIS,
             SessionPlanPolicy.selectedDurationMillis(Long.MAX_VALUE),
         )
+        assertEquals(60L * 60_000L, SessionPlanPolicy.MAX_DURATION_MILLIS)
     }
 
     @Test

@@ -1,0 +1,4 @@
+Added child lock with private 4–8 digit PIN protection, escalating lockouts, and optional strong-biometric recovery that can only reset the PIN.
+Added session-bound parent temporary overrides for hard limits, with automatic expiry on deadline, real backgrounding, screen-off, process end, or rule/mode changes.
+Added continuous shared per-launch sessions across app-group members and effective-rest resets after a configured cooldown.
+Improved Provider access recovery after reboot, warning placement in cutout/immersive layouts, exit safety, rule validation, diagnostics, and test coverage.

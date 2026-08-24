@@ -18,6 +18,16 @@
         <item name="android:colorAccent">#FFFFFF</item>
     </style>
 
+    <style name="Theme.AppTimeLimiter.Bootstrap" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+
     <style name="Theme.AppTimeLimiter.TimePicker.Green.Light" parent="android:style/Theme.Material.Light.Dialog.Alert">
         <item name="android:colorAccent">#276B4E</item>
     </style>

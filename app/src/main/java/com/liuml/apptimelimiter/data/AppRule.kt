@@ -117,6 +117,7 @@ data class AppGroup(
 )
 
 data class GlobalSettings(
+    val childLockEnabled: Boolean = false,
     val exitWarningEnabled: Boolean = true,
     val fullScreenExitWarningEnabled: Boolean = false,
     val exitWarningVibrationEnabled: Boolean = false,

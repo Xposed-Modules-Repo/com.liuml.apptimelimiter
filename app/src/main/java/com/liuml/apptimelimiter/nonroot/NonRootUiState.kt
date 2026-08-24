@@ -33,14 +33,23 @@ data class NonRootHealthSnapshot(
 )
 
 object NonRootUiRecoveryPolicy {
+    fun shouldRestoreInterruptedPlanPrompt(
+        uiState: NonRootUiExecutionState,
+        planPromptHandled: Boolean,
+        planActive: Boolean,
+    ): Boolean =
+        (uiState == NonRootUiExecutionState.PLAN_PENDING ||
+            uiState == NonRootUiExecutionState.PLAN_VISIBLE) &&
+            planPromptHandled &&
+            !planActive
+
     fun shouldRestorePlanAfterServiceRestart(
         uiState: NonRootUiExecutionState,
         planPromptHandled: Boolean,
         planActive: Boolean,
     ): Boolean =
         uiState == NonRootUiExecutionState.PLAN_VISIBLE &&
-            planPromptHandled &&
-            !planActive
+            shouldRestoreInterruptedPlanPrompt(uiState, planPromptHandled, planActive)
 
     fun shouldRetryPlanDetach(
         attemptsCompleted: Int,
