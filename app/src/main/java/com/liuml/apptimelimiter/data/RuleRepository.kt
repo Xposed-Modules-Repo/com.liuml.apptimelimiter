@@ -4,6 +4,11 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import com.liuml.apptimelimiter.BuildConfig
+import com.liuml.apptimelimiter.backup.PortableBackupPolicy
+import com.liuml.apptimelimiter.backup.PortableBackupV1
+import com.liuml.apptimelimiter.backup.PortableBackupValidationResult
+import com.liuml.apptimelimiter.backup.PortableGlobalSettings
 import com.liuml.apptimelimiter.core.SharedCooldownClaim
 import com.liuml.apptimelimiter.core.SharedCooldownPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownRecord
@@ -23,6 +28,7 @@ import com.liuml.apptimelimiter.core.TimeQuotePolicy
 import com.liuml.apptimelimiter.core.ThemeColorPolicy
 import com.liuml.apptimelimiter.ipc.RuleContract
 import com.liuml.apptimelimiter.core.GroupMembershipPolicy
+import com.liuml.apptimelimiter.migration.MigrationStorageGate
 import java.io.File
 import java.util.UUID
 
@@ -76,6 +82,27 @@ class RuleRepository(context: Context) {
                 false,
             )
             if (
+                (BuildConfig.LEGACY_MIGRATION_EXPORT_ENABLED || BuildConfig.MODERN_XPOSED_ENABLED) &&
+                sharedStore.frameworkBacked &&
+                sharedMarkerPresent
+            ) {
+                val sharedGeneration = sharedPrefs.getLong(KEY_RULESET_GENERATION, 0L)
+                val primaryGeneration = primaryPrefs.getLong(KEY_RULESET_GENERATION, 0L)
+                val sharedPackages = sharedPrefs.getStringSet(KEY_PACKAGES, emptySet()).orEmpty()
+                val primaryPackages = primaryPrefs.getStringSet(KEY_PACKAGES, emptySet()).orEmpty()
+                if (
+                    !primaryMarkerPresent ||
+                    sharedGeneration > primaryGeneration ||
+                    (sharedGeneration == primaryGeneration &&
+                        sharedPackages.isNotEmpty() && primaryPackages.isEmpty())
+                ) {
+                    val adopted = primaryPrefs.edit().clear().also { editor ->
+                        copyPreferences(sharedPrefs, editor)
+                    }.putBoolean(KEY_PRIMARY_STORAGE_INITIALIZED, true).commit()
+                    check(adopted) { "Failed to adopt the legacy LSPosed rule store" }
+                }
+            }
+            if (
                 !primaryMarkerPresent &&
                 privateMarkerPresent &&
                 !sharedStore.frameworkBacked
@@ -124,7 +151,9 @@ class RuleRepository(context: Context) {
             ) {
                 "Failed to persist the private rule lifecycle marker"
             }
-            syncSharedMirrorLocked(primaryPrefs)
+            if (MigrationStorageGate.maySynchronizeMirror(appContext)) {
+                syncSharedMirrorLocked(primaryPrefs)
+            }
             return primaryPrefs
         }
     }
@@ -279,6 +308,147 @@ class RuleRepository(context: Context) {
         .orEmpty() + getGroups().flatMap(AppGroup::packageNames)
 
     fun rulesetGeneration(): Long = prefs.getLong(KEY_RULESET_GENERATION, 0L)
+
+    fun exportPortableBackup(
+        sourceVersionName: String,
+        sourceVersionCode: Int,
+        createdAtMillis: Long = System.currentTimeMillis(),
+    ): PortableBackupV1 {
+        val portableRules = knownPackages()
+            .asSequence()
+            .filter(PackageNamePolicy::isValid)
+            .filterNot { it == appContext.packageName }
+            .map(::getRule)
+            .filter(AppRule::hasPersonalConfiguration)
+            .sortedBy(AppRule::packageName)
+            .toList()
+        val settings = getGlobalSettings()
+        return PortableBackupV1(
+            createdAtMillis = createdAtMillis,
+            sourceVersionName = sourceVersionName,
+            sourceVersionCode = sourceVersionCode,
+            rules = portableRules,
+            groups = getGroups(),
+            settings = PortableGlobalSettings(
+                exitWarningEnabled = settings.exitWarningEnabled,
+                fullScreenExitWarningEnabled = settings.fullScreenExitWarningEnabled,
+                exitWarningVibrationEnabled = settings.exitWarningVibrationEnabled,
+                languageMode = settings.languageMode,
+                themeMode = settings.themeMode,
+                themeColor = settings.themeColor,
+                timeQuotesEnabled = settings.timeQuotesEnabled,
+                builtInTimeQuotesEnabled = settings.builtInTimeQuotesEnabled,
+                customTimeQuotes = settings.customTimeQuotes,
+                automaticUpdateCheckEnabled = settings.automaticUpdateCheckEnabled,
+                extensionSeconds = settings.extensionSeconds,
+                diagnosticsEnabled = settings.diagnosticsEnabled,
+                usageStatsEnabled = settings.usageStatsEnabled,
+            ),
+        )
+    }
+
+    /** Removes one retained app configuration, including membership in an imported group. */
+    fun deletePortableConfiguration(packageName: String): Boolean {
+        if (!PackageNamePolicy.isValid(packageName) || packageName == appContext.packageName) {
+            return false
+        }
+        val group = groupForPackage(packageName)
+        if (group != null && !saveGroup(group.copy(packageNames = group.packageNames - packageName))) {
+            return false
+        }
+        // Saving an empty rule keeps a monotonic tombstone for already-running Hook processes,
+        // while configuredPackages()/portable exports no longer treat it as active configuration.
+        return save(AppRule(packageName = packageName))
+    }
+
+    /** Atomically replaces portable configuration while retaining device security and engine state. */
+    fun replacePortableConfiguration(backup: PortableBackupV1): Boolean {
+        val normalized = PortableBackupPolicy.normalize(backup)
+        if (
+            PortableBackupPolicy.validate(normalized, appContext.packageName) !is
+            PortableBackupValidationResult.Valid
+        ) return false
+        synchronized(STORAGE_LIFECYCLE_LOCK) {
+            val current = getGlobalSettings()
+            val previousGeneration = rulesetGeneration()
+            val nextGeneration = MonotonicVersionPolicy.next(
+                previousVersion = previousGeneration,
+                wallClockMillis = System.currentTimeMillis(),
+            )
+            val nextModeGeneration = MonotonicVersionPolicy.next(
+                previousVersion = current.protectionModeGeneration,
+                wallClockMillis = System.currentTimeMillis(),
+            )
+            val groupMembers = normalized.groups.flatMapTo(mutableSetOf(), AppGroup::packageNames)
+            val packages = (normalized.rules.map(AppRule::packageName) + groupMembers).toSet()
+            val editor = prefs.edit().clear()
+                .putBoolean(KEY_PRIMARY_STORAGE_INITIALIZED, true)
+                .putBoolean(KEY_SHARED_STORAGE_INITIALIZED, true)
+                .putLong(KEY_RULESET_GENERATION, nextGeneration)
+                .putStringSet(KEY_PACKAGES, packages)
+                .putStringSet(KEY_GROUP_IDS, normalized.groups.mapTo(mutableSetOf(), AppGroup::id))
+
+            normalized.rules.forEach { rule ->
+                writeRule(editor, rule, nextGeneration)
+            }
+            normalized.groups.forEach { group ->
+                writeGroup(editor, group, nextGeneration)
+            }
+            writePortableAndDeviceSettings(
+                editor = editor,
+                portable = normalized.settings,
+                device = current,
+                protectionModeGeneration = nextModeGeneration,
+            )
+            if (!editor.commit()) return false
+            if (!lifecyclePrefs.edit().putBoolean(KEY_PRIVATE_STORAGE_INITIALIZED, true).commit()) {
+                return false
+            }
+            makePreferencesReadable()
+            packages.forEach(::grantRuleAccess)
+            return true
+        }
+    }
+
+    fun isLegacyMigrationAuthorityConfirmed(): Boolean {
+        val primaryReady = primaryPrefs.getBoolean(KEY_PRIMARY_STORAGE_INITIALIZED, false)
+        val sharedReady = runCatching {
+            sharedPrefs.getBoolean(KEY_SHARED_STORAGE_INITIALIZED, false)
+        }.getOrDefault(false)
+        val mode = getGlobalSettings().protectionMode
+        return primaryReady && (
+            mode != ProtectionMode.XPOSED ||
+                (sharedStore.frameworkBacked && sharedReady) ||
+                configuredPackages().isEmpty()
+            )
+    }
+
+    internal fun exportMigrationSnapshot(): Map<String, *> = prefs.all
+        .filterKeys { key -> !key.contains(".runtime_") }
+        .toMap()
+
+    internal fun rawAuthoritativeSnapshot(): Map<String, *> = prefs.all.toMap()
+
+    internal fun replaceRawAuthoritativeSnapshot(values: Map<String, *>): Boolean =
+        synchronized(STORAGE_LIFECYCLE_LOCK) {
+            val editor = prefs.edit().clear()
+            copyPreferences(values, editor)
+            val previousGeneration = values[KEY_RULESET_GENERATION] as? Long ?: 0L
+            val nextGeneration = MonotonicVersionPolicy.next(
+                previousVersion = previousGeneration,
+                wallClockMillis = System.currentTimeMillis(),
+            )
+            val committed = editor
+                .putBoolean(KEY_PRIMARY_STORAGE_INITIALIZED, true)
+                .putBoolean(KEY_SHARED_STORAGE_INITIALIZED, true)
+                .putLong(KEY_RULESET_GENERATION, nextGeneration)
+                .commit()
+            if (committed) {
+                lifecyclePrefs.edit().putBoolean(KEY_PRIVATE_STORAGE_INITIALIZED, true).commit()
+                makePreferencesReadable()
+            }
+            committed
+        }
 
     fun getGroups(): List<AppGroup> = prefs.getStringSet(KEY_GROUP_IDS, emptySet())
         .orEmpty()
@@ -751,6 +921,96 @@ class RuleRepository(context: Context) {
         legacyShizukuEnabled = prefs.getBoolean(KEY_SHIZUKU_ENHANCEMENT_ENABLED, false),
     )
 
+    private fun writeRule(
+        editor: SharedPreferences.Editor,
+        rule: AppRule,
+        version: Long,
+    ) {
+        val prefix = prefix(rule.packageName)
+        val windows = rule.scheduleWindows.filter(ScheduleWindow::isValid).take(ScheduleCodec.MAX_WINDOWS)
+        val scheduleEnabled = rule.scheduleEnabled && windows.isNotEmpty()
+        val cooldownEnabled = rule.cooldownEnabled &&
+            CooldownPolicy.canEnable(rule.dailyEnabled, rule.perLaunchEnabled)
+        editor
+            .putBoolean("${prefix}enabled", rule.enabled && (rule.dailyEnabled || rule.perLaunchEnabled || scheduleEnabled))
+            .putBoolean("${prefix}session_planning_enabled", rule.sessionPlanningEnabled)
+            .putBoolean("${prefix}daily_enabled", rule.dailyEnabled)
+            .putLong("${prefix}daily_limit_seconds", rule.dailyLimitSeconds)
+            .putBoolean("${prefix}per_launch_enabled", rule.perLaunchEnabled)
+            .putLong("${prefix}per_launch_limit_seconds", rule.perLaunchLimitSeconds)
+            .putBoolean("${prefix}schedule_enabled", scheduleEnabled)
+            .putString("${prefix}schedule_mode", rule.scheduleMode.name)
+            .putString("${prefix}schedule_windows", ScheduleCodec.encode(windows))
+            .putBoolean("${prefix}cooldown_enabled", cooldownEnabled)
+            .putLong("${prefix}cooldown_seconds", rule.cooldownSeconds)
+            .putLong("${prefix}limit_seconds", if (rule.dailyEnabled) rule.dailyLimitSeconds else rule.perLaunchLimitSeconds)
+            .putString("${prefix}mode", if (rule.dailyEnabled) RuleMode.DAILY.name else RuleMode.PER_LAUNCH.name)
+            .putLong("${prefix}version", version)
+    }
+
+    private fun writeGroup(
+        editor: SharedPreferences.Editor,
+        group: AppGroup,
+        version: Long,
+    ) {
+        val prefix = groupPrefix(group.id)
+        val windows = group.scheduleWindows.filter(ScheduleWindow::isValid).take(ScheduleCodec.MAX_WINDOWS)
+        val scheduleEnabled = group.scheduleEnabled && windows.isNotEmpty()
+        val cooldownEnabled = group.cooldownEnabled &&
+            CooldownPolicy.canEnable(group.dailyEnabled, group.perLaunchEnabled)
+        val effectiveEnabled = group.enabled && group.packageNames.isNotEmpty() &&
+            (group.dailyEnabled || group.perLaunchEnabled || scheduleEnabled)
+        editor
+            .putString("${prefix}name", group.name.trim().take(MAX_GROUP_NAME_LENGTH))
+            .putBoolean("${prefix}enabled", effectiveEnabled)
+            .putBoolean("${prefix}daily_enabled", group.dailyEnabled)
+            .putLong("${prefix}daily_limit_seconds", group.dailyLimitSeconds)
+            .putBoolean("${prefix}per_launch_enabled", group.perLaunchEnabled)
+            .putLong("${prefix}per_launch_limit_seconds", group.perLaunchLimitSeconds)
+            .putBoolean("${prefix}schedule_enabled", scheduleEnabled)
+            .putString("${prefix}schedule_mode", group.scheduleMode.name)
+            .putString("${prefix}schedule_windows", ScheduleCodec.encode(windows))
+            .putBoolean("${prefix}cooldown_enabled", cooldownEnabled)
+            .putLong("${prefix}cooldown_seconds", group.cooldownSeconds)
+            .putStringSet("${prefix}packages", group.packageNames)
+            .putLong("${prefix}version", version)
+        group.packageNames.forEach { packageName ->
+            editor
+                .putString("$KEY_PACKAGE_GROUP_PREFIX$packageName", group.id)
+                .putLong("$KEY_PACKAGE_GROUP_VERSION_PREFIX$packageName", version)
+        }
+    }
+
+    private fun writePortableAndDeviceSettings(
+        editor: SharedPreferences.Editor,
+        portable: PortableGlobalSettings,
+        device: GlobalSettings,
+        protectionModeGeneration: Long,
+    ) {
+        editor
+            .putBoolean(KEY_CHILD_LOCK_ENABLED, device.childLockEnabled)
+            .putBoolean(KEY_EXIT_WARNING_ENABLED, portable.exitWarningEnabled)
+            .putBoolean(KEY_FULL_SCREEN_EXIT_WARNING_ENABLED, portable.fullScreenExitWarningEnabled)
+            .putBoolean(KEY_EXIT_WARNING_VIBRATION_ENABLED, portable.exitWarningVibrationEnabled)
+            .putString(KEY_LANGUAGE_MODE, portable.languageMode.name)
+            .putString(KEY_THEME_MODE, portable.themeMode.name)
+            .putString(KEY_THEME_COLOR, portable.themeColor.name)
+            .putBoolean(KEY_TIME_QUOTES_ENABLED, portable.timeQuotesEnabled)
+            .putBoolean(KEY_BUILT_IN_TIME_QUOTES_ENABLED, portable.builtInTimeQuotesEnabled)
+            .putString(KEY_CUSTOM_TIME_QUOTES, TimeQuotePolicy.encode(portable.customTimeQuotes))
+            .putBoolean(KEY_AUTOMATIC_UPDATE_CHECK_ENABLED, portable.automaticUpdateCheckEnabled)
+            .putString(KEY_PROTECTION_MODE, device.protectionMode.name)
+            .putLong(KEY_PROTECTION_MODE_GENERATION, protectionModeGeneration)
+            .putBoolean(KEY_NON_ROOT_PROTECTION_ENABLED, device.protectionMode.usesNonRoot)
+            .putString(KEY_NON_ROOT_COMPATIBILITY_MODE, device.nonRootCompatibilityMode.name)
+            .putBoolean(KEY_SHIZUKU_ENHANCEMENT_ENABLED, device.protectionMode.usesShizuku)
+            .putLong(KEY_EXTENSION_SECONDS, portable.extensionSeconds)
+            .putBoolean(KEY_DIAGNOSTICS_ENABLED, portable.diagnosticsEnabled)
+            .putBoolean(KEY_LAUNCHER_ICON_HIDDEN, device.launcherIconHidden)
+            .putBoolean(KEY_USAGE_STATS_ENABLED, portable.usageStatsEnabled)
+            .putString(KEY_LIMIT_ENFORCEMENT_MODE, device.limitEnforcementMode.name)
+    }
+
     fun grantRuleAccess(packageName: String): Boolean {
         if (!PackageNamePolicy.isValid(packageName) || packageName == appContext.packageName) {
             return false
@@ -783,27 +1043,35 @@ class RuleRepository(context: Context) {
     private fun makePreferencesReadable() {
         synchronized(STORAGE_LIFECYCLE_LOCK) {
             if (prefs === primaryPrefs) {
-                syncSharedMirrorLocked(primaryPrefs)
+                if (MigrationStorageGate.maySynchronizeMirror(appContext)) {
+                    syncSharedMirrorLocked(primaryPrefs)
+                }
             } else {
                 makeLegacyPreferencesReadable()
             }
         }
     }
 
-    private fun syncSharedMirrorLocked(source: SharedPreferences) {
+    internal fun synchronizeAuthoritativeMirrorForMigration(): Boolean =
+        synchronized(STORAGE_LIFECYCLE_LOCK) {
+            syncSharedMirrorLocked(primaryPrefs)
+        }
+
+    private fun syncSharedMirrorLocked(source: SharedPreferences): Boolean {
         val primarySnapshot = source.all
         val sharedSnapshot = runCatching { sharedPrefs.all }.getOrNull()
         if (sharedSnapshot == primarySnapshot) {
             makeLegacyPreferencesReadable()
-            return
+            return true
         }
         val synchronized = runCatching {
             val editor = sharedPrefs.edit().clear()
             copyPreferences(primarySnapshot, editor)
             editor.commit()
         }.getOrDefault(false)
-        if (!synchronized) return
+        if (!synchronized) return false
         makeLegacyPreferencesReadable()
+        return true
     }
 
     private fun makeLegacyPreferencesReadable() {
@@ -883,6 +1151,27 @@ class RuleRepository(context: Context) {
         const val KEY_RULESET_GENERATION = "storage.ruleset_generation"
         const val PREFS_NAME = "rules"
         const val KEY_PACKAGES = "configured_packages"
+
+        /** True when this package already had a rule store before the current APK was installed. */
+        internal fun hadPriorRuleStorage(context: Context): Boolean = runCatching {
+            val app = context.applicationContext
+            val lifecycle = app.getSharedPreferences(
+                STORAGE_LIFECYCLE_PREFS_NAME,
+                Context.MODE_PRIVATE,
+            )
+            val primary = app.getSharedPreferences(
+                PRIMARY_PREFS_NAME,
+                Context.MODE_PRIVATE,
+            )
+            lifecycle.getBoolean(KEY_PRIVATE_STORAGE_INITIALIZED, false) ||
+                primary.getBoolean(KEY_PRIMARY_STORAGE_INITIALIZED, false) ||
+                runCatching {
+                    app.getSharedPreferences(
+                        PREFS_NAME,
+                        Context.MODE_WORLD_READABLE,
+                    ).getBoolean(KEY_SHARED_STORAGE_INITIALIZED, false)
+                }.getOrDefault(false)
+        }.getOrDefault(false)
         const val KEY_GROUP_IDS = "group_ids"
         const val KEY_PACKAGE_GROUP_PREFIX = "package_group."
         const val KEY_PACKAGE_GROUP_VERSION_PREFIX = "package_group_version."

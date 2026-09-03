@@ -45,6 +45,19 @@ object UpdateChecker {
         }
     }
 
+    fun checkModernUpgrade(context: Context, callback: (UpdateCheckResult) -> Unit) {
+        val english = isEnglish(context)
+        thread(name = "github-modern-upgrade-check", isDaemon = true) {
+            val result = runCatching { requestModernMigrationRelease(english) }
+                .getOrElse {
+                    UpdateCheckResult.Error(
+                        it.message ?: if (english) "Unable to find the Modern upgrade" else "暂时找不到 Modern 升级版本",
+                    )
+                }
+            Handler(Looper.getMainLooper()).post { callback(result) }
+        }
+    }
+
     fun download(context: Context, release: ReleaseInfo): Long {
         val english = isEnglish(context)
         require(isTrustedReleaseAssetUrl(release.apkDownloadUrl)) {
@@ -127,11 +140,57 @@ object UpdateChecker {
         }
     }
 
+    private fun requestModernMigrationRelease(english: Boolean): UpdateCheckResult {
+        val connection = (URL(RELEASES_API).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10_000
+            readTimeout = 15_000
+            setRequestProperty("Accept", "application/vnd.github+json")
+            setRequestProperty("X-GitHub-Api-Version", "2022-11-28")
+            setRequestProperty("User-Agent", "AppTimeLimiter/${BuildConfig.VERSION_NAME}")
+        }
+        return try {
+            if (connection.responseCode !in 200..299) error("GitHub HTTP ${connection.responseCode}")
+            val releases = JSONArray(connection.inputStream.bufferedReader().use { it.readText() })
+            val release = (0 until releases.length())
+                .asSequence()
+                .map(releases::getJSONObject)
+                .firstOrNull { value ->
+                    !value.optBoolean("draft", false) &&
+                        versionParts(value.optString("tag_name")) == versionParts(MODERN_VERSION)
+                }
+                ?: return UpdateCheckResult.UpToDate(BuildConfig.VERSION_NAME)
+            val assets = release.optJSONArray("assets") ?: JSONArray()
+            val apkAsset = (0 until assets.length())
+                .asSequence()
+                .map(assets::getJSONObject)
+                .firstOrNull {
+                    isPublishableApkAsset(it.optString("name")) &&
+                        isTrustedReleaseAssetUrl(it.optString("browser_download_url"))
+                }
+                ?: return UpdateCheckResult.Error(
+                    if (english) "The Modern release has no installable APK" else "Modern 版本没有可安装 APK",
+                )
+            UpdateCheckResult.Available(
+                ReleaseInfo(
+                    version = release.optString("tag_name", MODERN_VERSION),
+                    pageUrl = release.optString("html_url", REPOSITORY_URL),
+                    notes = release.optString("body"),
+                    apkName = apkAsset.getString("name"),
+                    apkDownloadUrl = apkAsset.getString("browser_download_url"),
+                ),
+            )
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     const val REPOSITORY_URL =
         "https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter"
     private const val RELEASES_API =
         "https://api.github.com/repos/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases?per_page=10"
     private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
+    private const val MODERN_VERSION = "0.11.14"
 
     private fun isEnglish(context: Context): Boolean = AppLocaleController.resolvedLanguage(
         context,

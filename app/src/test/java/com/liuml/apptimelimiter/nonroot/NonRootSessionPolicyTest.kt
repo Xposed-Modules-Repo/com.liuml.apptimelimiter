@@ -7,6 +7,23 @@ import org.junit.Test
 
 class NonRootSessionPolicyTest {
     @Test
+    fun `modern timed override may preserve session beyond normal background grace`() {
+        val initial = NonRootSessionPolicy.newSession("example.app", 4L)
+        val foreground = NonRootSessionPolicy.foreground(initial, "example.app", 1_000L)
+        val background = NonRootSessionPolicy.background(foreground, 2_000L)
+
+        val resumed = NonRootSessionPolicy.foreground(
+            state = background,
+            packageName = "example.app",
+            nowElapsedMillis = 90_000L,
+            protectionModeGeneration = 4L,
+            preserveExistingSession = true,
+        )
+
+        assertEquals(background.sessionId, resumed.sessionId)
+    }
+
+    @Test
     fun `mode generation mismatch creates a new session`() {
         val old = NonRootSessionPolicy.newSession("com.example.app", 3L)
         val resumed = NonRootSessionPolicy.foreground(

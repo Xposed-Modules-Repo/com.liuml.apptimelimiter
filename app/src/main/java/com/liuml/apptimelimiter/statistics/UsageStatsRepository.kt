@@ -20,6 +20,31 @@ class UsageStatsRepository(context: Context) {
         Context.MODE_PRIVATE,
     )
 
+    internal fun exportMigrationSnapshot(): Map<String, *> = prefs.all
+        .filterKeys { key ->
+            !key.startsWith("heartbeat.") &&
+                !key.startsWith("hook_version.") &&
+                !key.startsWith("hook_mode_generation.")
+        }
+        .toMap()
+
+    internal fun rawMigrationStorageSnapshot(): Map<String, *> = prefs.all.toMap()
+
+    internal fun importMigrationSnapshot(values: Map<String, *>): Boolean {
+        val editor = prefs.edit().clear()
+        values.forEach { (key, value) ->
+            when (value) {
+                is Boolean -> editor.putBoolean(key, value)
+                is Int -> editor.putInt(key, value)
+                is Long -> editor.putLong(key, value)
+                is Float -> editor.putFloat(key, value)
+                is String -> editor.putString(key, value)
+                is Set<*> -> editor.putStringSet(key, value.filterIsInstance<String>().toSet())
+            }
+        }
+        return editor.commit()
+    }
+
     fun record(
         packageName: String,
         durationMillis: Long,

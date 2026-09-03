@@ -1,0 +1,7 @@
+What's new
+
+- Published the legacy migration build for the two-step LSPosed upgrade path.
+- Added a private AES-GCM encrypted migration capsule for legacy rules, groups, stable usage statistics, and child-lock verification state.
+- Added atomic write-and-verify handling with fail-closed behavior when migration data cannot be confirmed.
+- Kept this bridge release on the traditional `assets/xposed_init` entry; Modern remote preferences and scope synchronization remain disabled.
+- Added migration policy, rollback, provider recovery, and data-safety coverage.

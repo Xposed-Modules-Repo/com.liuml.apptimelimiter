@@ -4,14 +4,14 @@
 
 ![Android 8.1+](https://img.shields.io/badge/Android-8.1%2B-3DDC84?logo=android&logoColor=white)
 ![LSPosed API 93+](https://img.shields.io/badge/LSPosed-API%2093%2B-5C6BC0)
-![Version 0.11.10](https://img.shields.io/badge/version-0.11.10-2E7D5B)
+![Version 0.11.13](https://img.shields.io/badge/version-0.11.13-2E7D5B)
 ![License GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
 Stock screen-time tools are usually built for reports, daily caps, and focus modes. **Time Stop** is built for people who want sharper controls: per-app quotas, per-launch timers, weekly allow/block windows, shared group budgets, cooldowns after forced exits, Hook verification, and diagnostics that show what is actually happening inside the target process.
 
 [Latest release](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed module page](https://modules.lsposed.org/module/com.liuml.apptimelimiter/) · [Obtainium](#obtainium) · [中文说明](#中文说明)
 
-Current version: `0.11.10`
+Transition builds: `0.11.13 (52)` legacy migration / `0.11.14 (53)` Modern
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -33,7 +33,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 
 | Capability | What it does |
 | --- | --- |
-| Independent app rules | Each app keeps its own enabled state, daily quota, per-launch quota, schedule windows, warning style, and cooldown behavior. |
+| Independent app rules | Each app keeps its own enabled state, daily quota, per-launch quota, schedule windows, warning style, and cooldown behavior. The launcher-app list refreshes after package changes or returning to Time Stop and also supports pull-to-refresh. |
 | App groups and shared allowance | Put multiple apps into one group with shared daily, continuous per-launch, schedule, and cooldown rules. Switching directly between members keeps one per-launch balance; leaving the group for the configured rest starts a new cycle. Group members run only the group policy. |
 | Child lock and parent override | Optionally protects rule-changing settings with a private 4–8 digit PIN. PIN derivation runs off the UI thread, repeated submissions are suppressed, and an active lockout shows a live countdown instead of freezing or closing the manager. At a hard limit, a parent can temporarily allow only the current app session. |
 | Non-root basic protection | Uses a content-blind accessibility service for foreground package changes plus Android usage access for daily calibration. An opt-in enhanced compatibility mode adds package-only content-change events for ROMs that miss normal window events; it still retrieves no nodes, text, input, or notifications and uses no foreground service or continuous polling. |
@@ -50,10 +50,10 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Delay action | Lets the user add 1-60 minutes for normal time limits while keeping schedule blocks strict. |
 | Post-exit cooldown | Blocks reopening for 1-1,440 minutes after a daily or per-launch quota event. A group uses one fixed shared cooldown window for all members; repeated openings never refresh its start or inflate limit-hit counts. Schedule denials do not start cooldown. |
 | Group sync loop | Grouped foreground apps synchronize daily and per-launch usage every 15 seconds without keeping the manager app alive. Cross-member handoff uses one persisted session and one incident ID. |
-| Hook and scope status | Reads framework and scope state through the optional libxposed service when supported, can request missing scope with framework confirmation, and keeps the current-version Hook heartbeat as the compatibility fallback. |
+| Hook and scope status | Registers the API 102 service listener at process creation, reads real scope when available, automatically requests scope for newly managed apps, and removes scope after the last personal or group rule is deleted. Framework confirmation is still required; unsupported frameworks keep the current-version Hook heartbeat fallback. |
 | Diagnostics | Logs Hook setup, rule reads, timer starts, sync events, stats writes, and limit exits so configuration problems are traceable. |
 | System-app guardrails | Third-party apps can have their target process terminated; system apps only have their UI closed. |
-| Updates and feedback | Checks GitHub Releases automatically when the manager opens (rate-limited and configurable), actively prompts for a new stable release, uses Android's download manager for APK updates, and offers email diagnostics or QQ group `1009712674` for feedback and beta participation. |
+| Updates and diagnostics | Checks GitHub Releases automatically when the manager opens (rate-limited and configurable), actively prompts for a new stable release, uses Android's download manager for APK updates, and can attach local diagnostics to an email report. |
 
 Changing a rule resets the Hook-local accumulator for that app, but Android's system usage for the current day remains part of the daily baseline when usage access is granted. That makes rule tweaking visible, not a loophole.
 
@@ -102,7 +102,8 @@ Key source files:
 Requirements: JDK 17 and Android SDK 37 (`targetSdk` remains 35).
 
 ```powershell
-.\gradlew.bat testDebugUnitTest lintDebug assembleDebug
+.\gradlew.bat testLegacyMigrationDebugUnitTest lintLegacyMigrationDebug assembleLegacyMigrationDebug
+.\gradlew.bat testModernDebugUnitTest lintModernDebug assembleModernDebug
 ```
 
 If Windows path encoding causes Kotlin or JUnit classpath errors, build from a temporary ASCII drive:
@@ -114,7 +115,8 @@ T:
 subst T: /d
 ```
 
-The debug APK is generated at `app/build/outputs/apk/debug/app-debug.apk`.
+The variant APKs are generated below `app/build/outputs/apk/legacyMigration/debug/` and
+`app/build/outputs/apk/modern/debug/`.
 
 ## Installation
 
@@ -125,9 +127,11 @@ The debug APK is generated at `app/build/outputs/apk/debug/app-debug.apk`.
 
 Time Stop checks required non-root permissions when the manager opens and when it returns from system settings. Missing accessibility or usage access is reported as inactive protection; missing Shizuku permission is reported separately while the basic restriction-page fallback remains available.
 
-When upgrading from a build that stored its only rule copy in LSPosed's redirected preferences, open Time Stop once while the module is still enabled. This performs a one-time migration to the stable private manager store. After that migration, disabling LSPosed no longer switches the manager UI to a different rule database.
+Upgrade legacy installations through `0.11.13 (52)` before installing `0.11.14 (53)`. Version 52 contains only `assets/xposed_init`; while the legacy LSPosed store is still authoritative it writes an AES-GCM encrypted capsule into app-private, no-backup storage and refreshes it after configuration or child-lock changes. Once that capsule is valid, every cold start offers the exact 0.11.14 release again. Version 53 imports the capsule before initializing Modern remote preferences or scope synchronization, then retains the consumed capsule for 30 days. A legacy upgrade without a valid capsule fails closed instead of replacing rules with an empty store.
 
-On frameworks that expose the modern service, Time Stop can read scope before the target app is opened and request missing packages through the framework confirmation UI. Older frameworks fall back to the persisted `HOOK_READY` heartbeat, so "Hook verified" means the target app has successfully loaded this module version before.
+Settings also provides a portable plaintext JSON export/import flow through Android's document picker. It previews and validates the file before atomically replacing app and group rules, preserves rules for apps not currently installed, and keeps device-specific protection settings and child lock unchanged. Portable backups contain package names and time rules, but never PIN material, statistics, diagnostics, runtime cooldowns, challenges, or temporary overrides.
+
+On frameworks that expose API 102 service access, Time Stop registers its listener when the manager process is created, reads scope before a target app opens, automatically requests missing packages after a personal rule or active group is saved, and removes packages after their last effective rule is deleted. LSPosed still shows its own approval UI, and running targets must be force-stopped and reopened after a scope change. Older or temporarily disconnected frameworks fall back to the persisted `HOOK_READY` heartbeat without reporting an unknown scope as missing.
 
 ## Distribution
 
@@ -226,7 +230,7 @@ This tool should be used only by the device owner or on explicitly authorized ma
 
 [下载最新版本](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed 模块页面](https://modules.lsposed.org/module/com.liuml.apptimelimiter/)
 
-当前版本：`0.11.10`
+当前版本：`0.11.13 (52)` 传统迁移版。Modern 版：`0.11.14 (53)`
 
 ## 它和系统屏幕时间有什么不同？
 
@@ -256,7 +260,7 @@ This tool should be used only by the device owner or on explicitly authorized ma
 | 非 Root 普通保护 | 通过无障碍服务感知前台包名，通过系统使用情况访问校准每日累计；可选“增强兼容检测”为漏发普通窗口事件的系统增加包名级内容变化事件，但仍不读取页面节点、文字、输入内容或通知，不启动前台常驻服务，也不持续轮询。 |
 | Shizuku 强停模式 | Shizuku 只负责在到限后强停已配置的第三方应用，不参与计时；未安装、未授权、服务未运行、Binder 断开或执行失败时自动回退普通限制页，不切换到 LSPosed。 |
 | 设置内保护状态 | 设置顶部同时展示所选模式、实际执行链路、明确异常和修复入口；LSPosed 未取得权威证据时显示“等待验证”而不是误报未生效，Shizuku 不可用时明确回退普通保护独立限制页。 |
-| 应用列表过滤 | 应用管理默认只显示第三方应用；需要管理系统应用时可手动开启“显示系统应用”。 |
+| 应用列表过滤 | 应用管理默认只显示第三方应用；需要管理系统应用时可手动开启“显示系统应用”。安装、卸载、更新应用或返回时停后会自动刷新，也可在应用页下拉刷新。 |
 | 每日累计限制 | 为每个应用设置 1-1440 分钟的每日额度；有“使用情况访问权限”时，以 Android 系统时长和 Hook 本地计时的较大值判定，跨零点自动重置。 |
 | 单次打开限制 | 目标应用进程首次进入前台时开始计时；进程即使仍驻留后台，只要真正离开达到所设冷静时长，也视为完成有效休息并开始新的单次轮次。短暂切换仍延续原轮次。 |
 | 本次使用计划 | 可为单个应用开启“打开时制定计划”；同一页面提供 5、10、15、30 分钟快捷选择和 1–60 分钟拖动条，默认5分钟、每次调整1分钟。LSPosed 与非 Root 共用同一界面组件，固定底栏确保退出和跳过按钮始终可见；选择超过最早剩余额度时会即时提示并禁用提交，最终提交仍再次校验。 |
@@ -264,13 +268,13 @@ This tool should be used only by the device owner or on explicitly authorized ma
 | 精确前台计时 | 仅统计 Activity 处于前台的时间，应用切到后台后暂停计时。 |
 | 到期提醒与延时 | LSPosed Hook 目标到期前 5 秒可显示与全局颜色主题一致的顶部或全屏倒计时、触发一次长震动，并提供退出应用或临时延长 1-60 分钟；纯非 Root 模式不显示这些 Hook 专属设置，本次计划在结束前 5 秒提供退出或重新计划入口。 |
 | 限制执行方式 | 设置页按引擎分别显示有效选项：LSPosed 可选“强制退出”或“独立休息页”；非 Root 普通保护可选“独立限制页”或需要 Shizuku 的“强制退出”。LSPosed 强制退出会关闭任务并结束当前 Hook 进程，但多进程应用的独立后台服务仍可能存活；需要整包强停时使用普通保护 + Shizuku。独立页跟随全局颜色和明暗主题并提供退出到桌面的按钮；Shizuku 不可用或执行失败时自动回退限制页。 |
-| 家长临时放行 | 儿童锁开启后，每次 PIN 验证可选择 1–60 分钟，默认 5 分钟且不记忆上次选择。时间到期、真正离开目标应用、息屏、进程结束或规则/模式变化时立即撤销，任一条件先到即结束。 |
+| 家长临时放行 | 儿童锁开启后，每次 PIN 验证可选择 1–60 分钟，默认 5 分钟且不记忆上次选择。Modern 版在固定截止时间前可切换其他应用后再返回，不重复限制；到期、息屏、目标进程结束或规则/模式变化仍会撤销。 |
 | 儿童锁与安全验证 | 使用私有 4–8 位 PIN 保护规则、分组和设置修改；PIN 派生不在主线程执行，失败次数递增锁定并显示实时倒计时。可选强生物识别找回，但只能重设 PIN，不能显示旧 PIN。 |
 | 语言 | 支持跟随系统、简体中文和 English，管理界面与目标应用内 Hook 提醒使用同一设置。 |
 | 外观 | 提供健康绿、宁静蓝、专注紫三套全局颜色，并分别支持跟随系统、浅色和深色；计划弹窗、全屏提醒和独立限制页还可随机显示内置或自定义时间短句。 |
 | 退出后冷却 | 每日或单次额度触发限制后，可在 1-1440 分钟内禁止再次打开。分组使用一份固定的共享冷却状态：任一成员触发后，全组看到相同剩余时间；反复打开不会刷新起点或重复统计。禁止时段拒绝不会启动冷却。 |
 | 使用统计 | 首页和统计页按需读取 Android `UsageStatsManager`，根据前台事件计算各应用时长和启动次数；熄屏会清除厂商系统遗漏的旧前台状态，“今日总使用”按所有应用前台区间的并集去重，因此不会因分屏或事件重叠而超过当天已过去的时间。 |
-| Hook 与作用域状态 | 支持的框架可通过 libxposed 服务直接读取作用域并向框架申请补充作用域；旧框架继续使用当前版本 Hook 回传作为兼容验证。 |
+| Hook 与作用域状态 | 管理进程创建时即注册 API 102 服务监听；保存个人规则、仅计划规则或启用分组后自动向 LSPosed 申请缺失作用域，删除最后一条有效规则后自动移除由时停管理的作用域。框架仍会显示确认界面，旧框架继续使用当前版本 Hook 回传作为兼容验证。 |
 | 多级规则回退 | 优先通过受控 Provider 读取规则，并提供 `XSharedPreferences` 与本地缓存回退；重启后可通过无命令、无数据的显式访问桥接恢复目标进程的包可见性。 |
 | 诊断日志 | 记录 Hook 安装、规则来源、计时开始与暂停、统计写入和限制触发，方便快速定位配置问题。 |
 | 系统安全保护 | 第三方应用到期后结束自身进程；系统应用只关闭界面，不结束系统进程，并记录开机诊断锚点。 |
@@ -347,9 +351,11 @@ subst T: /d
 
 时停会在管理界面首次打开及从系统设置返回时检查普通保护权限。无障碍状态区分“未开启”“已开启但服务未连接”和“已连接运行”，并综合系统已启用组件、系统服务列表与服务真实生命周期；无需为了刷新显示而反复开关。使用情况访问缺失时普通保护不会计时；Shizuku 未授权或未运行会单独提示，但基础独立限制页仍可继续工作。
 
-如果从“规则仅保存在 LSPosed 重定向偏好”的旧版本升级，请先保持模块启用并打开一次时停，完成向稳定私有主库的一次性迁移。迁移完成后，再关闭 LSPosed 也不会让管理界面切换到另一份空规则库。
+旧版用户必须先升级到 `0.11.13 (52)`，再安装 `0.11.14 (53)`。52 版只包含传统 `assets/xposed_init`，会在旧 LSPosed 存储仍可确认时，将规则、分组、全局设置、稳定统计和儿童锁校验状态写入应用私有、禁止备份的 AES-GCM 迁移包；迁移包就绪后，每次冷启动都会再次提示升级 Modern 版。53 版在启动 Modern Remote Preferences 和作用域同步之前导入，成功后保留迁移包30天用于故障恢复。若旧版升级未找到有效迁移包，应用会停止初始化，不会用空规则覆盖旧数据。
 
-支持现代服务的框架可在目标应用尚未打开时直接显示作用域状态，缺少作用域时可通过框架确认界面申请加入。旧版 LSPosed 会自动回退到 `HOOK_READY` 心跳验证；此时“Hook 已验证”表示目标应用曾成功加载当前版本。
+设置中的“数据与备份”可通过 Android 系统文件选择器导出、导入明文 JSON。导入会先预览和完整校验，再全量替换应用与分组规则；未安装应用的规则会保留，安装后自动激活。便携备份不包含 PIN 材料、统计、诊断、运行时冷却、挑战令牌和临时放行。
+
+支持 API 102 服务的框架可在目标应用尚未打开时直接显示作用域状态。时停会在保存有效个人规则、仅计划规则或启用分组后自动发起缺失作用域申请，并在应用失去最后一条有效规则后移除由时停同步的作用域；LSPosed 的授权确认不能绕过。作用域变化后请强停并重开正在运行的目标应用。旧版或服务暂时断开的 LSPosed 会回退到 `HOOK_READY` 心跳验证，未知状态不会误报成“未加入作用域”。
 
 ## 分发渠道
 

@@ -2,8 +2,6 @@ package com.liuml.apptimelimiter.xposed
 
 import android.media.MediaPlayer
 import android.webkit.WebView
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
 import java.util.Collections
 import java.util.WeakHashMap
 
@@ -22,6 +20,7 @@ internal data class MediaPauseResult(
  */
 internal class MediaPauseController(
     private val classLoader: ClassLoader,
+    private val constructorHookInstaller: ConstructorHookInstaller,
 ) {
     private val platformPlayers = Collections.synchronizedMap(WeakHashMap<MediaPlayer, Unit>())
     private val exoPlayers = Collections.synchronizedMap(WeakHashMap<Any, Unit>())
@@ -100,17 +99,7 @@ internal class MediaPauseController(
     private fun hookConstructors(
         targetClass: Class<*>,
         onCreated: (Any?) -> Unit,
-    ): Boolean = runCatching {
-        XposedBridge.hookAllConstructors(
-            targetClass,
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    onCreated(param.thisObject)
-                }
-            },
-        )
-        true
-    }.getOrDefault(false)
+    ): Boolean = constructorHookInstaller.hook(targetClass, onCreated)
 
     private fun <T : Any> snapshot(source: MutableMap<T, Unit>): List<T> =
         synchronized(source) { source.keys.toList() }

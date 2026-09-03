@@ -13,6 +13,7 @@ import android.os.Looper
 import android.os.IBinder
 import android.os.Parcel
 import android.os.Process
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -93,7 +94,7 @@ class AppTimeLimitHook : IXposedHookLoadPackage {
             )
             return
         }
-        if (!claimProcessHookInstallation()) {
+        if (!ProcessHookInstallationRegistry.claim()) {
             XposedBridge.log(
                 "AppTimeLimiter: HOOK_DUPLICATE_INSTALL_SKIPPED package=${lpparam.packageName} " +
                     "process=${lpparam.processName}",
@@ -103,9 +104,9 @@ class AppTimeLimitHook : IXposedHookLoadPackage {
 
         // Install lifecycle hooks for every package in the LSPosed scope. Rules are read when
         // an Activity resumes, so enabling a rule no longer depends on cross-process prefs at load time.
-        val preferences = XSharedPreferences(MODULE_PACKAGE, RuleRepository.PREFS_NAME)
-        preferences.makeWorldReadable()
-        runCatching { preferences.reload() }
+        val preferences = LegacyRulePreferences(
+            XSharedPreferences(MODULE_PACKAGE, RuleRepository.PREFS_NAME),
+        )
         val initialProtectionMode = ProtectionModePolicy.parse(
             storedValue = preferences.getString(RuleRepository.KEY_PROTECTION_MODE, null),
             legacyNonRootEnabled = preferences.getBoolean(
@@ -123,12 +124,32 @@ class AppTimeLimitHook : IXposedHookLoadPackage {
                 preferences.getString(RuleRepository.KEY_LIMIT_ENFORCEMENT_MODE, null),
             ),
         )
-        val mediaPauseController = MediaPauseController(lpparam.classLoader)
+        val logger = HookLogger { message, error ->
+            XposedBridge.log(message)
+            if (error != null) XposedBridge.log(error)
+        }
+        val mediaPauseController = MediaPauseController(
+            classLoader = lpparam.classLoader,
+            constructorHookInstaller = ConstructorHookInstaller { targetClass, onCreated ->
+                runCatching {
+                    XposedBridge.hookAllConstructors(
+                        targetClass,
+                        object : XC_MethodHook() {
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                onCreated(param.thisObject)
+                            }
+                        },
+                    )
+                    true
+                }.getOrDefault(false)
+            },
+        )
         val limiter = RuntimeLimiter(
             lpparam.packageName,
             lpparam.processName,
             preferences,
             mediaPauseController,
+            logger,
         )
         val installedEntries = mutableListOf<String>()
         val installErrors = mutableListOf<String>()
@@ -224,22 +245,15 @@ class AppTimeLimitHook : IXposedHookLoadPackage {
 
     private companion object {
         const val MODULE_PACKAGE = "com.liuml.apptimelimiter"
-        private var processHookInstallationClaimed = false
-
-        @Synchronized
-        fun claimProcessHookInstallation(): Boolean {
-            if (processHookInstallationClaimed) return false
-            processHookInstallationClaimed = true
-            return true
-        }
     }
 }
 
-private class RuntimeLimiter(
+internal class RuntimeLimiter(
     private val packageName: String,
     private val processName: String,
-    private val preferences: XSharedPreferences,
+    private val preferences: RulePreferences,
     private val mediaPauseController: MediaPauseController,
+    private val logger: HookLogger,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val processSessionId =
@@ -608,7 +622,20 @@ private class RuntimeLimiter(
             )
             return
         }
-        revokeTemporaryParentOverride(activity, "process_background")
+        val screenInteractive = activity.getSystemService(PowerManager::class.java)
+            ?.isInteractive != false
+        if (!BuildConfig.MODERN_XPOSED_ENABLED || !screenInteractive) {
+            revokeTemporaryParentOverride(
+                activity,
+                if (screenInteractive) "process_background" else "screen_off",
+            )
+        } else if (temporaryParentOverrideActive) {
+            diagnostic(
+                activity,
+                event = "TEMPORARY_OVERRIDE_PRESERVED_IN_BACKGROUND",
+                message = "Modern 定时放行保留到固定截止时间；session=$processSessionId, expiresAtElapsed=$temporaryParentOverrideExpiresAtElapsedMillis",
+            )
+        }
         parentUnlockOffered = false
         pauseSessionPlan(activity)
         detachBlockingOverlay()
@@ -3529,7 +3556,7 @@ private class RuntimeLimiter(
                 )
             }
         } else {
-            XposedBridge.log(
+            logger.log(
                 "AppTimeLimiter: HOOK_STATUS_REPORT_FAILED package=$packageName " +
                     "generation=${rule.protectionModeGeneration} " +
                     "error=${result.exceptionOrNull()?.javaClass?.simpleName ?: "provider_rejected"}",
@@ -3613,7 +3640,7 @@ private class RuntimeLimiter(
                 mainHandler.removeCallbacks(statsRetry)
                 if (!statsSuccessLogged) {
                     statsSuccessLogged = true
-                    XposedBridge.log("AppTimeLimiter: STATS_REPORT_OK package=$packageName")
+                    logger.log("AppTimeLimiter: STATS_REPORT_OK package=$packageName")
                     diagnostic(
                         context,
                         event = "STATS_REPORT_OK",
@@ -3625,10 +3652,10 @@ private class RuntimeLimiter(
 
             if (!statsFailureLogged) {
                 statsFailureLogged = true
-                XposedBridge.log(
+                logger.log(
                     "AppTimeLimiter: STATS_REPORT_FAILED package=$packageName day=$day error=${result.exceptionOrNull()?.javaClass?.simpleName ?: "provider_rejected"}",
                 )
-                result.exceptionOrNull()?.let(XposedBridge::log)
+                result.exceptionOrNull()?.let { logger.log("AppTimeLimiter: STATS_REPORT_EXCEPTION package=$packageName", it) }
                 diagnostic(
                     context,
                     level = "WARN",
@@ -4593,7 +4620,7 @@ private class RuntimeLimiter(
                     val error = result.exceptionOrNull()
                     val detail = error?.message.orEmpty()
                         .ifBlank { error?.javaClass?.simpleName ?: "ensure_failed" }
-                    XposedBridge.log(
+                    logger.log(
                         "AppTimeLimiter: RULE_PROVIDER_ACCESS_RECOVERY_FAILED package=$packageName process=$processName stage=ensure detail=${detail.take(120)}",
                     )
                     finishProviderAccessRecovery(appContext, false, detail, this)
@@ -4601,7 +4628,7 @@ private class RuntimeLimiter(
                 }
                 providerFailureLogged = false
                 val detail = result.getOrThrow()
-                XposedBridge.log(
+                logger.log(
                     "AppTimeLimiter: RULE_PROVIDER_ACCESS_RECOVERED package=$packageName process=$processName $detail",
                 )
                 finishProviderAccessRecovery(appContext, true, detail, this)
@@ -4628,7 +4655,7 @@ private class RuntimeLimiter(
                 Context.BIND_AUTO_CREATE,
             )
         }.getOrElse { error ->
-            XposedBridge.log(
+            logger.log(
                 "AppTimeLimiter: RULE_PROVIDER_ACCESS_RECOVERY_FAILED package=$packageName process=$processName stage=bind detail=${error.javaClass.simpleName}",
             )
             false
@@ -4895,7 +4922,7 @@ private class RuntimeLimiter(
                 "${it.javaClass.simpleName}:${it.message.orEmpty().take(120)}"
             } ?: providerAttempt.getOrNull()?.getString(RuleContract.KEY_MESSAGE).orEmpty()
                 .ifBlank { "empty_or_denied" }
-            XposedBridge.log(
+            logger.log(
                 "AppTimeLimiter: PROVIDER_UNAVAILABLE package=$packageName process=$processName detail=$detail fallback=XSharedPreferences/local_cache",
             )
         }
@@ -5553,7 +5580,7 @@ private class RuntimeLimiter(
         message: String,
     ) {
         if (!diagnosticsEnabled) return
-        XposedBridge.log("AppTimeLimiter: $event package=$packageName process=$processName $message")
+        logger.log("AppTimeLimiter: $event package=$packageName process=$processName $message")
         val extras = Bundle().apply {
             putString(RuleContract.KEY_LEVEL, level)
             putString(RuleContract.KEY_EVENT, event)

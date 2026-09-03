@@ -2,7 +2,7 @@
 
 Precision app-time control for Android power users who want policy, telemetry, and enforcement in the same loop.
 
-Current version: `0.11.10`
+Transition builds: `0.11.13 (52)` legacy migration / `0.11.14 (53)` Modern
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -24,7 +24,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 
 | Capability | What it does |
 | --- | --- |
-| Independent app rules | Each app keeps its own enabled state, daily quota, per-launch quota, schedule windows, warning style, and cooldown behavior. |
+| Independent app rules | Each app keeps its own enabled state, daily quota, per-launch quota, schedule windows, warning style, and cooldown behavior. The launcher-app list refreshes after package changes or returning to Time Stop and also supports pull-to-refresh. |
 | App groups and shared rules | Enable shared daily, continuous per-launch, weekly schedule, and cooldown rules for a group. Switching directly between members keeps one per-launch balance; leaving the group for the configured rest starts a new cycle. |
 | Child lock and parent override | Optionally protects rule-changing settings with a private 4–8 digit PIN. PIN derivation runs off the UI thread, repeated submissions are suppressed, and an active lockout shows a live countdown instead of freezing or closing the manager. At a hard limit, a parent can temporarily allow only the current app session. |
 | Non-root basic protection | Uses content-blind accessibility foreground events and Android usage access. An opt-in enhanced compatibility mode adds package-only content-change events for ROMs that miss normal window events; it still retrieves no nodes, text, or input and adds no foreground service or continuous polling. |
@@ -38,14 +38,14 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Foreground-only accounting | Counts only the `onResume` to `onPause` phase. Background residency does not burn the quota. |
 | Warning UI | LSPosed Hook targets can show a five-second top or full-screen warning matching the selected global color, optionally vibrate once, and offer exit or a 1-60 minute extension. Pure non-root mode hides these Hook-only settings; its session plan offers exit or replan five seconds before expiry. |
 | Enforcement mode | Settings expose only actions supported by each engine. LSPosed force-exit closes the task and terminates the current Hook process; separate background processes may survive, while package-wide force-stop requires Standard protection + Shizuku. LSPosed also offers a themed standalone break page with an exit-to-Home action. Non-root basic protection offers the same styled restriction page or Shizuku force-stop, with automatic page fallback if Shizuku is unavailable or fails. |
-| Parent temporary override | With child lock enabled, each PIN verification selects 1-60 minutes and defaults to 5 minutes without remembering the previous choice. The override ends at the earliest of its deadline, truly leaving the target app, screen-off, process end, or a rule/mode change. |
+| Parent temporary override | With child lock enabled, each PIN verification selects 1-60 minutes and defaults to 5 minutes without remembering the previous choice. In the Modern build, switching to another app and returning keeps the override until its fixed deadline; expiry, screen-off, target-process end, or a rule/mode change still invalidates it. |
 | Language | Supports system-default, Simplified Chinese, and English UI; Hook warnings use the same preference. |
 | Appearance | Offers health green, calm blue, and focus purple across all in-app and target-side surfaces, each with follow-system, light, and dark modes. Plan prompts, full-screen warnings, and restriction pages can also show built-in or custom time-reflection lines. |
 | Delay action | Lets the user add 1-60 minutes for normal time limits while keeping schedule blocks strict. |
 | Post-exit cooldown | Blocks reopening for 1-1,440 minutes after a daily or per-launch quota event. A group uses one fixed shared cooldown window for all members; repeated openings do not refresh it or inflate limit-hit counts. Schedule denials do not start cooldown. |
 | Group sync loop | Grouped foreground apps synchronize daily and per-launch usage every 15 seconds without keeping the manager app alive. Cross-member handoff uses one persisted session and one incident ID. |
 | Non-blocking system usage | Daily Android `UsageEvents` are refreshed in the module process and reused as a short-lived snapshot, avoiding a full-day scan on the target app's main thread. |
-| Hook and scope status | Reads framework and scope state through the optional libxposed service when supported, can request missing scope with framework confirmation, and keeps the current-version Hook heartbeat as the compatibility fallback. |
+| Hook and scope status | Registers the API 102 service listener at process creation, reads real scope when available, automatically requests scope for newly managed apps, and removes scope after the last personal or group rule is deleted. Framework confirmation is still required; unsupported frameworks keep the current-version Hook heartbeat fallback. |
 | Diagnostics | Logs Hook setup, rule reads, timer starts, sync events, stats writes, and limit exits so configuration problems are traceable. |
 | Usage totals | Calculates per-app time from foreground events, clears stale foreground state at screen-off, and deduplicates overlapping intervals for the daily total so it cannot exceed the elapsed part of the day. |
 | System-app guardrails | Third-party apps can have their target process terminated; system apps only have their UI closed. |
@@ -98,7 +98,8 @@ Key source files:
 Requirements: JDK 17 and Android SDK 37 (`targetSdk` remains 35).
 
 ```powershell
-.\gradlew.bat testDebugUnitTest lintDebug assembleDebug
+.\gradlew.bat testLegacyMigrationDebugUnitTest lintLegacyMigrationDebug assembleLegacyMigrationDebug
+.\gradlew.bat testModernDebugUnitTest lintModernDebug assembleModernDebug
 ```
 
 If Windows path encoding causes Kotlin or JUnit classpath errors, build from a temporary ASCII drive:
@@ -110,7 +111,8 @@ T:
 subst T: /d
 ```
 
-The debug APK is generated at `app/build/outputs/apk/debug/app-debug.apk`.
+The variant APKs are generated below `app/build/outputs/apk/legacyMigration/debug/` and
+`app/build/outputs/apk/modern/debug/`.
 
 ## Installation
 
@@ -121,9 +123,11 @@ The debug APK is generated at `app/build/outputs/apk/debug/app-debug.apk`.
 
 Time Stop checks required non-root permissions only when non-root mode has managed targets. Choosing Later suppresses the same issue combination for 72 hours, while “Do not show this type again” suppresses that signature until reminders are restored in Settings. Missing Shizuku capability never disables basic timing; enforcement falls back to the standalone restriction page.
 
-When upgrading from a build whose only rule copy lives in LSPosed's redirected preferences, open Time Stop once while the module is still enabled. This performs a one-time migration to the stable private manager store. After migration, disabling LSPosed no longer switches the manager UI to a different rule database.
+Upgrade legacy installations through `0.11.13 (52)` before installing `0.11.14 (53)`. Version 52 contains only `assets/xposed_init`; while the legacy LSPosed store is still authoritative it writes an AES-GCM encrypted capsule into app-private, no-backup storage and refreshes it after configuration or child-lock changes. Once that capsule is valid, every cold start offers the exact 0.11.14 release again. Version 53 imports the capsule before initializing Modern remote preferences or scope synchronization, then retains the consumed capsule for 30 days. If a user upgrades directly from an older version to 53 and the legacy authoritative store is still readable, 53 adopts it once and continues without requiring a data wipe. If legacy data is detected but cannot be confirmed, initialization stops rather than replacing rules with an empty store.
 
-On frameworks that expose the modern service, Time Stop can read scope before the target app is opened and request missing packages through the framework confirmation UI. Older frameworks fall back to the persisted `HOOK_READY` heartbeat, so "Hook verified" means the target app has successfully loaded this module version before.
+Settings also provides a portable plaintext JSON export/import flow through Android's document picker. It previews and validates the file before atomically replacing app and group rules, preserves rules for apps not currently installed, and keeps device-specific protection settings and child lock unchanged. Portable backups contain package names and time rules, but never PIN material, statistics, diagnostics, runtime cooldowns, challenges, or temporary overrides.
+
+On frameworks that expose API 102 service access, Time Stop registers its listener when the manager process is created, reads scope before a target app opens, automatically requests missing packages after a personal rule or active group is saved, and removes packages after their last effective rule is deleted. LSPosed still shows its own approval UI, and running targets must be force-stopped and reopened after a scope change. Older or temporarily disconnected frameworks fall back to the persisted `HOOK_READY` heartbeat without reporting an unknown scope as missing.
 
 ## Distribution
 

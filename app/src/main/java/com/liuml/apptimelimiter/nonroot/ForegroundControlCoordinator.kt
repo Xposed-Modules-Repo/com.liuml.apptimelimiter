@@ -299,7 +299,11 @@ class ForegroundControlCoordinator(
             "source=$source, eventType=$eventType, kind=$kind, previous=${previous.orEmpty()}",
         )
         if (previous != null) {
-            pauseSession(previous, nowElapsed)
+            pauseSession(
+                previous,
+                nowElapsed,
+                preserveTimedParentOverride = BuildConfig.MODERN_XPOSED_ENABLED,
+            )
             restoreInterruptedPlanPrompt(previous, "foreground_changed_to_$kind")
         }
         cancelPendingActionForForeground(packageName, kind, "foreground_changed")
@@ -399,6 +403,9 @@ class ForegroundControlCoordinator(
             packageName,
             nowElapsed,
             protectionModeGeneration = settings.protectionModeGeneration,
+            preserveExistingSession = BuildConfig.MODERN_XPOSED_ENABLED &&
+                previousState != null &&
+                packageName in activeParentOverridePackages,
         )
         if (previousState?.sessionId != resumed.sessionId) {
             planPromptAttempts.remove(packageName)
@@ -749,8 +756,12 @@ class ForegroundControlCoordinator(
         )
     }
 
-    private fun pauseSession(packageName: String, nowElapsed: Long) {
-        if (activeParentOverridePackages.remove(packageName)) {
+    private fun pauseSession(
+        packageName: String,
+        nowElapsed: Long,
+        preserveTimedParentOverride: Boolean = false,
+    ) {
+        if (!preserveTimedParentOverride && activeParentOverridePackages.remove(packageName)) {
             val sessionId = sessions[packageName]?.sessionId
                 ?: runtimeStore.loadSession(packageName)?.sessionId.orEmpty()
             if (sessionId.isNotBlank()) revokeParentOverride(packageName, sessionId)

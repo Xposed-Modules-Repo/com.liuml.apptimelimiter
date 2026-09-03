@@ -2,9 +2,11 @@ package com.liuml.apptimelimiter
 
 import android.content.Context
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
+import android.content.IntentFilter
 import android.app.TimePickerDialog
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -16,12 +18,16 @@ import android.provider.Settings
 import android.view.ContextThemeWrapper
 import android.widget.Toast
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.fragment.app.FragmentActivity
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -63,6 +69,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -115,6 +122,9 @@ import com.liuml.apptimelimiter.data.RuleRepository
 import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.data.ScheduleMode
 import com.liuml.apptimelimiter.data.ScheduleWindow
+import com.liuml.apptimelimiter.backup.PortableBackupOperationResult
+import com.liuml.apptimelimiter.backup.PortableBackupPreview
+import com.liuml.apptimelimiter.backup.PortableBackupRepository
 import com.liuml.apptimelimiter.core.GroupUsagePolicy
 import com.liuml.apptimelimiter.core.HookStatusPresentationPolicy
 import com.liuml.apptimelimiter.core.CooldownPolicy
@@ -134,6 +144,8 @@ import com.liuml.apptimelimiter.core.VersionAnnouncementPolicy
 import com.liuml.apptimelimiter.localization.AppLocaleController
 import com.liuml.apptimelimiter.localization.SupportedLanguage
 import com.liuml.apptimelimiter.localization.UiText
+import com.liuml.apptimelimiter.migration.MigrationCoordinator
+import com.liuml.apptimelimiter.migration.MigrationState
 import com.liuml.apptimelimiter.nonroot.NonRootProtectionStatusRepository
 import com.liuml.apptimelimiter.nonroot.AccessibilityRuntimeState
 import com.liuml.apptimelimiter.nonroot.NonRootHealthSnapshot
@@ -169,6 +181,8 @@ import com.liuml.apptimelimiter.ui.theme.LocalTimeStopExtendedColors
 import com.liuml.apptimelimiter.ui.theme.LocalTimeStopThemeState
 import com.liuml.apptimelimiter.ui.theme.TimeStopTheme
 import com.liuml.apptimelimiter.xposedstatus.ManagedAppHookState
+import com.liuml.apptimelimiter.xposedstatus.ScopeSyncCoordinator
+import com.liuml.apptimelimiter.xposedstatus.ScopeSyncSnapshot
 import com.liuml.apptimelimiter.xposedstatus.XposedStatusPolicy
 import com.liuml.apptimelimiter.xposedstatus.XposedStatusRepository
 import androidx.lifecycle.Lifecycle
@@ -176,25 +190,113 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import java.time.LocalDate
 import java.time.ZoneId
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+@Composable
+private fun MigrationGateScreen(
+    state: MigrationState,
+    onRetry: () -> Unit,
+) {
+    val english = Locale.getDefault().language.equals("en", ignoreCase = true)
+    val legacy = BuildConfig.LEGACY_MIGRATION_EXPORT_ENABLED
+    Surface(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 28.dp, vertical = 48.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            MaterialText(
+                text = if (legacy && english) {
+                    "Upgrade data is not ready"
+                } else if (legacy) {
+                    "需要准备升级数据"
+                } else if (english) {
+                    "Legacy data migration failed"
+                } else {
+                    "无法完成旧版数据迁移"
+                },
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(14.dp))
+            MaterialText(
+                text = if (legacy && english) {
+                    "Enable Time Stop in LSPosed, then force stop and reopen Time Stop. The Modern upgrade will remain unavailable until the migration capsule is ready."
+                } else if (legacy) {
+                    "请确认 LSPosed 中已启用时停，然后强制停止并重新打开时停。迁移完成前不会提供 Modern 版本升级。"
+                } else if (english) {
+                    "This installation was upgraded from an older version, but no valid migration capsule from 0.11.13 was found. Initialization has stopped to prevent empty data from replacing rules, language settings, or child-lock state."
+                } else {
+                    "当前安装来自旧版本，但没有找到由 0.11.13 生成的迁移数据。为避免规则、语言或儿童锁被空数据覆盖，时停已停止初始化。"
+                },
+                style = MaterialTheme.typography.bodyLarge,
+                textAlign = TextAlign.Center,
+            )
+            if (state is MigrationState.Failed) {
+                Spacer(Modifier.height(12.dp))
+                MaterialText(
+                    text = "${if (english) "Details" else "诊断"}：${state.reason.take(180)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+            Spacer(Modifier.height(24.dp))
+            Button(onClick = onRetry) {
+                MaterialText(if (english) "Check again" else "重新检测")
+            }
+        }
+    }
+}
 
 class MainActivity : FragmentActivity() {
     private val xposedStatusRepository = XposedStatusRepository.instance
     private lateinit var nonRootStatusRepository: NonRootProtectionStatusRepository
 
     override fun attachBaseContext(newBase: Context) {
-        val languageMode = runCatching {
-            RuleRepository(newBase).getGlobalSettings().languageMode
-        }.getOrDefault(AppLanguageMode.SYSTEM)
+        val migration = MigrationCoordinator.get(newBase)
+        val languageMode = if (migration.canInitializeRepositories()) {
+            runCatching { RuleRepository(newBase).getGlobalSettings().languageMode }
+                .getOrDefault(AppLanguageMode.SYSTEM)
+        } else {
+            AppLanguageMode.SYSTEM
+        }
         super.attachBaseContext(AppLocaleController.wrap(newBase, languageMode))
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        xposedStatusRepository.initialize()
+        val migrationCoordinator = MigrationCoordinator.get(this)
+        if (!migrationCoordinator.canInitializeRepositories()) {
+            setContent {
+                TimeStopTheme(AppThemeMode.SYSTEM, AppThemeColor.GREEN) {
+                    MigrationGateScreen(
+                        state = migrationCoordinator.state,
+                        onRetry = {
+                            if (BuildConfig.LEGACY_MIGRATION_EXPORT_ENABLED) {
+                                migrationCoordinator.refreshLegacyExport()
+                            } else {
+                                migrationCoordinator.initialize()
+                            }
+                            recreate()
+                        },
+                    )
+                }
+            }
+            return
+        }
+        if (BuildConfig.MODERN_XPOSED_ENABLED) {
+            xposedStatusRepository.initialize(this)
+        }
         nonRootStatusRepository = NonRootProtectionStatusRepository.get(this)
         val ruleRepository = RuleRepository(this)
         val diagnosticsRepository = DiagnosticsRepository(this)
@@ -217,8 +319,39 @@ class MainActivity : FragmentActivity() {
             }
             var themeColor by remember { mutableStateOf(initialSettings.themeColor) }
             var apps by remember { mutableStateOf<List<InstalledApp>?>(null) }
+            var appsRefreshing by remember { mutableStateOf(false) }
+            var appRefreshRevision by remember { mutableIntStateOf(0) }
+            val lifecycleOwner = LocalLifecycleOwner.current
+            DisposableEffect(lifecycleOwner) {
+                val observer = LifecycleEventObserver { _, event ->
+                    if (event == Lifecycle.Event.ON_RESUME) appRefreshRevision++
+                }
+                lifecycleOwner.lifecycle.addObserver(observer)
+                onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+            }
+            DisposableEffect(this@MainActivity) {
+                val packageReceiver = object : BroadcastReceiver() {
+                    override fun onReceive(context: Context?, intent: Intent?) {
+                        appRefreshRevision++
+                    }
+                }
+                val packageFilter = IntentFilter().apply {
+                    addAction(Intent.ACTION_PACKAGE_ADDED)
+                    addAction(Intent.ACTION_PACKAGE_REMOVED)
+                    addAction(Intent.ACTION_PACKAGE_CHANGED)
+                    addAction(Intent.ACTION_PACKAGE_REPLACED)
+                    addDataScheme("package")
+                }
+                ContextCompat.registerReceiver(
+                    this@MainActivity,
+                    packageReceiver,
+                    packageFilter,
+                    ContextCompat.RECEIVER_EXPORTED,
+                )
+                onDispose { runCatching { unregisterReceiver(packageReceiver) } }
+            }
             LaunchedEffect(Unit) {
-                apps = withContext(Dispatchers.IO) {
+                withContext(Dispatchers.IO) {
                     val reconciliation = ruleRepository.reconcileRuleAccess()
                     if (reconciliation.failedPackages.isNotEmpty()) {
                         diagnosticsRepository.append(
@@ -235,7 +368,16 @@ class MainActivity : FragmentActivity() {
                             message = "count=${reconciliation.grantedPackages.size}",
                         )
                     }
-                    installedAppsRepository.loadLaunchableApps()
+                }
+            }
+            LaunchedEffect(appRefreshRevision) {
+                appsRefreshing = true
+                try {
+                    apps = withContext(Dispatchers.IO) {
+                        installedAppsRepository.loadLaunchableApps()
+                    }
+                } finally {
+                    appsRefreshing = false
                 }
             }
             TimeStopTheme(themeMode, themeColor) {
@@ -254,6 +396,8 @@ class MainActivity : FragmentActivity() {
                         xposedStatusRepository,
                         nonRootStatusRepository,
                         childLockRepository,
+                        appsRefreshing = appsRefreshing,
+                        onRefreshApps = { appRefreshRevision++ },
                         onThemeChanged = { mode, color ->
                             themeMode = mode
                             themeColor = color
@@ -266,8 +410,10 @@ class MainActivity : FragmentActivity() {
 
     override fun onResume() {
         super.onResume()
-        xposedStatusRepository.initialize()
-        xposedStatusRepository.refresh()
+        if (BuildConfig.MODERN_XPOSED_ENABLED) {
+            xposedStatusRepository.initialize(this)
+            xposedStatusRepository.refresh()
+        }
         if (::nonRootStatusRepository.isInitialized) nonRootStatusRepository.refresh()
     }
 }
@@ -283,19 +429,85 @@ private fun TimeLimiterScreen(
     xposedStatusRepository: XposedStatusRepository,
     nonRootStatusRepository: NonRootProtectionStatusRepository,
     childLockRepository: ChildLockRepository,
+    appsRefreshing: Boolean,
+    onRefreshApps: () -> Unit,
     onThemeChanged: (AppThemeMode, AppThemeColor) -> Unit,
 ) {
     val context = LocalContext.current
     val screenScope = rememberCoroutineScope()
+    val portableBackupRepository = remember(context) { PortableBackupRepository(context) }
+    var backupPreview by remember { mutableStateOf<PortableBackupPreview?>(null) }
+    var backupStatus by remember { mutableStateOf<String?>(null) }
+    var showMissingBackupRules by remember { mutableStateOf(false) }
+    var pendingMissingBackupRuleDelete by remember { mutableStateOf<String?>(null) }
+    var backupRevision by remember { mutableIntStateOf(0) }
+    val missingBackupPackages = remember(apps, backupRevision) {
+        portableBackupRepository.missingConfiguredPackages()
+    }
+    val exportBackupLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        uri ?: return@rememberLauncherForActivityResult
+        screenScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                portableBackupRepository.export(uri)
+            }
+            backupStatus = when (result) {
+                is PortableBackupOperationResult.Success -> localizedText(
+                    context,
+                    "配置备份已导出",
+                    "Configuration backup exported",
+                )
+                is PortableBackupOperationResult.Failure -> localizedText(
+                    context,
+                    "导出失败：${result.reason}",
+                    "Export failed: ${result.reason}",
+                )
+            }
+            Toast.makeText(context, backupStatus.orEmpty(), Toast.LENGTH_LONG).show()
+        }
+    }
+    val importBackupLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        uri ?: return@rememberLauncherForActivityResult
+        screenScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                portableBackupRepository.preview(uri)
+            }
+            result.onSuccess { backupPreview = it }
+                .onFailure { error ->
+                    backupStatus = localizedText(
+                        context,
+                        "无法读取备份：${error.message.orEmpty()}",
+                        "Could not read backup: ${error.message.orEmpty()}",
+                    )
+                    Toast.makeText(context, backupStatus.orEmpty(), Toast.LENGTH_LONG).show()
+                }
+        }
+    }
+    val scopeSyncCoordinator = remember(context) { ScopeSyncCoordinator.get(context) }
+    val scopeSyncSnapshot by scopeSyncCoordinator.snapshot.collectAsState()
     val xposedSnapshot by xposedStatusRepository.snapshot.collectAsState()
     val nonRootSnapshot by nonRootStatusRepository.snapshot.collectAsState()
     val nonRootHealthSnapshot by nonRootStatusRepository.healthSnapshot.collectAsState()
     val shizukuRepository = remember(context) { ShizukuExecutionRepository.get(context) }
     val biometricRecoveryManager = remember(context) { BiometricRecoveryManager(context) }
     val shizukuState by shizukuRepository.state.collectAsState()
-    val rules = remember {
+    val appPackages = remember(apps) { apps.map(InstalledApp::packageName) }
+    val rules = remember(appPackages) {
         mutableStateMapOf<String, AppRule>().also { map ->
             apps.forEach { map[it.packageName] = repository.getRule(it.packageName) }
+        }
+    }
+    LaunchedEffect(Unit) {
+        if (BuildConfig.MODERN_XPOSED_ENABLED) {
+            scopeSyncCoordinator.initialize()
+        }
+    }
+    LaunchedEffect(appPackages) {
+        if (BuildConfig.MODERN_XPOSED_ENABLED) {
+            scopeSyncCoordinator.notifyConfigurationChanged()
         }
     }
     var search by remember { mutableStateOf("") }
@@ -315,6 +527,9 @@ private fun TimeLimiterScreen(
     var checkingUpdate by remember { mutableStateOf(false) }
     var updateResult by remember { mutableStateOf<UpdateCheckResult?>(null) }
     var pendingAutomaticUpdate by remember {
+        mutableStateOf<UpdateCheckResult.Available?>(null)
+    }
+    var pendingMigrationUpdate by remember {
         mutableStateOf<UpdateCheckResult.Available?>(null)
     }
     var selectedSection by remember { mutableStateOf(MainSection.HOME) }
@@ -367,6 +582,27 @@ private fun TimeLimiterScreen(
     var childPinSaveInProgress by remember { mutableStateOf(false) }
     var pendingChildLockAction by remember { mutableStateOf<String?>(null) }
     var pendingProtectedAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    LaunchedEffect(childLockRevision) {
+        if (childLockRevision > 0 && BuildConfig.LEGACY_MIGRATION_EXPORT_ENABLED) {
+            withContext(Dispatchers.IO) {
+                MigrationCoordinator.get(context).refreshLegacyExport()
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        if (
+            BuildConfig.LEGACY_MIGRATION_EXPORT_ENABLED &&
+            MigrationCoordinator.get(context).state is MigrationState.Ready
+        ) {
+            UpdateChecker.checkModernUpgrade(context) { result ->
+                if (result is UpdateCheckResult.Available) {
+                    pendingMigrationUpdate = result
+                }
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         val uiPreferences = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
@@ -429,10 +665,13 @@ private fun TimeLimiterScreen(
             showNonRootRepairPrompt ||
             showDonationPrompt ||
             showManagerPinPrompt ||
-            showChildPinSetup
+            showChildPinSetup ||
+            backupPreview != null ||
+            showMissingBackupRules ||
+            pendingMissingBackupRuleDelete != null
     LaunchedEffect(pendingAutomaticUpdate, anotherDialogVisible) {
         val available = pendingAutomaticUpdate ?: return@LaunchedEffect
-        if (anotherDialogVisible) return@LaunchedEffect
+        if (anotherDialogVisible || pendingMigrationUpdate != null) return@LaunchedEffect
         val promptedAt = System.currentTimeMillis()
         context.getSharedPreferences("ui", Context.MODE_PRIVATE)
             .edit()
@@ -440,6 +679,13 @@ private fun TimeLimiterScreen(
             .putLong(AUTOMATIC_UPDATE_LAST_PROMPT_AT_KEY, promptedAt)
             .apply()
         pendingAutomaticUpdate = null
+        updateResult = available
+    }
+
+    LaunchedEffect(pendingMigrationUpdate, anotherDialogVisible) {
+        val available = pendingMigrationUpdate ?: return@LaunchedEffect
+        if (anotherDialogVisible) return@LaunchedEffect
+        pendingMigrationUpdate = null
         updateResult = available
     }
 
@@ -1025,11 +1271,16 @@ private fun TimeLimiterScreen(
                 onOpenLogs = { showLogs = true },
             )
 
-            MainSection.APPS -> LazyColumn(
+            MainSection.APPS -> PullToRefreshBox(
+                isRefreshing = appsRefreshing,
+                onRefresh = onRefreshApps,
                 modifier = Modifier.fillMaxSize().padding(padding),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
                 item {
                     TextField(
                         value = search,
@@ -1113,6 +1364,7 @@ private fun TimeLimiterScreen(
                                         )
                                     }
                                     rules[app.packageName] = repository.getRule(app.packageName)
+                                    scopeSyncCoordinator.notifyConfigurationChanged()
                                     usageRevision++
                                 }
                                 if (childLockSnapshot.enabled && !managerUnlocked) {
@@ -1125,6 +1377,7 @@ private fun TimeLimiterScreen(
                         },
                     )
                 }
+            }
             }
 
             MainSection.GROUPS -> GroupManagementScreen(
@@ -1173,8 +1426,6 @@ private fun TimeLimiterScreen(
             initialRule = rules.getValue(app.packageName),
             onDismiss = { editingApp = null },
             onSave = saveRule@{ configuredRule ->
-                val newlyControlled = (configuredRule.enabled || configuredRule.sessionPlanningEnabled) &&
-                    app.packageName !in hookFeaturePackages
                 if (!repository.save(configuredRule)) {
                     Toast.makeText(
                         context,
@@ -1196,16 +1447,7 @@ private fun TimeLimiterScreen(
                     )
                 }
                 rules[app.packageName] = repository.getRule(app.packageName)
-                if (
-                    newlyControlled &&
-                    HookStatusPresentationPolicy.scopeReminderPackages(
-                        nonRootModeEnabled = nonRootModeEnabled,
-                        candidatePackages = setOf(app.packageName),
-                        states = hookStatusByPackage,
-                    ).isNotEmpty()
-                ) {
-                    scopeReminderPackages = setOf(app.packageName)
-                }
+                scopeSyncCoordinator.notifyConfigurationChanged()
                 editingApp = null
             },
         )
@@ -1219,19 +1461,9 @@ private fun TimeLimiterScreen(
             rules = rules.toMap(),
             onDismiss = { editingGroup = null },
             onSave = { updated ->
-                val newlyControlledPackages = if (updated.enabled) {
-                    updated.packageNames - enabledPackages
-                } else {
-                    emptySet()
-                }
                 if (repository.saveGroup(updated)) {
                     groups = repository.getGroups()
-                    scopeReminderPackages =
-                        HookStatusPresentationPolicy.scopeReminderPackages(
-                            nonRootModeEnabled = nonRootModeEnabled,
-                            candidatePackages = newlyControlledPackages,
-                            states = hookStatusByPackage,
-                        )
+                    scopeSyncCoordinator.notifyConfigurationChanged()
                     editingGroup = null
                     usageRevision++
                 } else {
@@ -1249,6 +1481,7 @@ private fun TimeLimiterScreen(
             onDelete = {
                 if (repository.deleteGroup(group.id)) {
                     groups = repository.getGroups()
+                    scopeSyncCoordinator.notifyConfigurationChanged()
                     editingGroup = null
                     usageRevision++
                 } else {
@@ -1295,6 +1528,9 @@ private fun TimeLimiterScreen(
             xposedTargets = xposedDiagnosticStatuses,
             xposedFrameworkConnected = xposedSnapshot.connected,
             xposedSnapshotStale = xposedSnapshot.stale,
+            scopeSyncSnapshot = scopeSyncSnapshot,
+            missingBackupPackages = missingBackupPackages,
+            backupStatus = backupStatus,
             onDismiss = {
                 repository.getGlobalSettings().let {
                     onThemeChanged(it.themeMode, it.themeColor)
@@ -1352,8 +1588,9 @@ private fun TimeLimiterScreen(
                 )
             },
             onRefreshProtectionStatus = {
-                xposedStatusRepository.initialize()
+                xposedStatusRepository.initialize(context)
                 xposedStatusRepository.refresh()
+                scopeSyncCoordinator.syncNow()
                 nonRootStatusRepository.refresh()
                 usageRevision++
                 if (repository.getGlobalSettings().diagnosticsEnabled) {
@@ -1365,7 +1602,34 @@ private fun TimeLimiterScreen(
                     )
                 }
             },
-            onRequestScope = { packages -> scopeReminderPackages = packages },
+            onRequestScope = { packages ->
+                scopeRequestInProgress = true
+                scopeSyncCoordinator.syncNow { result ->
+                    scopeRequestInProgress = false
+                    if (result.errorMessage != null) {
+                        scopeReminderPackages = packages
+                        Toast.makeText(
+                            context,
+                            localizedText(
+                                context,
+                                "作用域同步失败：${result.errorMessage}",
+                                "Scope sync failed: ${result.errorMessage}",
+                            ),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    } else {
+                        Toast.makeText(
+                            context,
+                            localizedText(
+                                context,
+                                "作用域同步完成；运行中的目标应用需强停后重开",
+                                "Scope synchronized. Force-stop and reopen running target apps.",
+                            ),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+            },
             onRestorePermissionPrompts = {
                 context.getSharedPreferences("ui", Context.MODE_PRIVATE).edit()
                     .remove(NON_ROOT_REPAIR_SUPPRESSED_SIGNATURES_KEY)
@@ -1406,6 +1670,19 @@ private fun TimeLimiterScreen(
                 managerUnlocked = false
                 pendingChildLockAction = if (enabled) "biometric_on" else "biometric_off"
                 showManagerPinPrompt = true
+            },
+            onExportBackup = {
+                showSettings = false
+                val timestamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
+                exportBackupLauncher.launch("TimeStop-backup-$timestamp.json")
+            },
+            onImportBackup = {
+                showSettings = false
+                importBackupLauncher.launch(arrayOf("application/json", "text/json", "text/plain"))
+            },
+            onManageMissingBackupRules = {
+                showSettings = false
+                showMissingBackupRules = true
             },
             onOpenOemCompatibilitySettings = {
                 val result = OemCompatibilityNavigator.open(context)
@@ -1478,6 +1755,7 @@ private fun TimeLimiterScreen(
                     return@saveSettings
                 }
                 val savedSettings = repository.getGlobalSettings()
+                scopeSyncCoordinator.notifyConfigurationChanged()
                 if (savedSettings.protectionMode != previousSettings.protectionMode) {
                     if (savedSettings.diagnosticsEnabled) {
                         diagnosticsRepository.append(
@@ -1600,6 +1878,188 @@ private fun TimeLimiterScreen(
                     }
             },
             onOpenPage = { release -> openUrl(context, release.pageUrl) },
+        )
+    }
+
+    backupPreview?.let { preview ->
+        AlertDialog(
+            onDismissRequest = { backupPreview = null },
+            title = {
+                Text(localizedText(context, "导入配置预览", "Import configuration preview"))
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        localizedText(
+                            context,
+                            "来源：${preview.backup.sourceVersionName} (${preview.backup.sourceVersionCode})",
+                            "Source: ${preview.backup.sourceVersionName} (${preview.backup.sourceVersionCode})",
+                        ),
+                    )
+                    Text(
+                        localizedText(
+                            context,
+                            "应用规则 ${preview.backup.rules.size} 项 · 分组 ${preview.backup.groups.size} 个",
+                            "${preview.backup.rules.size} app rules · ${preview.backup.groups.size} groups",
+                        ),
+                    )
+                    Text(
+                        localizedText(
+                            context,
+                            "已安装 ${preview.installedRuleCount} 项 · 待安装 ${preview.missingRulePackages.size} 项",
+                            "${preview.installedRuleCount} installed · ${preview.missingRulePackages.size} waiting for installation",
+                        ),
+                    )
+                    Text(
+                        localizedText(
+                            context,
+                            "将替换本机 ${preview.existingRuleCount} 项有效规则和 ${preview.existingGroupCount} 个分组。儿童锁和当前保护方式不会改变。",
+                            "This replaces ${preview.existingRuleCount} active rules and ${preview.existingGroupCount} groups. Child lock and the current protection mode will not change.",
+                        ),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        backupPreview = null
+                        screenScope.launch {
+                            val result = withContext(Dispatchers.IO) {
+                                portableBackupRepository.import(preview)
+                            }
+                            backupStatus = when (result) {
+                                is PortableBackupOperationResult.Success -> localizedText(
+                                    context,
+                                    "配置导入成功",
+                                    "Configuration imported successfully",
+                                )
+                                is PortableBackupOperationResult.Failure -> localizedText(
+                                    context,
+                                    "导入失败：${result.reason}",
+                                    "Import failed: ${result.reason}",
+                                )
+                            }
+                            if (result is PortableBackupOperationResult.Success) {
+                                groups = repository.getGroups()
+                                apps.forEach { app -> rules[app.packageName] = repository.getRule(app.packageName) }
+                                backupRevision++
+                                usageRevision++
+                                scopeSyncCoordinator.notifyConfigurationChanged()
+                            }
+                            Toast.makeText(context, backupStatus.orEmpty(), Toast.LENGTH_LONG).show()
+                        }
+                    },
+                ) {
+                    Text(localizedText(context, "替换并导入", "Replace and import"))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { backupPreview = null }) {
+                    Text(localizedText(context, "取消", "Cancel"))
+                }
+            },
+        )
+    }
+
+    pendingMissingBackupRuleDelete?.let { packageName ->
+        AlertDialog(
+            onDismissRequest = {
+                pendingMissingBackupRuleDelete = null
+                showSettings = true
+            },
+            title = {
+                Text(localizedText(context, "删除待安装规则", "Delete waiting rule"))
+            },
+            text = {
+                Text(
+                    localizedText(
+                        context,
+                        "将删除 $packageName 的个人规则或分组成员关系。",
+                        "This removes the personal rule or group membership for $packageName.",
+                    ),
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val deleted = repository.deletePortableConfiguration(packageName)
+                        backupStatus = localizedText(
+                            context,
+                            if (deleted) "待安装规则已删除" else "删除失败，请重试",
+                            if (deleted) "Waiting rule deleted" else "Delete failed. Try again.",
+                        )
+                        if (deleted) {
+                            backupRevision++
+                            usageRevision++
+                            scopeSyncCoordinator.notifyConfigurationChanged()
+                        }
+                        pendingMissingBackupRuleDelete = null
+                        showSettings = true
+                    },
+                ) {
+                    Text(localizedText(context, "删除", "Delete"))
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        pendingMissingBackupRuleDelete = null
+                        showSettings = true
+                    },
+                ) {
+                    Text(localizedText(context, "取消", "Cancel"))
+                }
+            },
+        )
+    }
+
+    if (showMissingBackupRules) {
+        AlertDialog(
+            onDismissRequest = {
+                showMissingBackupRules = false
+                showSettings = true
+            },
+            title = {
+                Text(localizedText(context, "待安装应用规则", "Rules waiting for installation"))
+            },
+            text = {
+                LazyColumn(
+                    modifier = Modifier.heightIn(max = 420.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    items(missingBackupPackages.sorted(), key = { it }) { packageName ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                packageName,
+                                modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            TextButton(
+                                onClick = {
+                                    showMissingBackupRules = false
+                                    pendingMissingBackupRuleDelete = packageName
+                                },
+                            ) {
+                                Text(localizedText(context, "删除", "Delete"))
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showMissingBackupRules = false
+                        showSettings = true
+                    },
+                ) {
+                    Text(localizedText(context, "完成", "Done"))
+                }
+            },
         )
     }
 
@@ -2664,7 +3124,7 @@ private fun DashboardMetricCard(
     onClick: () -> Unit,
 ) {
     Card(
-        modifier = modifier.clickable(onClick = onClick),
+        modifier = modifier.heightIn(min = 176.dp).clickable(onClick = onClick),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
         ),
@@ -2675,8 +3135,19 @@ private fun DashboardMetricCard(
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Text(symbol, color = symbolColor, style = MaterialTheme.typography.headlineMedium)
-            Text(value, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-            Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                value,
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                label,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -2759,29 +3230,48 @@ private fun UsageStatisticsScreen(
             }
         }
         item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column {
-                    Text("今日总使用", style = MaterialTheme.typography.bodyMedium)
-                    Text(
-                        formatDashboardDuration(todayTotalMillis),
-                        style = MaterialTheme.typography.headlineMedium,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    Text(
-                        if (usageAccessGranted) {
-                            "Android 系统前台区间去重 · 无后台服务"
-                        } else {
-                            "授权后显示系统使用时长"
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+            BoxWithConstraints(Modifier.fillMaxWidth()) {
+                val compact = maxWidth < 520.dp
+                val summary: @Composable (Modifier) -> Unit = { summaryModifier ->
+                    Column(summaryModifier) {
+                        Text("今日总使用", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            formatDashboardDuration(todayTotalMillis),
+                            style = MaterialTheme.typography.headlineMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Text(
+                            if (usageAccessGranted) {
+                                "Android 系统前台区间去重 · 无后台服务"
+                            } else {
+                                "授权后显示系统使用时长"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
-                TextButton(onClick = onClear) { Text("清空模块记录") }
+                if (compact) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        summary(Modifier.fillMaxWidth())
+                        TextButton(
+                            onClick = onClear,
+                            modifier = Modifier.align(Alignment.End),
+                        ) { Text("清空模块记录") }
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        summary(Modifier.weight(1f))
+                        TextButton(onClick = onClear) { Text("清空模块记录") }
+                    }
+                }
             }
         }
         if (sorted.isEmpty()) {
@@ -3787,6 +4277,9 @@ private fun SettingsDialog(
     xposedTargets: List<TargetProtectionStatus>,
     xposedFrameworkConnected: Boolean,
     xposedSnapshotStale: Boolean,
+    scopeSyncSnapshot: ScopeSyncSnapshot,
+    missingBackupPackages: Set<String>,
+    backupStatus: String?,
     onDismiss: () -> Unit,
     onThemePreviewChange: (AppThemeMode, AppThemeColor) -> Unit,
     onDonate: () -> Unit,
@@ -3808,6 +4301,9 @@ private fun SettingsDialog(
     onDisableChildLock: () -> Unit,
     onChangeChildPin: () -> Unit,
     onSetBiometricRecovery: (Boolean) -> Unit,
+    onExportBackup: () -> Unit,
+    onImportBackup: () -> Unit,
+    onManageMissingBackupRules: () -> Unit,
     onSave: (GlobalSettings) -> Unit,
 ) {
     val context = LocalContext.current
@@ -4079,26 +4575,43 @@ private fun SettingsDialog(
                                 TextButton(onClick = onRefreshProtectionStatus) {
                                     Text("刷新状态")
                                 }
-                                if (
-                                    protectionMode == ProtectionMode.XPOSED &&
-                                    missingScopePackages.isNotEmpty()
-                                ) {
+                                if (protectionMode == ProtectionMode.XPOSED) {
                                     TextButton(
                                         onClick = {
                                             onRequestScope(
-                                                missingScopePackages,
+                                                scopeSyncSnapshot.desiredPackages.ifEmpty {
+                                                    missingScopePackages
+                                                },
                                             )
                                         },
+                                        enabled = !scopeSyncSnapshot.syncing &&
+                                            (scopeSyncSnapshot.desiredPackages.isNotEmpty() ||
+                                                missingScopePackages.isNotEmpty()),
                                     ) {
                                         Text(
-                                            if (xposedFrameworkConnected) {
-                                                "请求加入作用域"
+                                            if (scopeSyncSnapshot.syncing) {
+                                                localizedText(
+                                                    context,
+                                                    "等待作用域确认",
+                                                    "Waiting for scope confirmation",
+                                                )
                                             } else {
-                                                "查看作用域提示"
+                                                localizedText(
+                                                    context,
+                                                    "重新同步作用域",
+                                                    "Resync scope",
+                                                )
                                             },
                                         )
                                     }
                                 }
+                            }
+                            if (protectionMode == ProtectionMode.XPOSED) {
+                                Text(
+                                    scopeSyncStatusText(context, scopeSyncSnapshot),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                             }
                             if (
                                 displayedProtectionPresentation.explicitIssuePackages.isNotEmpty()
@@ -4833,6 +5346,87 @@ private fun SettingsDialog(
                 }
                 item { HorizontalDivider() }
                 item {
+                    SettingsSectionTitle(
+                        localizedText(context, "数据与备份", "Data and backup"),
+                    )
+                }
+                item {
+                    SettingsEntry(
+                        title = localizedText(context, "导出配置", "Export configuration"),
+                        description = localizedText(
+                            context,
+                            "导出明文 JSON，包含规则、分组和便携设置；不包含 PIN、统计或运行状态",
+                            "Export plaintext JSON with rules, groups, and portable settings. PIN, statistics, and runtime state are excluded.",
+                        ),
+                        action = localizedText(context, "导出 ›", "Export ›"),
+                        onClick = onExportBackup,
+                    )
+                }
+                item {
+                    SettingsEntry(
+                        title = localizedText(context, "导入配置", "Import configuration"),
+                        description = localizedText(
+                            context,
+                            "预览后全量替换当前规则；设备保护方式和儿童锁保持不变",
+                            "Preview, then replace all current rules. Device protection mode and child lock remain unchanged.",
+                        ),
+                        action = localizedText(context, "选择文件 ›", "Choose file ›"),
+                        onClick = onImportBackup,
+                    )
+                }
+                if (missingBackupPackages.isNotEmpty()) {
+                    item {
+                        Surface(
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Text(
+                                    localizedText(
+                                        context,
+                                        "待安装应用规则 ${missingBackupPackages.size} 项",
+                                        "${missingBackupPackages.size} rules waiting for app installation",
+                                    ),
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    missingBackupPackages.sorted().take(3).joinToString("\n") +
+                                        if (missingBackupPackages.size > 3) "\n…" else "",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                TextButton(onClick = onManageMissingBackupRules) {
+                                    Text(localizedText(context, "查看与删除 ›", "View and delete ›"))
+                                }
+                            }
+                        }
+                    }
+                }
+                backupStatus?.let { status ->
+                    item {
+                        Text(
+                            status,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                item {
+                    Text(
+                        localizedText(
+                            context,
+                            "备份文件是明文，可能包含受管应用包名和时间规则，请勿随意分享。",
+                            "Backup files are plaintext and may reveal managed app package names and time rules. Do not share them casually.",
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                item { HorizontalDivider() }
+                item {
                     SettingsSectionTitle("维护与支持")
                 }
                 item {
@@ -5484,6 +6078,42 @@ private fun localizedText(context: Context, chinese: String, english: String): S
     } else {
         chinese
     }
+}
+
+private fun scopeSyncStatusText(
+    context: Context,
+    snapshot: ScopeSyncSnapshot,
+): String = when {
+    !snapshot.connected || snapshot.stale -> localizedText(
+        context,
+        "框架暂不可读，将保留规则并等待服务重连；不会误报为未加入作用域。",
+        "The framework is temporarily unreadable. Rules are kept while waiting for reconnection; apps are not falsely marked out of scope.",
+    )
+    snapshot.syncing -> localizedText(
+        context,
+        "等待 LSPosed 确认作用域变更。",
+        "Waiting for LSPosed to confirm the scope change.",
+    )
+    snapshot.failedPackages.isNotEmpty() -> localizedText(
+        context,
+        "${snapshot.failedPackages.size} 个应用同步失败，可点击重新同步。",
+        "${snapshot.failedPackages.size} apps failed to sync. Tap resync to retry.",
+    )
+    snapshot.pendingPackages.isNotEmpty() -> localizedText(
+        context,
+        "${snapshot.pendingPackages.size} 个应用等待确认。拒绝后不会在同一规则集合中反复弹窗。",
+        "${snapshot.pendingPackages.size} apps are awaiting confirmation. A rejection will not repeatedly prompt for the same rule set.",
+    )
+    snapshot.desiredPackages.isEmpty() -> localizedText(
+        context,
+        "当前没有需要同步的管控应用。",
+        "There are currently no managed apps to synchronize.",
+    )
+    else -> localizedText(
+        context,
+        "作用域已同步。正在运行的目标应用需强停并重开后加载新状态。",
+        "Scope is synchronized. Force-stop and reopen running target apps to load the new state.",
+    )
 }
 
 private fun foregroundSourceLabel(

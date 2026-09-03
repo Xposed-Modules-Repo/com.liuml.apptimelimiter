@@ -10,6 +10,7 @@ import com.liuml.apptimelimiter.nonroot.ShizukuExecutionRepository
 import com.liuml.apptimelimiter.security.ChildLockRepository
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.xposedstatus.XposedStatusRepository
+import com.liuml.apptimelimiter.xposedstatus.ScopeSyncCoordinator
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -107,6 +108,9 @@ class DiagnosticsRepository(context: Context) {
             ShizukuExecutionRepository.get(appContext).state.value
         }.getOrNull()
         val xposed = runCatching { XposedStatusRepository.instance.snapshot.value }.getOrNull()
+        val scopeSync = runCatching {
+            ScopeSyncCoordinator.get(appContext).snapshot.value
+        }.getOrNull()
         val hookSummaries = runCatching {
             val packages = ruleRepository?.configuredPackages().orEmpty()
             UsageStatsRepository(appContext).summariesToday(packages)
@@ -163,6 +167,14 @@ class DiagnosticsRepository(context: Context) {
                     "${clean(it.packageName, 120)}:${it.hookVersionCode}"
                 }
                 .ifBlank { "NONE" },
+        )
+        appendLine(
+            "# scope_sync_connected=${scopeSync?.connected ?: false} " +
+                "stale=${scopeSync?.stale ?: false} syncing=${scopeSync?.syncing ?: false} " +
+                "desired=${scopeSync?.desiredPackages?.size ?: 0} " +
+                "actual=${scopeSync?.actualPackages?.size ?: 0} " +
+                "pending=${scopeSync?.pendingPackages?.size ?: 0} " +
+                "failed=${scopeSync?.failedPackages?.size ?: 0}",
         )
         val breakPage = nonRootHealth?.breakPageCompatibility
         appendLine(

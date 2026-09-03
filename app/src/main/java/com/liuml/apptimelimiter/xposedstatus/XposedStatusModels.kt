@@ -26,6 +26,33 @@ data class XposedFrameworkSnapshot(
     val errorMessage: String? = null,
 )
 
+enum class ScopeSyncPackageState {
+    SYNCED,
+    WAITING_CONFIRMATION,
+    FAILED,
+    FRAMEWORK_UNREADABLE,
+}
+
+data class ScopeSyncSnapshot(
+    val connected: Boolean = false,
+    val stale: Boolean = false,
+    val syncing: Boolean = false,
+    val desiredPackages: Set<String> = emptySet(),
+    val actualPackages: Set<String> = emptySet(),
+    val pendingPackages: Set<String> = emptySet(),
+    val failedPackages: Set<String> = emptySet(),
+    val lastError: String? = null,
+    val targetGeneration: String = "",
+    val updatedAtMillis: Long = 0L,
+) {
+    fun stateFor(packageName: String): ScopeSyncPackageState = when {
+        !connected || stale -> ScopeSyncPackageState.FRAMEWORK_UNREADABLE
+        packageName in actualPackages -> ScopeSyncPackageState.SYNCED
+        packageName in failedPackages -> ScopeSyncPackageState.FAILED
+        else -> ScopeSyncPackageState.WAITING_CONFIRMATION
+    }
+}
+
 enum class ManagedAppHookState {
     NOT_IN_SCOPE,
     IN_SCOPE_IDLE,

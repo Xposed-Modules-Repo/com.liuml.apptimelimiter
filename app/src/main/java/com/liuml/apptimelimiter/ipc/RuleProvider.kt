@@ -15,6 +15,7 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.provider.Settings
 import android.util.Base64
+import com.liuml.apptimelimiter.BuildConfig
 import com.liuml.apptimelimiter.core.BreakSessionPolicy
 import com.liuml.apptimelimiter.core.PackageNamePolicy
 import com.liuml.apptimelimiter.core.ParentOverrideDurationPolicy
@@ -36,6 +37,7 @@ import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
 import com.liuml.apptimelimiter.security.ChildLockRepository
 import com.liuml.apptimelimiter.security.ParentAuthStatus
 import com.liuml.apptimelimiter.security.ParentAuthStore
+import com.liuml.apptimelimiter.migration.MigrationCoordinator
 import java.time.LocalDate
 import java.security.SecureRandom
 import java.util.concurrent.Executors
@@ -61,6 +63,12 @@ class RuleProvider : ContentProvider() {
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
         val appContext = context ?: return Bundle().apply { putBoolean(RuleContract.KEY_OK, false) }
+        if (
+            BuildConfig.MODERN_XPOSED_ENABLED &&
+            !MigrationCoordinator.get(appContext).canInitializeRepositories()
+        ) {
+            return denied("migration_not_ready")
+        }
         val ruleRepository = RuleRepository(appContext)
         return when (method) {
             RuleContract.METHOD_ENSURE_RULE_ACCESS -> {

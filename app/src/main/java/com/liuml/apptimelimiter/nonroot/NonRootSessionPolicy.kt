@@ -49,6 +49,7 @@ object NonRootSessionPolicy {
         nowElapsedMillis: Long,
         dayToken: String = LocalDate.now().toString(),
         protectionModeGeneration: Long = state?.protectionModeGeneration ?: 0L,
+        preserveExistingSession: Boolean = false,
     ): NonRootSessionState {
         val base = state
             ?.takeIf {
@@ -56,7 +57,8 @@ object NonRootSessionPolicy {
                     it.protectionModeGeneration == protectionModeGeneration &&
                     (
                         it.foregroundStartedAtElapsedMillis > 0L ||
-                            shouldResume(it, nowElapsedMillis)
+                            shouldResume(it, nowElapsedMillis) ||
+                            preserveExistingSession
                         )
             }
             ?: newSession(packageName, protectionModeGeneration)

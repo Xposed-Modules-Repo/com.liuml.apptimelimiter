@@ -119,6 +119,25 @@ class ChildLockRepository(context: Context) {
             prefs.edit().putBoolean(KEY_BIOMETRIC_RECOVERY, enabled).commit()
         }
 
+    /** Private upgrade-only snapshot. It must never be exposed through user backups or logs. */
+    internal fun exportMigrationSnapshot(): Map<String, *> = synchronized(STORE_LOCK) {
+        prefs.all.toMap()
+    }
+
+    internal fun importMigrationSnapshot(values: Map<String, *>): Boolean = synchronized(STORE_LOCK) {
+        val editor = prefs.edit().clear()
+        values.forEach { (key, value) ->
+            when (value) {
+                is Boolean -> editor.putBoolean(key, value)
+                is Int -> editor.putInt(key, value)
+                is Long -> editor.putLong(key, value)
+                is String -> editor.putString(key, value)
+            }
+        }
+        if (!editor.commit()) return@synchronized false
+        !values.containsKey(KEY_ENABLED) || !values[KEY_ENABLED].let { it == true } || isEnabled()
+    }
+
     private fun persistAttempt(decision: PinAttemptDecision): Boolean =
         persistState(decision.state)
 
