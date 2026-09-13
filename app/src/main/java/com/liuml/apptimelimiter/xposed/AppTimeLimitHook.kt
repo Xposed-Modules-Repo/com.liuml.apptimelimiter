@@ -45,7 +45,10 @@ import com.liuml.apptimelimiter.core.SharedCooldownRecord
 import com.liuml.apptimelimiter.core.SharedGroupSessionAction
 import com.liuml.apptimelimiter.core.UsageMath
 import com.liuml.apptimelimiter.core.UsageReportingPolicy
+import com.liuml.apptimelimiter.core.UsageMilestonePolicy
+import com.liuml.apptimelimiter.core.RewardedAdPolicy
 import com.liuml.apptimelimiter.core.DailyUsageStatePolicy
+import com.liuml.apptimelimiter.core.ExtensionQuotaPolicy
 import com.liuml.apptimelimiter.core.ProcessTerminationPolicy
 import com.liuml.apptimelimiter.core.ProtectionModePolicy
 import com.liuml.apptimelimiter.core.ScheduleDecision
@@ -279,10 +282,14 @@ internal class RuntimeLimiter(
     private var providerFailureLogged = false
     private var diagnosticsEnabled = true
     private var grantedExtensionMs = 0L
+    private var extensionsUsedThisProcess = 0
     private var warningShownForExtensionMs = Long.MIN_VALUE
     private var warningVibratedForExtensionMs = Long.MIN_VALUE
     private var warningBanner: TopWarningBanner? = null
     private var warningCountdown: Runnable? = null
+    private var usageMilestoneDismiss: Runnable? = null
+    private var extensionActionGeneration = 0L
+    private var extensionActionInFlight = false
     private var sessionLaunchReported = false
     private var lastHookHeartbeatAtElapsedMillis = Long.MIN_VALUE
     private var lastHookStatusReportAtElapsedMillis = Long.MIN_VALUE
@@ -291,6 +298,7 @@ internal class RuntimeLimiter(
     private var lastUiCancelledModeGeneration = Long.MIN_VALUE
     private var statsContext: Context? = null
     private val pendingStatsByDay = linkedMapOf<String, PendingUsageBatch>()
+    private val pendingLimitHitsByIncident = linkedMapOf<String, PendingLimitHitEvent>()
     private var statsRetryCount = 0
     private var statsSuccessLogged = false
     private var statsFailureLogged = false
@@ -301,6 +309,7 @@ internal class RuntimeLimiter(
     private var loadedGroupIdentity = ""
     private var lastLoadedRule: HookRule? = null
     private var sessionPlanPromptHandled = false
+    private var sessionPlanPromptLastShownAtElapsedMillis = Long.MIN_VALUE
     private var sessionPlanRemainingMs = NOT_RUNNING
     private var sessionPlanForegroundStartedAt = NOT_RUNNING
     private var sessionPlanWarningShown = false
@@ -329,6 +338,7 @@ internal class RuntimeLimiter(
     private var parentUnlockCountdownGeneration = 0L
     private var parentAuthPoll: Runnable? = null
     private var parentAuthBootstrapPoll: Runnable? = null
+    private var extensionBootstrapPoll: Runnable? = null
     private var parentOverrideExpiry: Runnable? = null
     private var parentOverrideReturnTimeout: Runnable? = null
     private var parentAuthFailureAction: (() -> Unit)? = null
@@ -344,6 +354,7 @@ internal class RuntimeLimiter(
     private val scheduleWarningDeadline = Runnable { showScheduleWarning() }
     private val midnightDeadline = Runnable { checkMidnightRollover() }
     private val groupUsageSync = Runnable { syncGroupUsage() }
+    private val usageMilestoneDeadline = Runnable { showUsageMilestoneReminder() }
     private val statsRetry = Runnable {
         statsContext?.let(::flushUsageEvents)
     }
@@ -406,7 +417,23 @@ internal class RuntimeLimiter(
         previousActivity: Activity?,
         resumedDuringHandoff: Boolean,
     ) {
+        if (
+            sessionPlanPromptHandled &&
+            sessionPlanPromptLastShownAtElapsedMillis != Long.MIN_VALUE &&
+            SystemClock.elapsedRealtime() - sessionPlanPromptLastShownAtElapsedMillis >=
+            SESSION_PLAN_PROMPT_SUPPRESSION_MS
+        ) {
+            sessionPlanPromptHandled = false
+            sessionPlanPromptAttempts = 0
+            diagnostic(
+                activity,
+                level = "DEBUG",
+                event = "SESSION_PLAN_PROMPT_WINDOW_EXPIRED",
+                message = "本次计划提示抑制窗口已结束，允许再次制定计划",
+            )
+        }
         val rule = readRule(activity, reloadFallback = true)
+        consumePendingRewardedAd(activity, rule)
         refreshTemporaryParentOverride(activity, rule)
         if ((processWasForeground || resumedDuringHandoff) && previousActivity !== activity) {
             diagnostic(
@@ -553,6 +580,9 @@ internal class RuntimeLimiter(
         }
         if (rule.enabled && !exitScheduled) scheduleMidnightRollover(rule)
         if (rule.enabled && !exitScheduled) scheduleGroupUsageSync(rule)
+        if (rule.enabled && !exitScheduled && !parentControlActive) {
+            scheduleUsageMilestoneReminder(activity, rule)
+        }
         if (startedNow && !exitScheduled) {
             diagnostic(
                 activity,
@@ -655,6 +685,7 @@ internal class RuntimeLimiter(
         mainHandler.removeCallbacks(scheduleWarningDeadline)
         mainHandler.removeCallbacks(midnightDeadline)
         mainHandler.removeCallbacks(groupUsageSync)
+        mainHandler.removeCallbacks(usageMilestoneDeadline)
         foregroundDayToken = -1
         dismissWarning(resetForCurrentLimit = false)
         dismissScheduleWarning()
@@ -912,6 +943,7 @@ internal class RuntimeLimiter(
             }
             if (mode == SessionPlanDialogMode.INITIAL) {
                 sessionPlanPromptHandled = true
+                sessionPlanPromptLastShownAtElapsedMillis = SystemClock.elapsedRealtime()
                 sessionPlanPromptAttempts = 0
             }
             diagnostic(
@@ -1034,6 +1066,22 @@ internal class RuntimeLimiter(
             }
             return
         }
+        if (mode == SessionPlanDialogMode.REPLAN) {
+            val extension = consumeExtensionQuota(activity, rule)
+            if (!extension.accepted) {
+                if (extension.requiresAd) {
+                    launchRewardedAdPage(activity, rule)
+                } else {
+                    Toast.makeText(
+                        activity,
+                        hookText(activity, rule, "今日延时次数已用完", "Today's delay limit has been used"),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    showSessionPlanWarning()
+                }
+                return
+            }
+        }
         startSessionPlan(
             activity = activity,
             durationMillis = durationMillis,
@@ -1104,6 +1152,14 @@ internal class RuntimeLimiter(
         activity: Activity,
         delayMillis: Long = SESSION_PLAN_PROMPT_STABLE_MS,
     ) {
+        if (
+            sessionPlanPromptLastShownAtElapsedMillis != Long.MIN_VALUE &&
+            SystemClock.elapsedRealtime() - sessionPlanPromptLastShownAtElapsedMillis <
+            SESSION_PLAN_PROMPT_SUPPRESSION_MS
+        ) {
+            sessionPlanPromptHandled = true
+            return
+        }
         if (sessionPlanPromptHandled) return
         scheduleSessionPlanPrompt(
             activity = activity,
@@ -1383,6 +1439,14 @@ internal class RuntimeLimiter(
                 exitContentDescription = hookText(activity, rule, "立即退出应用", "Exit app now"),
                 onExit = { leaveTargetByUser(activity, "session_plan_warning") },
             )
+            recordUsageEvent(
+                activity = activity,
+                durationMillis = 0L,
+                launchIncrement = 0,
+                limitHitIncrement = 0,
+                incidentId = "reminder:session-plan:$processSessionId",
+                reminderIncrement = 1,
+            )
             if (!sessionPlanWarningVibrated) {
                 sessionPlanWarningVibrated = true
                 vibrateExitWarning(activity, rule)
@@ -1501,6 +1565,95 @@ internal class RuntimeLimiter(
         }
     }
 
+    private fun scheduleUsageMilestoneReminder(activity: Activity, rule: HookRule) {
+        mainHandler.removeCallbacks(usageMilestoneDeadline)
+        if (
+            !rule.usageMilestoneReminderEnabled ||
+            !rule.enabled ||
+            exitScheduled ||
+            blockingState != null ||
+            foregroundStartedAt == NOT_RUNNING ||
+            ParentControlSessionPolicy.ownsSessionUi(
+                authenticationPending = parentAuthPending,
+                overrideAwaitingResume = parentOverrideAwaitingTargetResume,
+                overrideActive = temporaryParentOverrideActive,
+            )
+        ) return
+        val used = authoritativeDailyTotalMillis(activity, rule, activeSegmentMillisForToday())
+        UsageMilestonePolicy.nextDelayMillis(used)?.let { delay ->
+            mainHandler.postDelayed(usageMilestoneDeadline, delay)
+        }
+    }
+
+    private fun showUsageMilestoneReminder() {
+        val activity = currentResumedActivity() ?: return
+        val rule = readRule(activity, reloadFallback = true)
+        if (!guardXposedUiMode(activity, rule, "usage_milestone")) return
+        if (
+            !rule.enabled ||
+            !rule.usageMilestoneReminderEnabled ||
+            exitScheduled ||
+            blockingState != null ||
+            warningBanner != null ||
+            ParentControlSessionPolicy.ownsSessionUi(
+                authenticationPending = parentAuthPending,
+                overrideAwaitingResume = parentOverrideAwaitingTargetResume,
+                overrideActive = temporaryParentOverrideActive,
+            )
+        ) return
+        val used = authoritativeDailyTotalMillis(activity, rule, activeSegmentMillisForToday())
+        val milestone = UsageMilestonePolicy.reachedIndex(used)
+        if (milestone <= 0) {
+            scheduleUsageMilestoneReminder(activity, rule)
+            return
+        }
+        val title = hookText(activity, rule, "使用时长提醒", "Usage reminder")
+        val appLabel = runCatching {
+            activity.packageManager.getApplicationLabel(activity.applicationInfo).toString()
+        }.getOrDefault(packageName)
+        val message = hookText(
+            activity,
+            rule,
+            "今天已使用 $appLabel ${formatDuration(activity, rule, milestone * UsageMilestonePolicy.INTERVAL_MILLIS)}",
+            "$appLabel has been used for ${formatDuration(activity, rule, milestone * UsageMilestonePolicy.INTERVAL_MILLIS)} today",
+        )
+        val banner = runCatching {
+            TopWarningBanner.attach(
+                activity = activity,
+                kind = WarningBannerKind.USAGE_MILESTONE,
+                title = title,
+                message = message,
+                remainingMillis = 1L,
+                maxProgressMillis = 1L,
+                fullScreen = false,
+                themeMode = rule.themeMode,
+                themeColor = rule.themeColor,
+                quote = null,
+            )
+        }.getOrNull() ?: return
+        warningBanner = banner
+        val claimed = runCatching {
+            activity.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_CLAIM_USAGE_MILESTONE_REMINDER,
+                packageName,
+                Bundle().apply {
+                    putString(RuleContract.KEY_DAY_TOKEN, LocalDate.now().toString())
+                    putInt(RuleContract.KEY_USAGE_MILESTONE_INDEX, milestone)
+                },
+            )?.getBoolean(RuleContract.KEY_OK, false) == true
+        }.getOrDefault(false)
+        if (!claimed) {
+            dismissBanner(WarningBannerKind.USAGE_MILESTONE)
+            scheduleUsageMilestoneReminder(activity, rule)
+            return
+        }
+        diagnostic(activity, event = "USAGE_MILESTONE_BANNER_SHOWN", message = "milestone=$milestone")
+        usageMilestoneDismiss = Runnable { dismissBanner(WarningBannerKind.USAGE_MILESTONE) }
+            .also { mainHandler.postDelayed(it, USAGE_MILESTONE_BANNER_DURATION_MS) }
+        scheduleUsageMilestoneReminder(activity, rule)
+    }
+
     private fun scheduleMidnightRollover(rule: HookRule) {
         mainHandler.removeCallbacks(midnightDeadline)
         if (
@@ -1589,6 +1742,7 @@ internal class RuntimeLimiter(
 
     private fun scheduleGroupUsageSync(rule: HookRule) {
         mainHandler.removeCallbacks(groupUsageSync)
+        mainHandler.removeCallbacks(usageMilestoneDeadline)
         if (
             !exitScheduled &&
             (rule.groupDailyEnabled || rule.groupPerLaunchEnabled) &&
@@ -1724,6 +1878,14 @@ internal class RuntimeLimiter(
                 exitLabel = hookText(activity, rule, "退出", "Exit"),
                 exitContentDescription = hookText(activity, rule, "立即退出应用", "Exit app now"),
                 onExit = onExpired,
+            )
+            recordUsageEvent(
+                activity = activity,
+                durationMillis = 0L,
+                launchIncrement = 0,
+                limitHitIncrement = 0,
+                incidentId = "reminder:$incidentId:$countdownGeneration",
+                reminderIncrement = 1,
             )
             val countdown = object : Runnable {
                 override fun run() {
@@ -1871,20 +2033,20 @@ internal class RuntimeLimiter(
                     activity,
                     rule,
                     when (failure) {
-                        "child_lock_disabled" -> "儿童锁尚未开启，请先在时停设置中开启"
-                        "child_lock_pin_missing" -> "儿童锁 PIN 数据不可用，请打开时停重新设置 PIN"
+                        "child_lock_disabled" -> "管控锁尚未开启，请先在时停设置中开启"
+                        "child_lock_pin_missing" -> "管控锁 PIN 数据不可用，请打开时停重新设置 PIN"
                         "hook_not_controller" -> "保护模式已经切换，请强停并重新打开目标应用"
                         "invalid_challenge_fields" -> "当前管控会话已过期，请强停并重新打开目标应用"
                         "rule_not_configured" -> "该应用的规则存储尚未同步，请打开时停重新保存规则"
-                        else -> "无法打开家长验证，请检查儿童锁设置"
+                        else -> "无法打开家长验证，请检查管控锁设置"
                     },
                     when (failure) {
-                        "child_lock_disabled" -> "Child lock is disabled in Time Stop settings."
-                        "child_lock_pin_missing" -> "Child-lock PIN data is unavailable. Set the PIN again in Time Stop."
+                        "child_lock_disabled" -> "Control Lock is disabled in Time Stop settings."
+                        "child_lock_pin_missing" -> "Control Lock PIN data is unavailable. Set the PIN again in Time Stop."
                         "hook_not_controller" -> "The protection mode changed. Force stop and reopen the target app."
                         "invalid_challenge_fields" -> "The control session is outdated. Force stop and reopen the target app."
                         "rule_not_configured" -> "The saved rule has not synchronized. Open Time Stop and save this app's rule again."
-                        else -> "Could not open parent verification. Check child-lock settings."
+                        else -> "Could not open parent verification. Check Control Lock settings."
                     },
                 ),
                 Toast.LENGTH_LONG,
@@ -1899,7 +2061,7 @@ internal class RuntimeLimiter(
         warningCountdown = null
         diagnostic(
             activity,
-            event = "PARENT_AUTH_CHALLENGE_STARTED",
+            event = "PARENT_AUTH_HANDOFF_STARTED",
             message = "reason=$reason, incident=${incidentId.take(80)}",
         )
         val intent = Intent().apply {
@@ -2257,6 +2419,7 @@ internal class RuntimeLimiter(
         mainHandler.removeCallbacks(scheduleWarningDeadline)
         mainHandler.removeCallbacks(midnightDeadline)
         mainHandler.removeCallbacks(groupUsageSync)
+        mainHandler.removeCallbacks(usageMilestoneDeadline)
         dismissWarning(resetForCurrentLimit = false)
         dismissScheduleWarning()
         val nextAllowed = formatNextTransition(activity, rule, decision)
@@ -2311,7 +2474,7 @@ internal class RuntimeLimiter(
             activity = activity,
             durationMillis = if (shouldReportUsageDuration(rule)) segmentMs else 0L,
             launchIncrement = 0,
-            limitHitIncrement = if (rule.usageStatsEnabled && incidentClaim.isNewIncident) {
+            limitHitIncrement = if (incidentClaim.isNewIncident) {
                 1
             } else {
                 0
@@ -2504,7 +2667,7 @@ internal class RuntimeLimiter(
                 activity,
                 durationMillis = 0L,
                 launchIncrement = 0,
-                limitHitIncrement = if (rule.usageStatsEnabled) 1 else 0,
+                limitHitIncrement = 1,
             )
         }
         if (incidentClaim.isNewIncident) {
@@ -2628,6 +2791,7 @@ internal class RuntimeLimiter(
                 )
                 putExtra(LimitBlockActivity.EXTRA_RULE_VERSION, state.ruleVersion)
                 putExtra(LimitBlockActivity.EXTRA_GROUP_VERSION, state.groupVersion)
+                putExtra(LimitBlockActivity.EXTRA_INCIDENT_ID, state.token)
                 putExtra(
                     LimitBlockActivity.EXTRA_COOLDOWN_ENDS_AT,
                     state.cooldownEndsAtMillis,
@@ -2666,7 +2830,7 @@ internal class RuntimeLimiter(
                 previous.reason != state.reason -> "OVERLAY_REASON_CHANGED"
                 else -> "EXTERNAL_BREAK_PAGE_UPDATED"
             },
-            message = "reason=${state.reason}, token=${state.token}",
+            message = "reason=${state.reason}, tokenPresent=${state.token.isNotBlank()}",
         )
         return true
     }
@@ -2777,6 +2941,7 @@ internal class RuntimeLimiter(
         perLaunchCommittedMs = 0L
         clearSharedGroupSessionState()
         perLaunchCycleGeneration++
+        resetRewardedAdSession(activity)
         grantedExtensionMs = 0L
         warningShownForExtensionMs = Long.MIN_VALUE
         warningVibratedForExtensionMs = Long.MIN_VALUE
@@ -2817,6 +2982,7 @@ internal class RuntimeLimiter(
         perLaunchCommittedMs = 0L
         clearSharedGroupSessionState()
         perLaunchCycleGeneration++
+        resetRewardedAdSession(activity)
         grantedExtensionMs = 0L
         warningShownForExtensionMs = Long.MIN_VALUE
         warningVibratedForExtensionMs = Long.MIN_VALUE
@@ -2853,6 +3019,27 @@ internal class RuntimeLimiter(
         sharedGroupSessionHandoffRefreshPending = false
     }
 
+    /** The Hook must never write ad state into the target app sandbox. */
+    private fun resetRewardedAdSession(activity: Activity) {
+        if (processSessionId.isBlank()) return
+        runCatching {
+            activity.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_RESET_REWARDED_AD_SESSION,
+                packageName,
+                Bundle().apply {
+                    putString(RuleContract.KEY_AD_SESSION_ID, processSessionId)
+                },
+            )
+        }.onSuccess { result ->
+            if (result?.getBoolean(RuleContract.KEY_OK, false) != true) {
+                diagnostic(activity, "WARN", "REWARDED_AD_SESSION_RESET_FAILED", "provider_rejected")
+            }
+        }.onFailure { error ->
+            diagnostic(activity, "WARN", "REWARDED_AD_SESSION_RESET_FAILED", error.javaClass.simpleName)
+        }
+    }
+
     private fun finishTarget(activity: Activity, message: String, statsPersisted: Boolean) {
         runCatching {
             // The task can disappear before the system Toast does. Keep this message short and
@@ -2878,6 +3065,70 @@ internal class RuntimeLimiter(
             mainHandler.removeCallbacks(statsRetry)
             mainHandler.postDelayed(statsRetry, FINAL_STATS_RETRY_DELAY_MS)
         }
+        val currentRule = lastLoadedRule
+        if (
+            currentRule?.protectionMode == ProtectionMode.XPOSED &&
+            currentRule.rootEnhancementEnabled
+        ) {
+            val incidentId = "xposed-root|$packageName|${processSessionId.take(80)}|${SystemClock.elapsedRealtime()}"
+            diagnostic(
+                activity,
+                event = "ROOT_AUTH_REQUESTED",
+                message = "reason=limit_execution; manager_provider=true; incident=${incidentId.take(80)}",
+            )
+            Thread {
+                val response = runCatching {
+                    activity.applicationContext.contentResolver.call(
+                        RuleContract.CONTENT_URI,
+                        RuleContract.METHOD_ROOT_FORCE_STOP_SELF,
+                        packageName,
+                        Bundle().apply {
+                            putString(RuleContract.KEY_INCIDENT_ID, incidentId)
+                            putString(RuleContract.KEY_PROCESS_SESSION_ID, processSessionId)
+                        },
+                    )
+                }.getOrNull()
+                val accepted = response?.getBoolean(RuleContract.KEY_OK, false) == true
+                val result = response?.getString(RuleContract.KEY_MESSAGE)
+                    ?.take(40)
+                    .orEmpty()
+                runCatching {
+                    diagnostic(
+                        activity,
+                        level = if (accepted) {
+                            "INFO"
+                        } else {
+                            "WARN"
+                        },
+                        event = "ROOT_FORCE_STOP_RESULT",
+                        message = "result=${if (accepted) result.ifBlank { "queued" } else "fallback"}; manager_provider=true; incident=${incidentId.take(80)}",
+                    )
+                }
+                if (accepted) {
+                    // The provider accepted a validated request. Keep the existing process exit
+                    // as fail-closed fallback while the manager-owned su command completes.
+                    runCatching {
+                        Thread.sleep(ROOT_PROCESS_KILL_GRACE_MILLIS)
+                        Process.killProcess(Process.myPid())
+                    }
+                } else {
+                    // Root is an enhancement only. Never treat an unavailable or failed Root
+                    // command as a successful release; retain the existing fail-closed exit.
+                    mainHandler.post {
+                        requestCurrentProcessTermination(activity, statsPersisted)
+                    }
+                }
+            }.apply {
+                isDaemon = true
+                name = "TimeStop-RootForceStop"
+                start()
+            }
+            return
+        }
+        requestCurrentProcessTermination(activity, statsPersisted)
+    }
+
+    private fun requestCurrentProcessTermination(activity: Activity, statsPersisted: Boolean) {
         mainHandler.postDelayed(
             {
                 diagnostic(
@@ -3010,9 +3261,11 @@ internal class RuntimeLimiter(
 
     private fun cooldownRemainingMillis(context: Context, rule: HookRule): Long {
         val nowMillis = System.currentTimeMillis()
-        val localRemaining = SharedCooldownPolicy.remainingMillis(
+        val nowElapsedMillis = SystemClock.elapsedRealtime()
+        val localRemaining = SharedCooldownPolicy.remainingMillisDual(
             localCooldownRecord(context, rule),
             nowMillis,
+            nowElapsedMillis,
         )
         val sharedRemaining = if (rule.groupEnabled && rule.groupCooldownEnabled) {
             (rule.groupCooldownEndsAtMillis - nowMillis).coerceAtLeast(0L)
@@ -3136,6 +3389,7 @@ internal class RuntimeLimiter(
             .filter(String::isNotBlank)
             .toList()
         val nowMillis = System.currentTimeMillis()
+        val nowElapsedMillis = SystemClock.elapsedRealtime()
         val claim = SharedCooldownPolicy.claim(
             existingRecord = localCooldownRecord(context, rule),
             handledIncidentIds = handled,
@@ -3144,6 +3398,7 @@ internal class RuntimeLimiter(
             occurredAtMillis = occurredAtMillis,
             durationMillis = durationMillis,
             nowMillis = nowMillis,
+            nowElapsedMillis = nowElapsedMillis,
         )
         val editor = prefs.edit()
             .putString(
@@ -3154,12 +3409,16 @@ internal class RuntimeLimiter(
             editor
                 .putLong(KEY_COOLDOWN_STARTED_AT, claim.record.startedAtMillis)
                 .putLong(KEY_COOLDOWN_ENDS_AT, claim.record.endsAtMillis)
+                .putLong(KEY_COOLDOWN_STARTED_ELAPSED_AT, nowElapsedMillis)
+                .putLong(KEY_COOLDOWN_ENDS_ELAPSED_AT, nowElapsedMillis + durationMillis)
                 .putString(KEY_COOLDOWN_INCIDENT_ID, claim.record.incidentId)
                 .putString(KEY_COOLDOWN_RULE_IDENTITY, rule.localCooldownIdentity())
         } else {
             editor
                 .remove(KEY_COOLDOWN_STARTED_AT)
                 .remove(KEY_COOLDOWN_ENDS_AT)
+                .remove(KEY_COOLDOWN_STARTED_ELAPSED_AT)
+                .remove(KEY_COOLDOWN_ENDS_ELAPSED_AT)
                 .remove(KEY_COOLDOWN_INCIDENT_ID)
                 .remove(KEY_COOLDOWN_RULE_IDENTITY)
         }
@@ -3200,6 +3459,8 @@ internal class RuntimeLimiter(
         ) return SharedCooldownRecord()
         val startedAt = prefs.getLong(KEY_COOLDOWN_STARTED_AT, 0L)
         val storedEnd = prefs.getLong(KEY_COOLDOWN_ENDS_AT, 0L)
+        val startedElapsed = prefs.getLong(KEY_COOLDOWN_STARTED_ELAPSED_AT, 0L)
+        val endsElapsed = prefs.getLong(KEY_COOLDOWN_ENDS_ELAPSED_AT, 0L)
         val migratedEnd = if (storedEnd > 0L) {
             storedEnd
         } else {
@@ -3215,6 +3476,8 @@ internal class RuntimeLimiter(
             endsAtMillis = migratedEnd,
             incidentId = prefs.getString(KEY_COOLDOWN_INCIDENT_ID, null).orEmpty(),
             sourcePackage = packageName,
+            startedAtElapsedMillis = startedElapsed,
+            endsAtElapsedMillis = endsElapsed,
         )
     }
 
@@ -3314,6 +3577,7 @@ internal class RuntimeLimiter(
         mainHandler.removeCallbacks(scheduleWarningDeadline)
         mainHandler.removeCallbacks(midnightDeadline)
         mainHandler.removeCallbacks(groupUsageSync)
+        mainHandler.removeCallbacks(usageMilestoneDeadline)
     }
 
     private fun commitActiveSegment(
@@ -3453,7 +3717,7 @@ internal class RuntimeLimiter(
             activity = activity,
             durationMillis = 0L,
             launchIncrement = 0,
-            limitHitIncrement = if (rule.usageStatsEnabled) 1 else 0,
+            limitHitIncrement = 1,
             incidentId = incidentId,
         )
 
@@ -3481,7 +3745,7 @@ internal class RuntimeLimiter(
                 activity,
                 level = "WARN",
                 event = "SCHEDULE_BLOCK_MARKER_FAILED",
-                message = "时段阻止标记写入失败，后续重复打开可能重复计数；token=$blockToken",
+                message = "时段阻止标记写入失败，后续重复打开可能重复计数；tokenPresent=${blockToken.isNotBlank()}",
             )
         }
         return ScheduleHitResult(recorded = true, statsPersisted = statsPersisted)
@@ -3494,6 +3758,7 @@ internal class RuntimeLimiter(
         limitHitIncrement: Int,
         eventDayToken: String = LocalDate.now().toString(),
         incidentId: String = "",
+        reminderIncrement: Int = 0,
     ): Boolean {
         val context = activity.applicationContext
         statsContext = context
@@ -3504,15 +3769,32 @@ internal class RuntimeLimiter(
             durationMillis.coerceAtLeast(0L),
         ).coerceAtMost(MAX_STATS_DURATION_PER_DAY_MS)
         pending.launches = safeAdd(pending.launches, launchIncrement.coerceAtLeast(0))
-        pending.limitHits = safeAdd(pending.limitHits, limitHitIncrement.coerceAtLeast(0))
+        val normalizedIncidentId = incidentId.trim().takeIf {
+            it.isNotEmpty() && it.length <= MAX_STATS_INCIDENT_ID_LENGTH &&
+                it.none { char -> char == '\n' || char == '\r' }
+        }
+        if (limitHitIncrement > 0 && normalizedIncidentId != null) {
+            pendingLimitHitsByIncident.putIfAbsent(
+                normalizedIncidentId,
+                PendingLimitHitEvent(
+                    dayToken = eventDayToken,
+                    increment = limitHitIncrement.coerceIn(1, MAX_STATS_COUNTER_INCREMENT),
+                ),
+            )
+        } else {
+            // Retain legacy aggregate events that predate incident IDs. New quota paths always
+            // use the durable event queue above, so a Provider retry remains idempotent.
+            pending.limitHits = safeAdd(pending.limitHits, limitHitIncrement.coerceAtLeast(0))
+        }
+        pending.reminders = safeAdd(pending.reminders, reminderIncrement.coerceAtLeast(0))
         persistStatsOutbox(context)
         val persisted = flushUsageEvents(context)
-        if (limitHitIncrement > 0) {
+        if (limitHitIncrement > 0 || reminderIncrement > 0) {
             diagnostic(
                 activity,
                 level = if (persisted) "INFO" else "WARN",
                 event = "STATS_LIMIT_HIT_PERSISTED",
-                message = "day=$eventDayToken, increment=$limitHitIncrement, " +
+                message = "day=$eventDayToken, limitIncrement=$limitHitIncrement, reminderIncrement=$reminderIncrement, " +
                     "incident=${incidentId.take(160)}, persisted=$persisted",
             )
         }
@@ -3579,6 +3861,25 @@ internal class RuntimeLimiter(
                     ).coerceIn(0L, MAX_STATS_DURATION_PER_DAY_MS),
                     launches = prefs.getInt("$OUTBOX_LAUNCHES.$day", 0).coerceAtLeast(0),
                     limitHits = prefs.getInt("$OUTBOX_LIMIT_HITS.$day", 0).coerceAtLeast(0),
+                    reminders = prefs.getInt("$OUTBOX_REMINDERS.$day", 0).coerceAtLeast(0),
+                )
+            }
+
+        prefs.getStringSet(OUTBOX_LIMIT_INCIDENTS, emptySet()).orEmpty()
+            .asSequence()
+            .filter {
+                it.length in 1..MAX_STATS_INCIDENT_ID_LENGTH &&
+                    it.none { char -> char == '\n' || char == '\r' }
+            }
+            .sorted()
+            .forEach { incidentId ->
+                val day = prefs.getString("$OUTBOX_LIMIT_DAY.$incidentId", null)
+                    ?.takeIf { runCatching { LocalDate.parse(it) }.isSuccess }
+                    ?: return@forEach
+                pendingLimitHitsByIncident[incidentId] = PendingLimitHitEvent(
+                    dayToken = day,
+                    increment = prefs.getInt("$OUTBOX_LIMIT_INCREMENT.$incidentId", 1)
+                        .coerceIn(1, MAX_STATS_COUNTER_INCREMENT),
                 )
             }
 
@@ -3590,6 +3891,7 @@ internal class RuntimeLimiter(
                     .coerceIn(0L, MAX_STATS_DURATION_PER_DAY_MS),
                 launches = prefs.getInt(OUTBOX_LAUNCHES, 0).coerceAtLeast(0),
                 limitHits = prefs.getInt(OUTBOX_LIMIT_HITS, 0).coerceAtLeast(0),
+                reminders = prefs.getInt(OUTBOX_REMINDERS, 0).coerceAtLeast(0),
             )
         }
         statsOutboxLoaded = true
@@ -3600,16 +3902,50 @@ internal class RuntimeLimiter(
             .edit()
             .clear()
             .putStringSet(OUTBOX_DAYS, pendingStatsByDay.keys.toSet())
+            .putStringSet(OUTBOX_LIMIT_INCIDENTS, pendingLimitHitsByIncident.keys.toSet())
         pendingStatsByDay.forEach { (day, batch) ->
             editor
                 .putLong("$OUTBOX_DURATION_MS.$day", batch.durationMillis)
                 .putInt("$OUTBOX_LAUNCHES.$day", batch.launches)
                 .putInt("$OUTBOX_LIMIT_HITS.$day", batch.limitHits)
+                .putInt("$OUTBOX_REMINDERS.$day", batch.reminders)
+        }
+        pendingLimitHitsByIncident.forEach { (incidentId, event) ->
+            editor
+                .putString("$OUTBOX_LIMIT_DAY.$incidentId", event.dayToken)
+                .putInt("$OUTBOX_LIMIT_INCREMENT.$incidentId", event.increment)
         }
         editor.commit()
     }
 
     private fun flushUsageEvents(context: Context): Boolean {
+        while (pendingLimitHitsByIncident.isNotEmpty()) {
+            val (incidentId, event) = pendingLimitHitsByIncident.entries.first()
+            val result = runCatching {
+                context.contentResolver.call(
+                    RuleContract.CONTENT_URI,
+                    RuleContract.METHOD_RECORD_USAGE,
+                    packageName,
+                    Bundle().apply {
+                        putString(RuleContract.KEY_DAY_TOKEN, event.dayToken)
+                        putInt(RuleContract.KEY_LIMIT_HIT_INCREMENT, event.increment)
+                        putString(RuleContract.KEY_USAGE_EVENT_ID, "limit:$incidentId")
+                        putInt(RuleContract.KEY_HOOK_VERSION_CODE, BuildConfig.VERSION_CODE)
+                        putLong(
+                            RuleContract.KEY_HOOK_MODE_GENERATION,
+                            lastLoadedRule?.protectionModeGeneration ?: 0L,
+                        )
+                    },
+                )
+            }
+            val persisted = result.getOrNull()?.getBoolean(RuleContract.KEY_OK, false) == true
+            if (!persisted) {
+                scheduleStatsRetry(context, "limit:$incidentId", result.exceptionOrNull())
+                return false
+            }
+            pendingLimitHitsByIncident.remove(incidentId)
+            persistStatsOutbox(context)
+        }
         while (pendingStatsByDay.isNotEmpty()) {
             val (day, batch) = pendingStatsByDay.entries.minBy { it.key }
             val extras = Bundle().apply {
@@ -3617,6 +3953,7 @@ internal class RuntimeLimiter(
                 putLong(RuleContract.KEY_DURATION_MS, batch.durationMillis)
                 putInt(RuleContract.KEY_LAUNCH_INCREMENT, batch.launches)
                 putInt(RuleContract.KEY_LIMIT_HIT_INCREMENT, batch.limitHits)
+                putInt(RuleContract.KEY_REMINDER_INCREMENT, batch.reminders)
                 putInt(RuleContract.KEY_HOOK_VERSION_CODE, BuildConfig.VERSION_CODE)
                 putLong(
                     RuleContract.KEY_HOOK_MODE_GENERATION,
@@ -3675,6 +4012,28 @@ internal class RuntimeLimiter(
         return true
     }
 
+    private fun scheduleStatsRetry(context: Context, identity: String, error: Throwable?) {
+        if (!statsFailureLogged) {
+            statsFailureLogged = true
+            logger.log(
+                "AppTimeLimiter: STATS_REPORT_FAILED package=$packageName item=$identity error=${error?.javaClass?.simpleName ?: "provider_rejected"}",
+            )
+            error?.let { logger.log("AppTimeLimiter: STATS_REPORT_EXCEPTION package=$packageName", it) }
+            diagnostic(
+                context,
+                level = "WARN",
+                event = "STATS_REPORT_FAILED",
+                message = "使用统计写入失败，将自动重试；项目=$identity；原因=${error?.javaClass?.simpleName ?: "provider_rejected"}",
+            )
+        }
+        mainHandler.removeCallbacks(statsRetry)
+        if (statsRetryCount < MAX_STATS_RETRIES) {
+            val delayMs = STATS_RETRY_DELAYS_MS[statsRetryCount]
+            statsRetryCount++
+            mainHandler.postDelayed(statsRetry, delayMs)
+        }
+    }
+
     private fun safeAdd(current: Long, increment: Long): Long =
         if (increment > Long.MAX_VALUE - current) Long.MAX_VALUE else current + increment
 
@@ -3716,6 +4075,7 @@ internal class RuntimeLimiter(
         mainHandler.removeCallbacks(scheduleWarningDeadline)
         mainHandler.removeCallbacks(midnightDeadline)
         mainHandler.removeCallbacks(groupUsageSync)
+        mainHandler.removeCallbacks(usageMilestoneDeadline)
         groupSegmentIdentity = ""
         groupSegmentBaselineDay = ""
         groupSegmentBaselineUsedMs = 0L
@@ -3775,30 +4135,78 @@ internal class RuntimeLimiter(
                     rule,
                     "quota-warning:$processSessionId:$grantedExtensionMs",
                 ),
-                actionLabel = hookText(
+                actionLabel = if (rule.extensionEnabled) hookText(
                     activity,
                     rule,
                     "延时 ${compactMinutes(rule.extensionMillis)}分",
                     "Extend ${compactMinutes(rule.extensionMillis)}m",
-                ),
-                actionContentDescription = hookText(
+                ) else null,
+                actionContentDescription = if (rule.extensionEnabled) hookText(
                     activity,
                     rule,
                     "延时 ${formatDuration(activity, rule, rule.extensionMillis)}",
                     "Extend by ${formatDuration(activity, rule, rule.extensionMillis)}",
-                ),
-                onAction = {
-                    val latest = readRule(activity, reloadFallback = true)
-                    if (
-                        guardXposedUiMode(activity, latest, "quota_warning_action") &&
-                        !activity.isFinishing &&
-                        !activity.isDestroyed &&
-                        !exitScheduled
-                    ) {
-                        dismissWarning(resetForCurrentLimit = false)
-                        grantExtension(activity, latest.extensionMillis)
+                ) else null,
+                onAction = if (rule.extensionEnabled) {
+                    {
+                    if (extensionActionInFlight) {
+                        diagnostic(activity, event = "EXTENSION_ACTION_IGNORED", message = "reason=in_flight")
+                        Toast.makeText(
+                            activity,
+                            hookText(activity, rule, "延时请求处理中", "Extension request is in progress."),
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                        return@attach
                     }
-                },
+                    extensionActionInFlight = true
+                    var keepExtensionActionInFlight = false
+                    try {
+                        // The displayed rule can be stale after a mode or quota update. Re-read
+                        // it at the click boundary instead of leaving a visible but inert action.
+                        val latest = readRule(activity, reloadFallback = true)
+                        val guardPassed = guardXposedUiMode(activity, latest, "quota_warning_action")
+                        diagnostic(
+                            activity,
+                            event = "EXTENSION_ACTION_CLICKED",
+                            message = "guardPassed=$guardPassed, exitScheduled=$exitScheduled, warningAttached=${warningBanner?.isAttached == true}",
+                        )
+                        when {
+                            !guardPassed -> Toast.makeText(
+                                activity,
+                                hookText(activity, latest, "保护方式已切换，请重新打开应用", "Protection mode changed. Reopen the app."),
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                            activity.isFinishing || activity.isDestroyed || exitScheduled -> Toast.makeText(
+                                activity,
+                                hookText(activity, latest, "限制已执行，请重新打开应用", "Restriction already ran. Reopen the app."),
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                            !latest.enabled -> Toast.makeText(
+                                activity,
+                                hookText(activity, latest, "规则已更新，请重新打开应用", "The rule changed. Reopen the app."),
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                            !latest.extensionEnabled -> Toast.makeText(
+                                activity,
+                                hookText(activity, latest, "延时功能已关闭", "Extensions are disabled."),
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                            else -> when (grantExtension(activity, latest)) {
+                                ExtensionActionResult.GRANTED -> extensionsUsedThisProcess++
+                                ExtensionActionResult.REQUIRES_AD -> launchRewardedAdPage(activity, latest)
+                                ExtensionActionResult.RECOVERING_PROVIDER -> {
+                                    keepExtensionActionInFlight = true
+                                }
+                                ExtensionActionResult.REJECTED -> Unit
+                            }
+                        }
+                    } finally {
+                        if (!keepExtensionActionInFlight) {
+                            extensionActionInFlight = false
+                        }
+                    }
+                    }
+                } else null,
                 secondaryActionLabel = if (rule.childLockEnabled) {
                     hookText(activity, rule, "PIN", "PIN")
                 } else null,
@@ -3818,6 +4226,14 @@ internal class RuntimeLimiter(
                 exitLabel = hookText(activity, rule, "退出", "Exit"),
                 exitContentDescription = hookText(activity, rule, "立即退出应用", "Exit app now"),
                 onExit = { leaveTargetByUser(activity, "time_limit_warning") },
+            )
+            recordUsageEvent(
+                activity = activity,
+                durationMillis = 0L,
+                launchIncrement = 0,
+                limitHitIncrement = 0,
+                incidentId = "reminder:quota:$processSessionId:$grantedExtensionMs",
+                reminderIncrement = 1,
             )
             if (warningVibratedForExtensionMs != grantedExtensionMs) {
                 warningVibratedForExtensionMs = grantedExtensionMs
@@ -3898,6 +4314,14 @@ internal class RuntimeLimiter(
                 exitLabel = hookText(activity, rule, "退出", "Exit"),
                 exitContentDescription = hookText(activity, rule, "立即退出应用", "Exit app now"),
                 onExit = { leaveTargetByUser(activity, "schedule_warning") },
+            )
+            recordUsageEvent(
+                activity = activity,
+                durationMillis = 0L,
+                launchIncrement = 0,
+                limitHitIncrement = 0,
+                incidentId = "reminder:schedule:$processSessionId:${dayToken()}",
+                reminderIncrement = 1,
             )
             vibrateExitWarning(activity, rule)
             diagnostic(
@@ -4002,8 +4426,78 @@ internal class RuntimeLimiter(
         mainHandler.post(countdown)
     }
 
-    private fun grantExtension(activity: Activity, extensionMillis: Long) {
-        val granted = extensionMillis.coerceAtLeast(RuleRepository.MIN_EXTENSION_SECONDS * 1000L)
+    private fun grantExtension(activity: Activity, rule: HookRule): ExtensionActionResult {
+        val requestGeneration = ++extensionActionGeneration
+        // A click is an in-flight state transition. Invalidate the old deadline first so it
+        // cannot win while the provider is atomically claiming the daily allowance.
+        mainHandler.removeCallbacks(deadline)
+        mainHandler.removeCallbacks(warningDeadline)
+        warningCountdown?.let(mainHandler::removeCallbacks)
+        warningCountdown = null
+        val claim = consumeExtensionQuota(activity, rule)
+        if (!claim.accepted) {
+            if (claim.providerUnavailable) {
+                requestInteractiveProviderAccessRecovery(activity) { recovered, detail ->
+                    try {
+                        if (
+                            requestGeneration != extensionActionGeneration ||
+                            exitScheduled ||
+                            activity.isFinishing ||
+                            activity.isDestroyed ||
+                            !resumedActivities.contains(activity)
+                        ) return@requestInteractiveProviderAccessRecovery
+                        if (recovered) {
+                            val retryRule = readRule(activity, reloadFallback = true)
+                            val retryClaim = consumeExtensionQuota(activity, retryRule)
+                            if (retryClaim.accepted) {
+                                applyGrantedExtension(activity, retryRule, requestGeneration)
+                                extensionsUsedThisProcess++
+                                return@requestInteractiveProviderAccessRecovery
+                            }
+                            restoreRejectedExtension(activity, retryRule, requestGeneration, retryClaim)
+                        } else {
+                            diagnostic(
+                                activity,
+                                level = "WARN",
+                                event = "EXTENSION_PROVIDER_RECOVERY_FAILED",
+                                message = "detail=${detail.take(80)}",
+                            )
+                            restoreRejectedExtension(activity, rule, requestGeneration, claim)
+                        }
+                    } finally {
+                        extensionActionInFlight = false
+                    }
+                }
+                Toast.makeText(
+                    activity,
+                    hookText(
+                        activity,
+                        rule,
+                        "正在恢复延时服务，请稍候",
+                        "Restoring extension service. Please wait.",
+                    ),
+                    Toast.LENGTH_SHORT,
+                ).show()
+                return ExtensionActionResult.RECOVERING_PROVIDER
+            }
+            if (claim.requiresAd) {
+                // Free quota is exhausted but an ad-backed extension is still eligible.
+                scheduleDeadline(activity, rule)
+                return ExtensionActionResult.REQUIRES_AD
+            }
+            restoreRejectedExtension(activity, rule, requestGeneration, claim)
+            return ExtensionActionResult.REJECTED
+        }
+        applyGrantedExtension(activity, rule, requestGeneration)
+        return ExtensionActionResult.GRANTED
+    }
+
+    private fun applyGrantedExtension(
+        activity: Activity,
+        rule: HookRule,
+        requestGeneration: Long,
+    ) {
+        val granted = rule.extensionMillis.coerceAtLeast(RuleRepository.MIN_EXTENSION_SECONDS * 1000L)
         grantedExtensionMs = UsageMath.addExtensionMillis(
             grantedExtensionMs,
             granted,
@@ -4015,9 +4509,201 @@ internal class RuntimeLimiter(
             event = "EXTENSION_GRANTED",
             message = "本次追加=${granted / 1000}s，累计延时=${grantedExtensionMs / 1000}s",
         )
+        if (requestGeneration != extensionActionGeneration || exitScheduled) return
         val latestRule = readRule(activity, reloadFallback = true)
+        dismissWarning(resetForCurrentLimit = false)
         scheduleDeadline(activity, latestRule)
         scheduleSessionPlan(activity, latestRule)
+    }
+
+    private fun restoreRejectedExtension(
+        activity: Activity,
+        rule: HookRule,
+        requestGeneration: Long,
+        claim: ExtensionClaimResult,
+    ) {
+            diagnostic(
+                activity,
+                level = "INFO",
+                event = "EXTENSION_REJECTED",
+                message = if (claim.quotaExhausted) "daily extension quota exhausted" else "extension unavailable",
+            )
+            // Re-arm the current deadline so the failure path is deterministic and does not
+            // leave a previously scheduled callback racing with the UI state.
+            val latest = readRule(activity, reloadFallback = true)
+            if (requestGeneration == extensionActionGeneration && !exitScheduled) {
+                warningShownForExtensionMs = Long.MIN_VALUE
+                showExitWarning()
+                scheduleDeadline(activity, latest)
+            }
+            Toast.makeText(
+                activity,
+                hookText(
+                    activity,
+                    rule,
+                    if (claim.quotaExhausted) "今日延时次数已用完" else "延时暂不可用，请稍后重试",
+                    if (claim.quotaExhausted) "No extensions left today" else "Extension is temporarily unavailable. Try again.",
+                ),
+                Toast.LENGTH_SHORT,
+            ).show()
+    }
+
+    private fun launchRewardedAdPage(
+        activity: Activity,
+        rule: HookRule,
+        providerRecoveryAttempted: Boolean = false,
+    ) {
+        val token = createBreakSessionToken(activity) ?: run {
+            diagnostic(
+                activity,
+                level = "WARN",
+                event = "REWARDED_AD_PAGE_REJECTED",
+                message = "break_session_unavailable",
+            )
+            if (!providerRecoveryAttempted) {
+                requestInteractiveProviderAccessRecovery(activity) { recovered, detail ->
+                    val active = !activity.isFinishing && !activity.isDestroyed &&
+                        resumedActivities.contains(activity) && !exitScheduled
+                    if (recovered && active) {
+                        diagnostic(
+                            activity,
+                            event = "REWARDED_AD_PAGE_PROVIDER_RECOVERED",
+                            message = detail.take(80),
+                        )
+                        launchRewardedAdPage(activity, readRule(activity, reloadFallback = true), true)
+                    } else if (active) {
+                        diagnostic(
+                            activity,
+                            level = "WARN",
+                            event = "REWARDED_AD_PAGE_PROVIDER_RECOVERY_FAILED",
+                            message = detail.take(80),
+                        )
+                        Toast.makeText(
+                            activity,
+                            hookText(
+                                activity,
+                                rule,
+                                "广告延时服务未连接，请重新打开应用后再试",
+                                "The ad extension service is unavailable. Reopen the app and try again.",
+                            ),
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
+            } else {
+                Toast.makeText(
+                    activity,
+                    hookText(
+                        activity,
+                        rule,
+                        "广告延时服务未连接，请重新打开应用后再试",
+                        "The ad extension service is unavailable. Reopen the app and try again.",
+                    ),
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+            return
+        }
+        val intent = Intent().apply {
+            setClassName(BuildConfig.APPLICATION_ID, LimitBlockActivity::class.java.name)
+            putExtra(LimitBlockActivity.EXTRA_TARGET_PACKAGE, packageName)
+            putExtra(LimitBlockActivity.EXTRA_BREAK_SESSION_TOKEN, token)
+            putExtra(LimitBlockActivity.EXTRA_RULE_VERSION, rule.version)
+            putExtra(LimitBlockActivity.EXTRA_GROUP_VERSION, rule.groupVersion)
+            putExtra(LimitBlockActivity.EXTRA_ENGLISH, isEnglish(activity, rule))
+            putExtra(LimitBlockActivity.EXTRA_CONTROL_SESSION_ID, processSessionId)
+            putExtra(LimitBlockActivity.EXTRA_INCIDENT_ID, "ad:$packageName:$processSessionId")
+            putExtra(LimitBlockActivity.EXTRA_AD_ONLY, true)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+        }
+        diagnostic(
+            activity,
+            event = "REWARDED_AD_PAGE_LAUNCH_REQUESTED",
+            message = "session=${processSessionId.take(24)}, rule=${rule.version}, group=${rule.groupVersion}",
+        )
+        runCatching { activity.startActivity(intent) }
+            .onSuccess {
+                diagnostic(activity, event = "REWARDED_AD_PAGE_LAUNCHED", message = "session=${processSessionId.take(24)}")
+            }
+            .onFailure {
+                diagnostic(
+                    activity,
+                    level = "WARN",
+                    event = "REWARDED_AD_PAGE_FAILED",
+                    message = it.javaClass.simpleName,
+                )
+                Toast.makeText(
+                    activity,
+                    hookText(activity, rule, "广告延时页面无法打开，请稍后重试", "Unable to open the ad extension page. Try again."),
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+    }
+
+    private fun consumePendingRewardedAd(activity: Activity, rule: HookRule) {
+        val result = runCatching {
+            activity.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_CONSUME_REWARDED_AD,
+                packageName,
+                Bundle().apply { putString(RuleContract.KEY_AD_SESSION_ID, processSessionId) },
+            )
+        }.getOrNull()?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) } ?: return
+        val reward = result.getLong(RuleContract.KEY_AD_REWARD_MILLIS, 0L)
+            .coerceIn(0L, RewardedAdPolicy.MAX_REWARD_MILLIS)
+        if (reward <= 0L) return
+        grantedExtensionMs = UsageMath.addExtensionMillis(
+            grantedExtensionMs,
+            reward,
+            MAX_TOTAL_EXTENSION_MS,
+        )
+        extensionsUsedThisProcess = (extensionsUsedThisProcess + 1)
+            .coerceAtMost(rule.extensionSessionLimit)
+        warningShownForExtensionMs = Long.MIN_VALUE
+        diagnostic(
+            activity,
+            event = "REWARDED_AD_REWARD_APPLIED",
+            message = "reward=${reward / 1000}s; session=${processSessionId.take(40)}",
+        )
+        scheduleDeadline(activity, rule)
+    }
+
+    private fun consumeExtensionQuota(activity: Activity, rule: HookRule): ExtensionClaimResult {
+        val quota = runCatching {
+            activity.contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_CLAIM_EXTENSION,
+                packageName,
+                Bundle().apply {
+                    putString(RuleContract.KEY_DAY_TOKEN, LocalDate.now().toString())
+                    putString(RuleContract.KEY_EXTENSION_SESSION_ID, processSessionId)
+                },
+            )
+        }.getOrNull()
+        val accepted = quota?.getBoolean(RuleContract.KEY_OK, false) == true &&
+            quota.getBoolean(RuleContract.KEY_EXTENSION_ALLOWED, false)
+        val providerMessage = quota?.getString(RuleContract.KEY_MESSAGE).orEmpty()
+        val remainingCount = quota?.getInt(RuleContract.KEY_EXTENSION_REMAINING_COUNT, -1) ?: -1
+        val requiresAd = quota?.getBoolean(RuleContract.KEY_EXTENSION_REQUIRES_AD, false) == true
+        diagnostic(
+            activity,
+            event = "EXTENSION_QUOTA_RESULT",
+                message = "ok=${quota?.getBoolean(RuleContract.KEY_OK, false) == true}, allowed=$accepted, remaining=$remainingCount${providerMessage.takeIf(String::isNotBlank)?.let { ", reason=${it.take(80)}" }.orEmpty()}",
+        )
+        if (!accepted) {
+            diagnostic(
+                activity,
+                level = "INFO",
+                event = "EXTENSION_REJECTED",
+                message = "extension unavailable; dailyLimit=${rule.extensionDailyLimit}; requiresAd=$requiresAd",
+            )
+        }
+        return ExtensionClaimResult(
+            accepted = accepted,
+            requiresAd = requiresAd,
+            quotaExhausted = !accepted && remainingCount == 0,
+            providerUnavailable = quota == null || !quota.getBoolean(RuleContract.KEY_OK, false),
+        )
     }
 
     private fun compactMinutes(durationMillis: Long): Long =
@@ -4105,6 +4791,10 @@ internal class RuntimeLimiter(
         if (banner.kind != kind) return
         warningCountdown?.let(mainHandler::removeCallbacks)
         warningCountdown = null
+        if (kind == WarningBannerKind.USAGE_MILESTONE) {
+            usageMilestoneDismiss?.let(mainHandler::removeCallbacks)
+            usageMilestoneDismiss = null
+        }
         runCatching { banner.remove() }
         warningBanner = null
     }
@@ -4181,12 +4871,15 @@ internal class RuntimeLimiter(
         extensionMillis: Long,
     ): String {
         val seconds = ((remainingMs + 999L) / 1000L).coerceAtLeast(0L)
-        return hookText(
+        val message = hookText(
             context,
             rule,
             "$seconds 秒后退出 · 可立即退出，或延长 ${formatDuration(context, rule, extensionMillis)}",
             "Exit in $seconds sec · exit now or extend ${formatDuration(context, rule, extensionMillis)}",
         )
+        return if (rule.extensionRemainingCount == 0) {
+            hookText(context, rule, "$message · 今日延时次数已用完", "$message · No extensions left today")
+        } else message
     }
 
     private fun formatDuration(context: Context, rule: HookRule, durationMs: Long): String {
@@ -4556,6 +5249,74 @@ internal class RuntimeLimiter(
     }
 
     /**
+     * A delay tap is also an explicit user action. On OEM builds that reject a cold bridge bind,
+     * use the transparent manager Activity to restore the target's temporary URI grant, then let
+     * the original tap retry its atomic quota claim exactly once.
+     */
+    private fun requestInteractiveProviderAccessRecovery(
+        activity: Activity,
+        callback: (Boolean, String) -> Unit,
+    ) {
+        val intent = Intent().apply {
+            setClassName(BuildConfig.APPLICATION_ID, ParentAuthBootstrapActivity::class.java.name)
+            putExtra(ParentAuthBootstrapActivity.EXTRA_TARGET_PACKAGE, packageName)
+            addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+        }
+        val launched = runCatching {
+            @Suppress("DEPRECATION")
+            activity.startActivityForResult(intent, EXTENSION_BOOTSTRAP_REQUEST_CODE)
+        }
+        if (launched.isFailure) {
+            callback(
+                false,
+                "activity_launch:${launched.exceptionOrNull()?.javaClass?.simpleName.orEmpty().ifBlank { "unknown" }}",
+            )
+            return
+        }
+        diagnostic(
+            activity,
+            event = "EXTENSION_PROVIDER_RECOVERY_LAUNCHED",
+            message = "target=$packageName",
+        )
+        val startedAt = SystemClock.elapsedRealtime()
+        var completed = false
+        fun finish(recovered: Boolean, detail: String) {
+            if (completed) return
+            completed = true
+            extensionBootstrapPoll = null
+            if (recovered) providerFailureLogged = false
+            callback(recovered, detail)
+        }
+        val poll = object : Runnable {
+            override fun run() {
+                if (completed) return
+                val providerReady = runCatching {
+                    activity.contentResolver.call(
+                        RuleContract.CONTENT_URI,
+                        RuleContract.METHOD_GET_RULE,
+                        packageName,
+                        null,
+                    )?.getBoolean(RuleContract.KEY_OK, false) == true
+                }.getOrDefault(false)
+                val targetResumed = !activity.isFinishing && !activity.isDestroyed &&
+                    resumedActivities.contains(activity)
+                if (providerReady && targetResumed) {
+                    finish(true, "interactive_bootstrap_restored")
+                    return
+                }
+                if (SystemClock.elapsedRealtime() - startedAt < PARENT_AUTH_BOOTSTRAP_TIMEOUT_MILLIS) {
+                    mainHandler.postDelayed(this, PARENT_AUTH_BOOTSTRAP_POLL_MILLIS)
+                } else {
+                    finish(false, if (providerReady) "target_not_resumed" else "provider_not_ready")
+                }
+            }
+        }
+        extensionBootstrapPoll?.let(mainHandler::removeCallbacks)
+        extensionBootstrapPoll = poll
+        mainHandler.postDelayed(poll, PARENT_AUTH_BOOTSTRAP_POLL_MILLIS)
+    }
+
+    /**
      * Android 11+ may hide an exported provider from a target process after reboot because the
      * older URI grant was temporary. Binding this explicit, command-free service establishes
      * package visibility long enough for the provider to re-offer a fresh temporary grant.
@@ -4851,6 +5612,10 @@ internal class RuntimeLimiter(
                     RuleContract.KEY_EXIT_WARNING_VIBRATION_ENABLED,
                     false,
                 ),
+                usageMilestoneReminderEnabled = result.getBoolean(
+                    RuleContract.KEY_USAGE_MILESTONE_REMINDER_ENABLED,
+                    false,
+                ),
                 languageMode = result.getString(RuleContract.KEY_LANGUAGE_MODE)
                     ?.let { runCatching { AppLanguageMode.valueOf(it) }.getOrNull() }
                     ?: AppLanguageMode.SYSTEM,
@@ -4871,6 +5636,7 @@ internal class RuntimeLimiter(
                 customTimeQuotes = TimeQuotePolicy.parseCustomQuotes(
                     result.getString(RuleContract.KEY_CUSTOM_TIME_QUOTES).orEmpty(),
                 ),
+                extensionEnabled = result.getBoolean(RuleContract.KEY_EXTENSION_ENABLED, true),
                 extensionMillis = result.getLong(
                     RuleContract.KEY_EXTENSION_SECONDS,
                     RuleRepository.DEFAULT_EXTENSION_SECONDS,
@@ -4878,8 +5644,28 @@ internal class RuntimeLimiter(
                     RuleRepository.MIN_EXTENSION_SECONDS,
                     RuleRepository.MAX_EXTENSION_SECONDS,
                 ) * 1000L,
+                extensionDailyLimit = result.getInt(
+                    RuleContract.KEY_EXTENSION_DAILY_LIMIT,
+                    ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT,
+                ).coerceIn(1, ExtensionQuotaPolicy.MAX_DAILY_LIMIT),
+                extensionSessionLimit = result.getInt(
+                    RuleContract.KEY_EXTENSION_SESSION_LIMIT,
+                    ExtensionQuotaPolicy.DEFAULT_SESSION_LIMIT,
+                ).coerceIn(1, ExtensionQuotaPolicy.MAX_SESSION_LIMIT),
+                extensionFreeDailyLimit = result.getInt(
+                    RuleContract.KEY_EXTENSION_FREE_DAILY_LIMIT,
+                    ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT,
+                ).coerceIn(0, ExtensionQuotaPolicy.MAX_FREE_DAILY_LIMIT),
+                extensionRemainingCount = result.getInt(
+                    RuleContract.KEY_EXTENSION_REMAINING_COUNT,
+                    ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT,
+                ).coerceAtLeast(0),
                 limitEnforcementMode = LimitEnforcementPolicy.parseMode(
                     result.getString(RuleContract.KEY_LIMIT_ENFORCEMENT_MODE),
+                ),
+                rootEnhancementEnabled = result.getBoolean(
+                    RuleContract.KEY_ROOT_ENHANCEMENT_ENABLED,
+                    false,
                 ),
                 diagnosticsEnabled = result.getBoolean(RuleContract.KEY_DIAGNOSTICS_ENABLED, true),
                 usageStatsEnabled = result.getBoolean(RuleContract.KEY_USAGE_STATS_ENABLED, true),
@@ -5175,6 +5961,10 @@ internal class RuntimeLimiter(
                 RuleRepository.KEY_EXIT_WARNING_VIBRATION_ENABLED,
                 false,
             ),
+            usageMilestoneReminderEnabled = preferences.getBoolean(
+                RuleRepository.KEY_USAGE_MILESTONE_REMINDER_ENABLED,
+                false,
+            ),
             languageMode = preferences.getString(
                 RuleRepository.KEY_LANGUAGE_MODE,
                 AppLanguageMode.SYSTEM.name,
@@ -5199,6 +5989,7 @@ internal class RuntimeLimiter(
             customTimeQuotes = TimeQuotePolicy.parseCustomQuotes(
                 preferences.getString(RuleRepository.KEY_CUSTOM_TIME_QUOTES, "").orEmpty(),
             ),
+            extensionEnabled = preferences.getBoolean(RuleRepository.KEY_EXTENSION_ENABLED, true),
             extensionMillis = preferences.getLong(
                 RuleRepository.KEY_EXTENSION_SECONDS,
                 RuleRepository.DEFAULT_EXTENSION_SECONDS,
@@ -5206,6 +5997,18 @@ internal class RuntimeLimiter(
                 RuleRepository.MIN_EXTENSION_SECONDS,
                 RuleRepository.MAX_EXTENSION_SECONDS,
             ) * 1000L,
+            extensionDailyLimit = preferences.getLong(
+                RuleRepository.KEY_EXTENSION_DAILY_LIMIT,
+                ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT.toLong(),
+            ).toInt().coerceIn(1, ExtensionQuotaPolicy.MAX_DAILY_LIMIT),
+            extensionSessionLimit = preferences.getLong(
+                RuleRepository.KEY_EXTENSION_SESSION_LIMIT,
+                ExtensionQuotaPolicy.DEFAULT_SESSION_LIMIT.toLong(),
+            ).toInt().coerceIn(1, ExtensionQuotaPolicy.MAX_SESSION_LIMIT),
+            extensionFreeDailyLimit = preferences.getLong(
+                RuleRepository.KEY_EXTENSION_FREE_DAILY_LIMIT,
+                ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT.toLong(),
+            ).toInt().coerceIn(0, ExtensionQuotaPolicy.MAX_FREE_DAILY_LIMIT),
             limitEnforcementMode = LimitEnforcementPolicy.parseMode(
                 preferences.getString(RuleRepository.KEY_LIMIT_ENFORCEMENT_MODE, null),
             ),
@@ -5256,13 +6059,18 @@ internal class RuntimeLimiter(
             rule.exitWarningEnabled,
             rule.fullScreenExitWarningEnabled,
             rule.exitWarningVibrationEnabled,
+            rule.usageMilestoneReminderEnabled,
             rule.languageMode.name,
             rule.themeMode.name,
             rule.themeColor.name,
             rule.timeQuotesEnabled,
             rule.builtInTimeQuotesEnabled,
             TimeQuotePolicy.encode(rule.customTimeQuotes),
+            rule.extensionEnabled,
             rule.extensionMillis,
+            rule.extensionDailyLimit,
+            rule.extensionSessionLimit,
+            rule.extensionFreeDailyLimit,
             rule.limitEnforcementMode.name,
             rule.diagnosticsEnabled,
             rule.usageStatsEnabled,
@@ -5325,6 +6133,10 @@ internal class RuntimeLimiter(
                 CACHE_EXIT_WARNING_VIBRATION_ENABLED,
                 rule.exitWarningVibrationEnabled,
             )
+            .putBoolean(
+                CACHE_USAGE_MILESTONE_REMINDER_ENABLED,
+                rule.usageMilestoneReminderEnabled,
+            )
             .putString(CACHE_LANGUAGE_MODE, rule.languageMode.name)
             .putString(CACHE_THEME_MODE, rule.themeMode.name)
             .putString(CACHE_THEME_COLOR, rule.themeColor.name)
@@ -5337,7 +6149,11 @@ internal class RuntimeLimiter(
                 CACHE_CUSTOM_TIME_QUOTES,
                 TimeQuotePolicy.encode(rule.customTimeQuotes),
             )
+            .putBoolean(CACHE_EXTENSION_ENABLED, rule.extensionEnabled)
             .putLong(CACHE_EXTENSION_MS, rule.extensionMillis)
+            .putInt(CACHE_EXTENSION_DAILY_LIMIT, rule.extensionDailyLimit)
+            .putInt(CACHE_EXTENSION_SESSION_LIMIT, rule.extensionSessionLimit)
+            .putInt(CACHE_EXTENSION_FREE_DAILY_LIMIT, rule.extensionFreeDailyLimit)
             .putString(CACHE_LIMIT_ENFORCEMENT_MODE, rule.limitEnforcementMode.name)
             .putBoolean(CACHE_DIAGNOSTICS_ENABLED, rule.diagnosticsEnabled)
             .putBoolean(CACHE_USAGE_STATS_ENABLED, rule.usageStatsEnabled)
@@ -5480,6 +6296,10 @@ internal class RuntimeLimiter(
                 CACHE_EXIT_WARNING_VIBRATION_ENABLED,
                 false,
             ),
+            usageMilestoneReminderEnabled = prefs.getBoolean(
+                CACHE_USAGE_MILESTONE_REMINDER_ENABLED,
+                false,
+            ),
             languageMode = prefs.getString(CACHE_LANGUAGE_MODE, AppLanguageMode.SYSTEM.name)
                 ?.let { runCatching { AppLanguageMode.valueOf(it) }.getOrNull() }
                 ?: AppLanguageMode.SYSTEM,
@@ -5495,6 +6315,7 @@ internal class RuntimeLimiter(
             customTimeQuotes = TimeQuotePolicy.parseCustomQuotes(
                 prefs.getString(CACHE_CUSTOM_TIME_QUOTES, "").orEmpty(),
             ),
+            extensionEnabled = prefs.getBoolean(CACHE_EXTENSION_ENABLED, true),
             extensionMillis = prefs.getLong(
                 CACHE_EXTENSION_MS,
                 RuleRepository.DEFAULT_EXTENSION_SECONDS * 1000L,
@@ -5502,6 +6323,18 @@ internal class RuntimeLimiter(
                 RuleRepository.MIN_EXTENSION_SECONDS * 1000L,
                 RuleRepository.MAX_EXTENSION_SECONDS * 1000L,
             ),
+            extensionDailyLimit = prefs.getInt(
+                CACHE_EXTENSION_DAILY_LIMIT,
+                ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT,
+            ).coerceIn(1, ExtensionQuotaPolicy.MAX_DAILY_LIMIT),
+            extensionSessionLimit = prefs.getInt(
+                CACHE_EXTENSION_SESSION_LIMIT,
+                ExtensionQuotaPolicy.DEFAULT_SESSION_LIMIT,
+            ).coerceIn(1, ExtensionQuotaPolicy.MAX_SESSION_LIMIT),
+            extensionFreeDailyLimit = prefs.getInt(
+                CACHE_EXTENSION_FREE_DAILY_LIMIT,
+                ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT,
+            ).coerceIn(0, ExtensionQuotaPolicy.MAX_FREE_DAILY_LIMIT),
             limitEnforcementMode = LimitEnforcementPolicy.parseMode(
                 prefs.getString(CACHE_LIMIT_ENFORCEMENT_MODE, null),
             ),
@@ -5565,7 +6398,11 @@ internal class RuntimeLimiter(
         timeQuotesEnabled = true,
         builtInTimeQuotesEnabled = true,
         customTimeQuotes = emptyList(),
+        extensionEnabled = true,
         extensionMillis = RuleRepository.DEFAULT_EXTENSION_SECONDS * 1000L,
+        extensionDailyLimit = ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT,
+        extensionSessionLimit = ExtensionQuotaPolicy.DEFAULT_SESSION_LIMIT,
+        extensionFreeDailyLimit = ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT,
         limitEnforcementMode = LimitEnforcementMode.FORCE_EXIT,
         diagnosticsEnabled = true,
         usageStatsEnabled = true,
@@ -5654,14 +6491,21 @@ internal class RuntimeLimiter(
         val exitWarningEnabled: Boolean,
         val fullScreenExitWarningEnabled: Boolean,
         val exitWarningVibrationEnabled: Boolean,
+        val usageMilestoneReminderEnabled: Boolean = false,
         val languageMode: AppLanguageMode,
         val themeMode: AppThemeMode,
         val themeColor: AppThemeColor,
         val timeQuotesEnabled: Boolean,
         val builtInTimeQuotesEnabled: Boolean,
         val customTimeQuotes: List<String>,
+        val extensionEnabled: Boolean,
         val extensionMillis: Long,
+        val extensionDailyLimit: Int,
+        val extensionSessionLimit: Int,
+        val extensionFreeDailyLimit: Int,
+        val extensionRemainingCount: Int = Int.MAX_VALUE,
         val limitEnforcementMode: LimitEnforcementMode,
+        val rootEnhancementEnabled: Boolean = false,
         val diagnosticsEnabled: Boolean,
         val usageStatsEnabled: Boolean,
         val rulesetGeneration: Long,
@@ -5689,7 +6533,28 @@ internal class RuntimeLimiter(
         var durationMillis: Long = 0L,
         var launches: Int = 0,
         var limitHits: Int = 0,
+        var reminders: Int = 0,
     )
+
+    private data class PendingLimitHitEvent(
+        val dayToken: String,
+        val increment: Int,
+    )
+
+    /** Result kept local to the Hook process; provider data remains authoritative. */
+    private data class ExtensionClaimResult(
+        val accepted: Boolean,
+        val requiresAd: Boolean,
+        val quotaExhausted: Boolean,
+        val providerUnavailable: Boolean,
+    )
+
+    private enum class ExtensionActionResult {
+        GRANTED,
+        REQUIRES_AD,
+        RECOVERING_PROVIDER,
+        REJECTED,
+    }
 
     private data class ScheduleHitResult(
         val recorded: Boolean,
@@ -5719,6 +6584,7 @@ internal class RuntimeLimiter(
         const val GROUP_SESSION_HANDOFF_REFRESH_MS = 600L
         const val SESSION_PLAN_PROMPT_STABLE_MS = 1_000L
         const val SESSION_PLAN_PROMPT_RETRY_MS = 1_000L
+        const val SESSION_PLAN_PROMPT_SUPPRESSION_MS = 10 * 60 * 1000L
         const val STATE_PREFS = "__app_time_limiter_state__"
         const val RULE_CACHE_PREFS = "__app_time_limiter_rule_cache__"
         const val STATS_OUTBOX_PREFS = "__app_time_limiter_stats_outbox__"
@@ -5727,6 +6593,8 @@ internal class RuntimeLimiter(
         const val KEY_USED_MS = "used_ms"
         const val KEY_COOLDOWN_STARTED_AT = "cooldown_started_at"
         const val KEY_COOLDOWN_ENDS_AT = "cooldown_ends_at"
+        const val KEY_COOLDOWN_STARTED_ELAPSED_AT = "cooldown_started_elapsed_at"
+        const val KEY_COOLDOWN_ENDS_ELAPSED_AT = "cooldown_ends_elapsed_at"
         const val KEY_COOLDOWN_INCIDENT_ID = "cooldown_incident_id"
         const val KEY_HANDLED_QUOTA_INCIDENTS = "handled_quota_incidents"
         const val KEY_COOLDOWN_RULE_VERSION = "cooldown_rule_version"
@@ -5772,13 +6640,18 @@ internal class RuntimeLimiter(
         const val CACHE_EXIT_WARNING_ENABLED = "exit_warning_enabled"
         const val CACHE_FULL_SCREEN_EXIT_WARNING_ENABLED = "full_screen_exit_warning_enabled"
         const val CACHE_EXIT_WARNING_VIBRATION_ENABLED = "exit_warning_vibration_enabled"
+        const val CACHE_USAGE_MILESTONE_REMINDER_ENABLED = "usage_milestone_reminder_enabled"
         const val CACHE_LANGUAGE_MODE = "language_mode"
         const val CACHE_THEME_MODE = "theme_mode"
         const val CACHE_THEME_COLOR = "theme_color"
         const val CACHE_TIME_QUOTES_ENABLED = "time_quotes_enabled"
         const val CACHE_BUILT_IN_TIME_QUOTES_ENABLED = "built_in_time_quotes_enabled"
         const val CACHE_CUSTOM_TIME_QUOTES = "custom_time_quotes"
+        const val CACHE_EXTENSION_ENABLED = "extension_enabled"
         const val CACHE_EXTENSION_MS = "extension_ms"
+        const val CACHE_EXTENSION_DAILY_LIMIT = "extension_daily_limit"
+        const val CACHE_EXTENSION_SESSION_LIMIT = "extension_session_limit"
+        const val CACHE_EXTENSION_FREE_DAILY_LIMIT = "extension_free_daily_limit"
         const val CACHE_LIMIT_ENFORCEMENT_MODE = "limit_enforcement_mode"
         const val CACHE_DIAGNOSTICS_ENABLED = "diagnostics_enabled"
         const val CACHE_USAGE_STATS_ENABLED = "usage_stats_enabled"
@@ -5788,18 +6661,27 @@ internal class RuntimeLimiter(
         const val OUTBOX_DURATION_MS = "duration_ms"
         const val OUTBOX_LAUNCHES = "launches"
         const val OUTBOX_LIMIT_HITS = "limit_hits"
+        const val OUTBOX_REMINDERS = "reminders"
+        const val OUTBOX_LIMIT_INCIDENTS = "limit_incidents"
+        const val OUTBOX_LIMIT_DAY = "limit_day"
+        const val OUTBOX_LIMIT_INCREMENT = "limit_increment"
+        const val MAX_STATS_INCIDENT_ID_LENGTH = 160
+        const val MAX_STATS_COUNTER_INCREMENT = 10
         const val LOGGABLE_SEGMENT_MS = 1_000L
         const val EXIT_DELAY_MS = 350L
         const val EXIT_DELAY_AFTER_STATS_FAILURE_MS = 1_500L
+        const val ROOT_PROCESS_KILL_GRACE_MILLIS = 150L
         const val FINAL_STATS_RETRY_DELAY_MS = 250L
         const val EXIT_RECOVERY_DELAY_MS = 2_000L
         const val WARNING_LEAD_MS = 5_000L
+        const val USAGE_MILESTONE_BANNER_DURATION_MS = 5_000L
         const val EXIT_WARNING_VIBRATION_MS = 1_200L
         const val COUNTDOWN_REFRESH_MS = 1_000L
         const val PARENT_AUTH_POLL_MILLIS = 250L
         const val PARENT_AUTH_RETURN_GRACE_MS = 2_000L
         const val PARENT_OVERRIDE_RESUME_TIMEOUT_MS = 5_000L
         const val PARENT_AUTH_BOOTSTRAP_REQUEST_CODE = 0x5453
+        const val EXTENSION_BOOTSTRAP_REQUEST_CODE = 0x5454
         const val PARENT_AUTH_BOOTSTRAP_POLL_MILLIS = 150L
         const val PARENT_AUTH_BOOTSTRAP_TIMEOUT_MILLIS = 3_000L
         const val PROVIDER_BOOTSTRAP_TIMEOUT_MILLIS = 2_500L

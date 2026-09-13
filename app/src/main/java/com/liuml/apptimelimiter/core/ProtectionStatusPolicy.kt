@@ -108,12 +108,6 @@ object ProtectionStatusPolicy {
             } else {
                 EffectiveController.INACTIVE
             }
-            ProtectionMode.ACCESSIBILITY_SHIZUKU -> when {
-                !basicReady -> EffectiveController.INACTIVE
-                input.shizukuState == ShizukuExecutionState.READY ->
-                    EffectiveController.ACCESSIBILITY_SHIZUKU
-                else -> EffectiveController.ACCESSIBILITY_FALLBACK
-            }
         }
         val message = productMessage(input, scopeState, hookState, controller)
         val health = when {
@@ -164,9 +158,7 @@ object ProtectionStatusPolicy {
             ProtectionMode.XPOSED -> targets.any {
                 it.controller == EffectiveController.XPOSED
             }
-            ProtectionMode.ACCESSIBILITY,
-            ProtectionMode.ACCESSIBILITY_SHIZUKU,
-            -> targets.isNotEmpty() && targets.any {
+            ProtectionMode.ACCESSIBILITY -> targets.isNotEmpty() && targets.any {
                 it.controller == EffectiveController.ACCESSIBILITY ||
                     it.controller == EffectiveController.ACCESSIBILITY_SHIZUKU ||
                     it.controller == EffectiveController.ACCESSIBILITY_FALLBACK

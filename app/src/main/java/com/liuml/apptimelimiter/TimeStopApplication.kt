@@ -3,6 +3,8 @@ package com.liuml.apptimelimiter
 import android.app.Application
 import android.content.Context
 import com.liuml.apptimelimiter.migration.MigrationCoordinator
+import com.liuml.apptimelimiter.ads.RewardedAdStateRepository
+import com.liuml.apptimelimiter.ads.TopOnSdkBootstrap
 import com.liuml.apptimelimiter.xposedstatus.ScopeSyncCoordinator
 import com.liuml.apptimelimiter.xposedstatus.XposedStatusRepository
 
@@ -20,6 +22,15 @@ class TimeStopApplication : Application() {
             // the framework's remote preferences with an empty private mirror.
             XposedStatusRepository.instance.initialize(this)
             ScopeSyncCoordinator.get(this).initialize()
+        }
+        if (RewardedAdStateRepository(this).isPrivacyConsentGranted()) {
+            TopOnSdkBootstrap.initialize(
+                context = this,
+                appId = BuildConfig.TOPON_APP_ID,
+                appKey = BuildConfig.TOPON_APP_KEY,
+                placementId = BuildConfig.TOPON_PLACEMENT_ID,
+                enabled = !BuildConfig.TOPON_TEST_MODE,
+            )
         }
     }
 }

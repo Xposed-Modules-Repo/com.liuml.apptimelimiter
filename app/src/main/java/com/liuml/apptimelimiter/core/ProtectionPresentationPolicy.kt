@@ -1,6 +1,7 @@
 package com.liuml.apptimelimiter.core
 
 import com.liuml.apptimelimiter.data.ProtectionMode
+import com.liuml.apptimelimiter.data.ForceStopEnhancement
 import com.liuml.apptimelimiter.nonroot.AccessibilityRuntimeState
 import com.liuml.apptimelimiter.nonroot.ShizukuExecutionState
 
@@ -38,6 +39,7 @@ object ProtectionPresentationPolicy {
         accessibilityState: AccessibilityRuntimeState,
         usageAccessGranted: Boolean,
         shizukuState: ShizukuExecutionState,
+        accessibilityEnhancement: ForceStopEnhancement = ForceStopEnhancement.NONE,
     ): ProtectionPresentationSnapshot {
         if (targets.isEmpty()) {
             return ProtectionPresentationSnapshot(
@@ -56,6 +58,7 @@ object ProtectionPresentationPolicy {
                 accessibilityState = accessibilityState,
                 usageAccessGranted = usageAccessGranted,
                 shizukuState = shizukuState,
+                accessibilityEnhancement = accessibilityEnhancement,
             )
         }
     }
@@ -116,6 +119,7 @@ object ProtectionPresentationPolicy {
         accessibilityState: AccessibilityRuntimeState,
         usageAccessGranted: Boolean,
         shizukuState: ShizukuExecutionState,
+        accessibilityEnhancement: ForceStopEnhancement,
     ): ProtectionPresentationSnapshot {
         if (accessibilityState != AccessibilityRuntimeState.CONNECTED || !usageAccessGranted) {
             return ProtectionPresentationSnapshot(
@@ -125,7 +129,7 @@ object ProtectionPresentationPolicy {
                 targetCount = targetCount,
             )
         }
-        if (selectedMode == ProtectionMode.ACCESSIBILITY_SHIZUKU) {
+        if (accessibilityEnhancement == ForceStopEnhancement.SHIZUKU) {
             return ProtectionPresentationSnapshot(
                 selectedMode = selectedMode,
                 state = if (shizukuState == ShizukuExecutionState.READY) {

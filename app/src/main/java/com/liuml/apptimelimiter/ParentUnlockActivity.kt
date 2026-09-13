@@ -1,6 +1,7 @@
 package com.liuml.apptimelimiter
 
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -48,6 +49,7 @@ import com.liuml.apptimelimiter.ipc.RuleContract
 import com.liuml.apptimelimiter.localization.AppLocaleController
 import com.liuml.apptimelimiter.security.ChildLockRepository
 import com.liuml.apptimelimiter.security.PinVerificationResult
+import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.ui.theme.TimeStopTheme
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
@@ -59,6 +61,7 @@ class ParentUnlockActivity : FragmentActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var token: String
     private var targetPackage = ""
+    private var deferGrantForAd = false
     private var reason = ""
     private var authorized = false
     private var expiresAtMillis = 0L
@@ -128,10 +131,12 @@ class ParentUnlockActivity : FragmentActivity() {
                     ParentOverrideDurationPolicy.DEFAULT_MINUTES,
                 ) ?: ParentOverrideDurationPolicy.DEFAULT_MINUTES,
             )
+            deferGrantForAd = savedInstanceState?.getBoolean(STATE_DEFER_GRANT_FOR_AD, false) == true
             authorized = token.isNotBlank() && targetPackage.isNotBlank() &&
                 expiresAtMillis > System.currentTimeMillis()
         } else {
             token = intent.getStringExtra(EXTRA_TOKEN).orEmpty()
+            deferGrantForAd = intent.getBooleanExtra(EXTRA_DEFER_GRANT_FOR_AD, false)
             val consumed = consumeChallenge(token)
             if (consumed != null) {
                 targetPackage = consumed.getString(EXTRA_TARGET_PACKAGE).orEmpty()
@@ -332,6 +337,7 @@ class ParentUnlockActivity : FragmentActivity() {
         outState.putString(STATE_REASON, reason)
         outState.putLong(STATE_EXPIRES_AT, expiresAtMillis)
         outState.putInt(STATE_DURATION_MINUTES, selectedDurationMinutes)
+        outState.putBoolean(STATE_DEFER_GRANT_FOR_AD, deferGrantForAd)
     }
 
     override fun onDestroy() {
@@ -383,16 +389,12 @@ class ParentUnlockActivity : FragmentActivity() {
             if (completed || isFinishing || isDestroyed) return@launch
             verificationInProgress = false
             when (result) {
-                PinVerificationResult.Success -> complete(
-                    granted = true,
-                    event = "PARENT_AUTH_SUCCEEDED",
-                    durationMinutes = durationMinutes,
-                )
+                PinVerificationResult.Success -> completeAfterSuccessfulPin(durationMinutes)
                 PinVerificationResult.NotConfigured -> {
                     errorText = if (english) {
-                        "Child lock is unavailable"
+                        "Control Lock is unavailable"
                     } else {
-                        "儿童锁配置不可用"
+                        "管控锁配置不可用"
                     }
                 }
                 is PinVerificationResult.Locked -> {
@@ -424,6 +426,43 @@ class ParentUnlockActivity : FragmentActivity() {
                 }
             }
         }
+    }
+
+    private fun completeAfterSuccessfulPin(durationMinutes: Int) {
+        if (!deferGrantForAd) {
+            complete(granted = true, event = "PARENT_AUTH_SUCCEEDED", durationMinutes = durationMinutes)
+            return
+        }
+        val adRequired = RuleRepository(this).claimParentUnlockAdRequired(
+            java.time.LocalDate.now().toString(),
+        )
+        if (!adRequired) {
+            complete(granted = true, event = "PARENT_AUTH_SUCCEEDED", durationMinutes = durationMinutes)
+            return
+        }
+        val marked = runCatching {
+            contentResolver.call(
+                RuleContract.CONTENT_URI,
+                RuleContract.METHOD_MARK_PARENT_AUTH_VERIFIED_FOR_AD,
+                null,
+                Bundle().apply { putString(RuleContract.KEY_PARENT_AUTH_TOKEN, token) },
+            )
+        }.getOrNull()?.getBoolean(RuleContract.KEY_OK, false) == true
+        if (!marked) {
+            // A successful parent verification must never be lost because the ad handoff expired.
+            complete(granted = true, event = "PARENT_AUTH_SUCCEEDED_AD_HANDOFF_FAILED", durationMinutes = durationMinutes)
+            return
+        }
+        completed = true
+        handler.removeCallbacksAndMessages(null)
+        diagnostic("PARENT_AUTH_VERIFIED_WAITING_AD", "reason=${reason.take(60)}")
+        setResult(
+            RESULT_PIN_VERIFIED_FOR_AD,
+            Intent().putExtra(EXTRA_DURATION_MINUTES, ParentOverrideDurationPolicy.normalizeMinutes(durationMinutes)),
+        )
+        finish()
+        @Suppress("DEPRECATION")
+        overridePendingTransition(0, 0)
     }
 
     private fun consumeChallenge(value: String): Bundle? = runCatching {
@@ -461,8 +500,25 @@ class ParentUnlockActivity : FragmentActivity() {
             )
         }.getOrNull()?.getBoolean(RuleContract.KEY_OK, false) == true
         val effectiveGrant = granted && persisted
+        if (effectiveGrant) {
+            UsageStatsRepository(this).recordParentUnlockEvent(
+                packageName = targetPackage,
+                day = java.time.LocalDate.now(),
+                eventId = token.hashCode().toString(),
+            )
+            // A successful PIN handoff owns the whole restriction UI flow. Close any stale
+            // standalone page before returning to the target app; failed/cancelled auth keeps it.
+            LimitBlockActivity.finishAuthorizedPageForTarget(
+                target = targetPackage,
+                reason = "parent_override_granted",
+            )
+        }
         diagnostic(
-            if (granted && !persisted) "PARENT_AUTH_COMPLETION_FAILED" else event,
+            when {
+                granted && !persisted -> "PARENT_AUTH_COMPLETION_FAILED"
+                effectiveGrant -> "PARENT_AUTH_UI_COMPLETED"
+                else -> event
+            },
             "reason=${reason.take(60)}, durationMinutes=${if (effectiveGrant) durationMinutes else 0}",
         )
         setResult(if (effectiveGrant) RESULT_OK else RESULT_CANCELED)
@@ -480,6 +536,9 @@ class ParentUnlockActivity : FragmentActivity() {
         private const val TAG = "TimeStopParentAuth"
         const val EXTRA_TOKEN = "parent_auth_token"
         const val EXTRA_TARGET_PACKAGE = "target_package"
+        const val EXTRA_DEFER_GRANT_FOR_AD = "defer_parent_grant_for_ad"
+        const val EXTRA_DURATION_MINUTES = "parent_override_duration_minutes"
+        const val RESULT_PIN_VERIFIED_FOR_AD = RESULT_FIRST_USER + 41
         const val MAX_WAIT_MILLIS = 30_000L
         private const val STATE_AUTHORIZED = "state_authorized"
         private const val STATE_TOKEN = "state_token"
@@ -487,5 +546,6 @@ class ParentUnlockActivity : FragmentActivity() {
         private const val STATE_REASON = "state_reason"
         private const val STATE_EXPIRES_AT = "state_expires_at"
         private const val STATE_DURATION_MINUTES = "state_duration_minutes"
+        private const val STATE_DEFER_GRANT_FOR_AD = "state_defer_grant_for_ad"
     }
 }

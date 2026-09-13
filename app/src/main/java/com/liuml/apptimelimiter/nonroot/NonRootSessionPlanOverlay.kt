@@ -100,6 +100,10 @@ class NonRootSessionPlanOverlay(
                 dismiss()
                 onExit()
             },
+            onClose = {
+                dismiss()
+                onSkipped()
+            },
         )
         root.addView(
             panel,

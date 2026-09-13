@@ -36,6 +36,7 @@ class SessionPlanPanel(
     private val onStart: (Long) -> Unit,
     private val onSkip: () -> Unit,
     private val onExit: () -> Unit,
+    private val onClose: () -> Unit,
 ) : LinearLayout(context) {
     private val ui = PanelUi(context, english, colors)
     private val eyebrowView = ui.eyebrow(copy.eyebrow)
@@ -59,7 +60,25 @@ class SessionPlanPanel(
         orientation = VERTICAL
         setPadding(ui.dp(22), ui.dp(18), ui.dp(22), ui.dp(16))
         background = ui.roundedBackground(colors.surface, 24f, 1, colors.outline)
-        addView(eyebrowView, ui.matchWrap())
+        val header = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(eyebrowView, LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(
+                TextView(context).apply {
+                    text = "×"
+                    textSize = 28f
+                    gravity = Gravity.CENTER
+                    setTextColor(colors.textSecondary)
+                    contentDescription = ui.text("关闭本次计划", "Close session plan")
+                    isClickable = true
+                    isFocusable = true
+                    setOnClickListener { onClose() }
+                },
+                LayoutParams(ui.dp(48), ui.dp(48)),
+            )
+        }
+        addView(header, ui.matchHeight(48))
         addView(titleView, ui.matchWrap())
         addView(descriptionView, ui.matchWrap())
         addView(bodyScroll, bodyWrapLayoutParams)
@@ -91,7 +110,10 @@ class SessionPlanPanel(
     }
 
     /** Returns true when Back was consumed; the outer non-cancelable container remains open. */
-    fun handleBack(): Boolean = true
+    fun handleBack(): Boolean {
+        onClose()
+        return true
+    }
 
     private fun select(durationMillis: Long) {
         if (SessionPlanDurationPolicy.durationAllowed(durationMillis, maxAllowedMillis)) {

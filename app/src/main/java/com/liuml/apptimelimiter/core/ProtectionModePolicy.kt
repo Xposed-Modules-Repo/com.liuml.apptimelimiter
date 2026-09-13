@@ -8,12 +8,15 @@ object ProtectionModePolicy {
         legacyNonRootEnabled: Boolean,
         legacyShizukuEnabled: Boolean,
     ): ProtectionMode = if (storedValue != null) {
-        runCatching { ProtectionMode.valueOf(storedValue) }
-            .getOrDefault(ProtectionMode.XPOSED)
+        when (storedValue) {
+            "ACCESSIBILITY_SHIZUKU" -> ProtectionMode.ACCESSIBILITY
+            else -> runCatching { ProtectionMode.valueOf(storedValue) }
+                .getOrDefault(ProtectionMode.XPOSED)
+        }
     } else {
         when {
             !legacyNonRootEnabled -> ProtectionMode.XPOSED
-            legacyShizukuEnabled -> ProtectionMode.ACCESSIBILITY_SHIZUKU
+            legacyShizukuEnabled -> ProtectionMode.ACCESSIBILITY
             else -> ProtectionMode.ACCESSIBILITY
         }
     }
