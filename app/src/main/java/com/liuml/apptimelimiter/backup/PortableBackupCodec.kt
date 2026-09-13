@@ -6,6 +6,7 @@ import com.liuml.apptimelimiter.data.AppRule
 import com.liuml.apptimelimiter.data.AppThemeColor
 import com.liuml.apptimelimiter.data.AppThemeMode
 import com.liuml.apptimelimiter.data.ScheduleMode
+import com.liuml.apptimelimiter.core.ExtensionQuotaPolicy
 import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.charset.StandardCharsets
@@ -123,6 +124,7 @@ object PortableBackupCodec {
         .put("exitWarningEnabled", settings.exitWarningEnabled)
         .put("fullScreenExitWarningEnabled", settings.fullScreenExitWarningEnabled)
         .put("exitWarningVibrationEnabled", settings.exitWarningVibrationEnabled)
+        .put("usageMilestoneReminderEnabled", settings.usageMilestoneReminderEnabled)
         .put("languageMode", settings.languageMode.name)
         .put("themeMode", settings.themeMode.name)
         .put("themeColor", settings.themeColor.name)
@@ -130,7 +132,11 @@ object PortableBackupCodec {
         .put("builtInTimeQuotesEnabled", settings.builtInTimeQuotesEnabled)
         .put("customTimeQuotes", JSONArray(settings.customTimeQuotes))
         .put("automaticUpdateCheckEnabled", settings.automaticUpdateCheckEnabled)
+        .put("extensionEnabled", settings.extensionEnabled)
         .put("extensionSeconds", settings.extensionSeconds)
+        .put("extensionDailyLimit", settings.extensionDailyLimit)
+        .put("extensionSessionLimit", settings.extensionSessionLimit)
+        .put("extensionFreeDailyLimit", settings.extensionFreeDailyLimit)
         .put("diagnosticsEnabled", settings.diagnosticsEnabled)
         .put("usageStatsEnabled", settings.usageStatsEnabled)
 
@@ -138,6 +144,7 @@ object PortableBackupCodec {
         exitWarningEnabled = value.optBoolean("exitWarningEnabled", true),
         fullScreenExitWarningEnabled = value.optBoolean("fullScreenExitWarningEnabled", false),
         exitWarningVibrationEnabled = value.optBoolean("exitWarningVibrationEnabled", false),
+        usageMilestoneReminderEnabled = value.optBoolean("usageMilestoneReminderEnabled", false),
         languageMode = enum(value.optString("languageMode"), AppLanguageMode.SYSTEM),
         themeMode = enum(value.optString("themeMode"), AppThemeMode.SYSTEM),
         themeColor = enum(value.optString("themeColor"), AppThemeColor.GREEN),
@@ -145,7 +152,11 @@ object PortableBackupCodec {
         builtInTimeQuotesEnabled = value.optBoolean("builtInTimeQuotesEnabled", true),
         customTimeQuotes = value.optJSONArray("customTimeQuotes")?.strings().orEmpty(),
         automaticUpdateCheckEnabled = value.optBoolean("automaticUpdateCheckEnabled", true),
+        extensionEnabled = value.optBoolean("extensionEnabled", true),
         extensionSeconds = value.getLong("extensionSeconds"),
+        extensionDailyLimit = value.optInt("extensionDailyLimit", ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT),
+        extensionSessionLimit = value.optInt("extensionSessionLimit", ExtensionQuotaPolicy.DEFAULT_SESSION_LIMIT),
+        extensionFreeDailyLimit = value.optInt("extensionFreeDailyLimit", ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT),
         diagnosticsEnabled = value.optBoolean("diagnosticsEnabled", true),
         usageStatsEnabled = value.optBoolean("usageStatsEnabled", true),
     )

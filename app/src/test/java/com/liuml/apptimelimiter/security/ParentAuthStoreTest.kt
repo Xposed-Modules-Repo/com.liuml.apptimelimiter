@@ -27,11 +27,19 @@ class ParentAuthStoreTest {
     }
 
     @Test
-    fun `successful challenge creates only matching temporary override`() {
+    fun `successful challenge survives a target process recreation until expiry`() {
         ParentAuthStore.issue("token", identity, "incident", "QUOTA", 1_000L)
         ParentAuthStore.consumeForUi("token", 2_000L)
         ParentAuthStore.complete("token", true, 60_000L, 2_001L, 10_000L)
         assertNotNull(ParentAuthStore.getOverride(identity, true, 2_002L, 10_001L))
+        assertNotNull(
+            ParentAuthStore.getOverride(
+                identity = identity.copy(processSessionId = "session-recreated"),
+                screenInteractive = true,
+                nowMillis = 2_002L,
+                nowElapsedMillis = 10_001L,
+            ),
+        )
         assertNull(
             ParentAuthStore.getOverride(
                 identity = identity.copy(ruleVersion = 9L),
@@ -40,7 +48,9 @@ class ParentAuthStoreTest {
                 nowElapsedMillis = 10_001L,
             ),
         )
-        assertFalse(ParentAuthStore.revoke("app.a", "session-a"))
+        assertFalse(ParentAuthStore.revoke("app.a", "session-recreated"))
+        assertNotNull(ParentAuthStore.getOverride(identity, true, 2_003L, 10_002L))
+        assertTrue(ParentAuthStore.revoke("app.a", "session-a"))
         assertNull(ParentAuthStore.getOverride(identity, true, 2_003L, 10_002L))
     }
 
@@ -52,6 +62,18 @@ class ParentAuthStoreTest {
             ParentAuthStore.status("token", "app.a", "session-a", 32_000L),
         )
         assertNull(ParentAuthStore.complete("token", true, 60_000L, 32_001L, 1_000L))
+    }
+
+    @Test
+    fun `verified PIN can wait for an ad then grant once`() {
+        ParentAuthStore.issue("token", identity, "incident", "QUOTA", 1_000L)
+        ParentAuthStore.consumeForUi("token", 1_001L)
+        assertEquals(
+            ParentAuthStatus.VERIFIED_WAITING_AD,
+            ParentAuthStore.markVerifiedWaitingForAd("token", 1_002L)?.status,
+        )
+        assertNotNull(ParentAuthStore.complete("token", true, 60_000L, 1_003L, 5_000L))
+        assertNull(ParentAuthStore.complete("token", true, 60_000L, 1_004L, 5_001L))
     }
 
     @Test

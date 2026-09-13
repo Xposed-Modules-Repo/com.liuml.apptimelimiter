@@ -80,6 +80,7 @@ class NonRootProtectionStatusRepository private constructor(
         val shizukuState = shizuku.state.value
         _snapshot.value = ProtectionEnginePolicy.resolve(
             protectionMode = settings.protectionMode,
+            accessibilityEnhancement = settings.accessibilityForceStopEnhancement,
             accessibilityEnabled = accessibility.serviceConnected,
             accessibilityConfigured = accessibility.systemConfigured,
             usageAccessGranted = accessibility.usageAccessGranted,

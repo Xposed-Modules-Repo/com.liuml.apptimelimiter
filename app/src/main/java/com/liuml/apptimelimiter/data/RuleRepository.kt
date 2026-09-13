@@ -17,6 +17,9 @@ import com.liuml.apptimelimiter.core.SharedGroupSessionPolicy
 import com.liuml.apptimelimiter.core.SharedGroupSessionRecord
 import com.liuml.apptimelimiter.core.SharedGroupSessionUpdate
 import com.liuml.apptimelimiter.core.CooldownPolicy
+import com.liuml.apptimelimiter.core.ExtensionQuotaPolicy
+import com.liuml.apptimelimiter.core.ExtensionQuotaDecision
+import com.liuml.apptimelimiter.core.ExtensionQuotaState
 import com.liuml.apptimelimiter.core.LimitEnforcementPolicy
 import com.liuml.apptimelimiter.core.MonotonicVersionPolicy
 import com.liuml.apptimelimiter.core.PackageNamePolicy
@@ -27,13 +30,19 @@ import com.liuml.apptimelimiter.core.RuleActivationPolicy
 import com.liuml.apptimelimiter.core.TimeQuotePolicy
 import com.liuml.apptimelimiter.core.ThemeColorPolicy
 import com.liuml.apptimelimiter.ipc.RuleContract
+import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.core.GroupMembershipPolicy
 import com.liuml.apptimelimiter.migration.MigrationStorageGate
 import java.io.File
 import java.util.UUID
+import android.os.SystemClock
 
 class RuleRepository(context: Context) {
     private val appContext = context.applicationContext
+    private val devicePreferences = appContext.getSharedPreferences(
+        DEVICE_SETTINGS_PREFS_NAME,
+        Context.MODE_PRIVATE,
+    )
     private val lifecyclePrefs = appContext.getSharedPreferences(
         STORAGE_LIFECYCLE_PREFS_NAME,
         Context.MODE_PRIVATE,
@@ -45,6 +54,30 @@ class RuleRepository(context: Context) {
         Context.MODE_PRIVATE,
     )
     private val prefs = prepareRuleStorage()
+
+    init {
+        migrateLegacyExtensionDefaults()
+    }
+
+    private fun migrateLegacyExtensionDefaults() {
+        val hasSessionLimit = prefs.contains(KEY_EXTENSION_SESSION_LIMIT)
+        val hasFreeDailyLimit = prefs.contains(KEY_EXTENSION_FREE_DAILY_LIMIT)
+        val legacyDailyLimit = prefs.getLong(KEY_EXTENSION_DAILY_LIMIT, 3L).toInt()
+        if (!ExtensionQuotaPolicy.shouldMigrateLegacyDefaults(
+                legacyDailyLimit = legacyDailyLimit,
+                hasSessionLimit = hasSessionLimit,
+                hasFreeDailyLimit = hasFreeDailyLimit,
+            )
+        ) return
+        if (prefs.edit()
+                .putLong(KEY_EXTENSION_DAILY_LIMIT, ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT.toLong())
+                .putLong(KEY_EXTENSION_SESSION_LIMIT, ExtensionQuotaPolicy.DEFAULT_SESSION_LIMIT.toLong())
+                .putLong(KEY_EXTENSION_FREE_DAILY_LIMIT, ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT.toLong())
+                .commit()
+        ) {
+            makePreferencesReadable()
+        }
+    }
 
     @SuppressLint("WorldReadableFiles")
     private fun openSharedPreferences(): SharedPreferenceStore = try {
@@ -309,6 +342,143 @@ class RuleRepository(context: Context) {
 
     fun rulesetGeneration(): Long = prefs.getLong(KEY_RULESET_GENERATION, 0L)
 
+    /** Atomically consumes one ordinary delay for this app or its owning group's active session. */
+    fun claimExtension(
+        packageName: String,
+        dayToken: String,
+        sessionId: String = "",
+    ): com.liuml.apptimelimiter.core.ExtensionQuotaDecision {
+        val group = groupForPackage(packageName)
+        val identity = group?.let { "group:${it.id}" } ?: "package:$packageName"
+        val safeSession = sessionId.take(160)
+        if (safeSession.isBlank()) throw IllegalArgumentException("missing_extension_session")
+        val settings = getGlobalSettings()
+        if (!settings.extensionEnabled) {
+            return ExtensionQuotaDecision(false, false, ExtensionQuotaState(), 0, 0, 0)
+        }
+        val globalPrefix = "runtime.extension.global.daily."
+        val sessionPrefix = "runtime.extension.$identity.session."
+        synchronized(STORAGE_LIFECYCLE_LOCK) {
+            val decision = ExtensionQuotaPolicy.claimFree(
+                state = ExtensionQuotaState(
+                    dayToken = prefs.getString(globalPrefix + "day", "").orEmpty(),
+                    dailyUsedCount = prefs.getInt(globalPrefix + "count", 0),
+                    freeUsedCount = prefs.getInt(globalPrefix + "free_count", 0),
+                    sessionId = prefs.getString(sessionPrefix + "id", "").orEmpty(),
+                    sessionUsedCount = prefs.getInt(sessionPrefix + "count", 0),
+                ),
+                dayToken = dayToken.take(32),
+                sessionId = safeSession,
+                dailyLimit = settings.extensionDailyLimit,
+                sessionLimit = settings.extensionSessionLimit,
+                freeDailyLimit = settings.extensionFreeDailyLimit,
+            )
+            if (!decision.allowed) return decision
+            if (!prefs.edit()
+                    .putString(globalPrefix + "day", decision.nextState.dayToken)
+                    .putInt(globalPrefix + "count", decision.nextState.dailyUsedCount)
+                    .putInt(globalPrefix + "free_count", decision.nextState.freeUsedCount)
+                    .putString(sessionPrefix + "id", decision.nextState.sessionId)
+                    .putInt(sessionPrefix + "count", decision.nextState.sessionUsedCount)
+                    .commit()) {
+                throw IllegalStateException("extension_quota_persist_failed")
+            }
+            recordExtensionStatistic(packageName, decision.nextState.dayToken, identity, decision.nextState.dailyUsedCount)
+            return decision
+        }
+    }
+
+    /** Claims an extension only after a rewarded-ad callback has been verified. */
+    fun claimRewardedExtension(
+        packageName: String,
+        dayToken: String,
+        sessionId: String,
+    ): ExtensionQuotaDecision {
+        val settings = getGlobalSettings()
+        if (!settings.extensionEnabled) {
+            return ExtensionQuotaDecision(false, false, ExtensionQuotaState(), 0, 0, 0)
+        }
+        val group = groupForPackage(packageName)
+        val identity = group?.let { "group:${it.id}" } ?: "package:$packageName"
+        val safeSession = sessionId.take(160)
+        if (safeSession.isBlank()) throw IllegalArgumentException("missing_extension_session")
+        val globalPrefix = "runtime.extension.global.daily."
+        val sessionPrefix = "runtime.extension.$identity.session."
+        synchronized(STORAGE_LIFECYCLE_LOCK) {
+            val decision = ExtensionQuotaPolicy.claimRewarded(
+                state = ExtensionQuotaState(
+                    dayToken = prefs.getString(globalPrefix + "day", "").orEmpty(),
+                    dailyUsedCount = prefs.getInt(globalPrefix + "count", 0),
+                    freeUsedCount = prefs.getInt(globalPrefix + "free_count", 0),
+                    sessionId = prefs.getString(sessionPrefix + "id", "").orEmpty(),
+                    sessionUsedCount = prefs.getInt(sessionPrefix + "count", 0),
+                ),
+                dayToken = dayToken.take(32),
+                sessionId = safeSession,
+                dailyLimit = settings.extensionDailyLimit,
+                sessionLimit = settings.extensionSessionLimit,
+                freeDailyLimit = settings.extensionFreeDailyLimit,
+            )
+            if (!decision.allowed) return decision
+            if (!prefs.edit()
+                    .putString(globalPrefix + "day", decision.nextState.dayToken)
+                    .putInt(globalPrefix + "count", decision.nextState.dailyUsedCount)
+                    .putInt(globalPrefix + "free_count", decision.nextState.freeUsedCount)
+                    .putString(sessionPrefix + "id", decision.nextState.sessionId)
+                    .putInt(sessionPrefix + "count", decision.nextState.sessionUsedCount)
+                    .commit()) {
+                throw IllegalStateException("rewarded_extension_quota_persist_failed")
+            }
+            recordExtensionStatistic(packageName, decision.nextState.dayToken, identity, decision.nextState.dailyUsedCount)
+            return decision
+        }
+    }
+
+    private fun recordExtensionStatistic(
+        packageName: String,
+        dayToken: String,
+        identity: String,
+        ordinal: Int,
+    ) {
+        val day = runCatching { java.time.LocalDate.parse(dayToken) }.getOrNull() ?: return
+        // Quota persistence is authoritative. A statistics write failure must never revoke a
+        // granted extension, and its id makes a later retry idempotent.
+        UsageStatsRepository(appContext).recordExtensionEvent(
+            packageName = packageName,
+            day = day,
+            eventId = "${identity.take(90)}:$ordinal",
+        )
+    }
+
+    fun extensionRemainingCount(packageName: String, dayToken: String): Int =
+        synchronized(STORAGE_LIFECYCLE_LOCK) {
+            val settings = getGlobalSettings()
+            if (!settings.extensionEnabled) return@synchronized 0
+            val currentDay = dayToken.take(32)
+            val used = if (prefs.getString("runtime.extension.global.daily.day", "") == currentDay) {
+                prefs.getInt("runtime.extension.global.daily.count", 0).coerceAtLeast(0)
+            } else 0
+            (settings.extensionDailyLimit - used).coerceAtLeast(0)
+        }
+
+    /** The first successful parent temporary unlock each local day does not request an ad. */
+    fun claimParentUnlockAdRequired(dayToken: String): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        val day = dayToken.take(32)
+        if (day.isBlank()) return@synchronized false
+        val prefix = "runtime.parent_auth.daily."
+        val used = if (prefs.getString(prefix + "day", "") == day) {
+            prefs.getInt(prefix + "count", 0).coerceAtLeast(0)
+        } else {
+            0
+        }
+        if (!prefs.edit()
+                .putString(prefix + "day", day)
+                .putInt(prefix + "count", used + 1)
+                .commit()
+        ) return@synchronized false
+        used >= 1
+    }
+
     fun exportPortableBackup(
         sourceVersionName: String,
         sourceVersionCode: Int,
@@ -333,6 +503,7 @@ class RuleRepository(context: Context) {
                 exitWarningEnabled = settings.exitWarningEnabled,
                 fullScreenExitWarningEnabled = settings.fullScreenExitWarningEnabled,
                 exitWarningVibrationEnabled = settings.exitWarningVibrationEnabled,
+                usageMilestoneReminderEnabled = settings.usageMilestoneReminderEnabled,
                 languageMode = settings.languageMode,
                 themeMode = settings.themeMode,
                 themeColor = settings.themeColor,
@@ -340,7 +511,11 @@ class RuleRepository(context: Context) {
                 builtInTimeQuotesEnabled = settings.builtInTimeQuotesEnabled,
                 customTimeQuotes = settings.customTimeQuotes,
                 automaticUpdateCheckEnabled = settings.automaticUpdateCheckEnabled,
+                extensionEnabled = settings.extensionEnabled,
                 extensionSeconds = settings.extensionSeconds,
+                extensionDailyLimit = settings.extensionDailyLimit,
+                extensionSessionLimit = settings.extensionSessionLimit,
+                extensionFreeDailyLimit = settings.extensionFreeDailyLimit,
                 diagnosticsEnabled = settings.diagnosticsEnabled,
                 usageStatsEnabled = settings.usageStatsEnabled,
             ),
@@ -631,6 +806,8 @@ class RuleRepository(context: Context) {
                 "${prefix}runtime_cooldown_source_package",
                 null,
             ).orEmpty(),
+            startedAtElapsedMillis = prefs.getLong("${prefix}runtime_cooldown_started_elapsed_at", 0L),
+            endsAtElapsedMillis = prefs.getLong("${prefix}runtime_cooldown_ends_elapsed_at", 0L),
         )
     }
 
@@ -643,7 +820,14 @@ class RuleRepository(context: Context) {
         nowMillis: Long = System.currentTimeMillis(),
     ): SharedCooldownRecord? = synchronized(GROUP_COOLDOWN_LOCK) {
         val record = getGroupCooldownRecord(groupId)
-        if (record.endsAtMillis <= 0L || record.endsAtMillis > nowMillis) {
+        if (
+            record.endsAtMillis <= 0L ||
+            SharedCooldownPolicy.remainingMillisDual(
+                record,
+                nowMillis,
+                SystemClock.elapsedRealtime(),
+            ) > 0L
+        ) {
             return@synchronized null
         }
         val editor = prefs.edit()
@@ -660,6 +844,7 @@ class RuleRepository(context: Context) {
         occurredAtMillis: Long,
         durationMillis: Long,
         nowMillis: Long = System.currentTimeMillis(),
+        nowElapsedMillis: Long = SystemClock.elapsedRealtime(),
     ): SharedCooldownClaim = synchronized(GROUP_COOLDOWN_LOCK) {
         val prefix = groupPrefix(groupId)
         val handledKey = "${prefix}runtime_cooldown_handled_incidents"
@@ -676,6 +861,7 @@ class RuleRepository(context: Context) {
             occurredAtMillis = occurredAtMillis,
             durationMillis = durationMillis,
             nowMillis = nowMillis,
+            nowElapsedMillis = nowElapsedMillis,
         )
         val editor = prefs.edit()
             .putString(handledKey, claim.handledIncidentIds.joinToString("\n"))
@@ -686,6 +872,8 @@ class RuleRepository(context: Context) {
                     claim.record.startedAtMillis,
                 )
                 .putLong("${prefix}runtime_cooldown_ends_at", claim.record.endsAtMillis)
+                .putLong("${prefix}runtime_cooldown_started_elapsed_at", nowElapsedMillis)
+                .putLong("${prefix}runtime_cooldown_ends_elapsed_at", nowElapsedMillis + (claim.record.endsAtMillis - nowMillis).coerceAtLeast(0L))
                 .putString("${prefix}runtime_cooldown_incident", claim.record.incidentId)
                 .putString(
                     "${prefix}runtime_cooldown_source_package",
@@ -801,6 +989,21 @@ class RuleRepository(context: Context) {
 
     fun getGlobalSettings(): GlobalSettings {
         val protectionMode = readProtectionMode()
+        val storedMode = prefs.getString(KEY_PROTECTION_MODE, null)
+        val legacyRootEnabled = devicePreferences.getBoolean(KEY_ROOT_ENHANCEMENT_ENABLED, false)
+        val legacyShizukuEnabled =
+            storedMode == "ACCESSIBILITY_SHIZUKU" ||
+                (storedMode == null && prefs.getBoolean(KEY_SHIZUKU_ENHANCEMENT_ENABLED, false))
+        val accessibilityEnhancement = devicePreferences
+            .getString(KEY_ACCESSIBILITY_FORCE_STOP_ENHANCEMENT, null)
+            ?.let { runCatching { ForceStopEnhancement.valueOf(it) }.getOrNull() }
+            ?: when {
+                protectionMode == ProtectionMode.ACCESSIBILITY && legacyRootEnabled ->
+                    ForceStopEnhancement.ROOT
+                protectionMode == ProtectionMode.ACCESSIBILITY && legacyShizukuEnabled ->
+                    ForceStopEnhancement.SHIZUKU
+                else -> ForceStopEnhancement.NONE
+            }
         return GlobalSettings(
         childLockEnabled = prefs.getBoolean(KEY_CHILD_LOCK_ENABLED, false),
         exitWarningEnabled = prefs.getBoolean(KEY_EXIT_WARNING_ENABLED, true),
@@ -810,6 +1013,10 @@ class RuleRepository(context: Context) {
         ),
         exitWarningVibrationEnabled = prefs.getBoolean(
             KEY_EXIT_WARNING_VIBRATION_ENABLED,
+            false,
+        ),
+        usageMilestoneReminderEnabled = prefs.getBoolean(
+            KEY_USAGE_MILESTONE_REMINDER_ENABLED,
             false,
         ),
         languageMode = prefs.getString(KEY_LANGUAGE_MODE, AppLanguageMode.SYSTEM.name)
@@ -839,14 +1046,35 @@ class RuleRepository(context: Context) {
         )?.let {
             runCatching { NonRootCompatibilityMode.valueOf(it) }.getOrNull()
         } ?: NonRootCompatibilityMode.STANDARD,
+        extensionEnabled = prefs.getBoolean(KEY_EXTENSION_ENABLED, true),
         extensionSeconds = prefs.getLong(KEY_EXTENSION_SECONDS, DEFAULT_EXTENSION_SECONDS)
             .coerceIn(MIN_EXTENSION_SECONDS, MAX_EXTENSION_SECONDS),
+        extensionDailyLimit = ExtensionQuotaPolicy.normalizeDailyLimit(
+            prefs.getLong(
+                KEY_EXTENSION_DAILY_LIMIT,
+                ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT.toLong(),
+            ).toInt(),
+        ),
+        extensionSessionLimit = ExtensionQuotaPolicy.normalizeSessionLimit(
+            prefs.getLong(KEY_EXTENSION_SESSION_LIMIT, ExtensionQuotaPolicy.DEFAULT_SESSION_LIMIT.toLong()).toInt(),
+        ),
+        extensionFreeDailyLimit = ExtensionQuotaPolicy.normalizeFreeDailyLimit(
+            ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT,
+            ExtensionQuotaPolicy.normalizeDailyLimit(
+                prefs.getLong(KEY_EXTENSION_DAILY_LIMIT, ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT.toLong()).toInt(),
+            ),
+        ),
         diagnosticsEnabled = prefs.getBoolean(KEY_DIAGNOSTICS_ENABLED, true),
         launcherIconHidden = prefs.getBoolean(KEY_LAUNCHER_ICON_HIDDEN, false),
         usageStatsEnabled = prefs.getBoolean(KEY_USAGE_STATS_ENABLED, true),
         limitEnforcementMode = LimitEnforcementPolicy.parseMode(
             prefs.getString(KEY_LIMIT_ENFORCEMENT_MODE, null),
         ),
+        xposedRootEnhancementEnabled = devicePreferences.getBoolean(
+            KEY_XPOSED_ROOT_ENHANCEMENT_ENABLED,
+            protectionMode == ProtectionMode.XPOSED && legacyRootEnabled,
+        ),
+        accessibilityForceStopEnhancement = accessibilityEnhancement,
         )
     }
 
@@ -872,6 +1100,10 @@ class RuleRepository(context: Context) {
             .putBoolean(
                 KEY_EXIT_WARNING_VIBRATION_ENABLED,
                 settings.exitWarningVibrationEnabled,
+            )
+            .putBoolean(
+                KEY_USAGE_MILESTONE_REMINDER_ENABLED,
+                settings.usageMilestoneReminderEnabled,
             )
             .putString(KEY_LANGUAGE_MODE, settings.languageMode.name)
             .putString(KEY_THEME_MODE, settings.themeMode.name)
@@ -900,18 +1132,50 @@ class RuleRepository(context: Context) {
             )
             .putBoolean(
                 KEY_SHIZUKU_ENHANCEMENT_ENABLED,
-                settings.protectionMode.usesShizuku,
+                settings.protectionMode == ProtectionMode.ACCESSIBILITY &&
+                    settings.accessibilityForceStopEnhancement == ForceStopEnhancement.SHIZUKU,
             )
+            .putBoolean(KEY_EXTENSION_ENABLED, settings.extensionEnabled)
             .putLong(
                 KEY_EXTENSION_SECONDS,
                 settings.extensionSeconds.coerceIn(MIN_EXTENSION_SECONDS, MAX_EXTENSION_SECONDS),
+            )
+            .putLong(
+                KEY_EXTENSION_DAILY_LIMIT,
+                ExtensionQuotaPolicy.normalizeDailyLimit(settings.extensionDailyLimit).toLong(),
+            )
+            .putLong(KEY_EXTENSION_SESSION_LIMIT, ExtensionQuotaPolicy.normalizeSessionLimit(settings.extensionSessionLimit).toLong())
+            .putLong(
+                KEY_EXTENSION_FREE_DAILY_LIMIT,
+                ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT.toLong(),
             )
             .putBoolean(KEY_DIAGNOSTICS_ENABLED, settings.diagnosticsEnabled)
             .putBoolean(KEY_LAUNCHER_ICON_HIDDEN, settings.launcherIconHidden)
             .putBoolean(KEY_USAGE_STATS_ENABLED, settings.usageStatsEnabled)
             .putString(KEY_LIMIT_ENFORCEMENT_MODE, settings.limitEnforcementMode.name)
             .commit()
-        if (persisted) makePreferencesReadable()
+        if (persisted) {
+            devicePreferences.edit()
+                .putBoolean(
+                    KEY_XPOSED_ROOT_ENHANCEMENT_ENABLED,
+                    settings.xposedRootEnhancementEnabled,
+                )
+                .putString(
+                    KEY_ACCESSIBILITY_FORCE_STOP_ENHANCEMENT,
+                    settings.accessibilityForceStopEnhancement.name,
+                )
+                // Keep the legacy value truthful for a downgrade without making it authoritative.
+                .putBoolean(
+                    KEY_ROOT_ENHANCEMENT_ENABLED,
+                    if (settings.protectionMode == ProtectionMode.XPOSED) {
+                        settings.xposedRootEnhancementEnabled
+                    } else {
+                        settings.accessibilityForceStopEnhancement == ForceStopEnhancement.ROOT
+                    },
+                )
+                .commit()
+            makePreferencesReadable()
+        }
         return persisted
     }
 
@@ -992,6 +1256,10 @@ class RuleRepository(context: Context) {
             .putBoolean(KEY_EXIT_WARNING_ENABLED, portable.exitWarningEnabled)
             .putBoolean(KEY_FULL_SCREEN_EXIT_WARNING_ENABLED, portable.fullScreenExitWarningEnabled)
             .putBoolean(KEY_EXIT_WARNING_VIBRATION_ENABLED, portable.exitWarningVibrationEnabled)
+            .putBoolean(
+                KEY_USAGE_MILESTONE_REMINDER_ENABLED,
+                portable.usageMilestoneReminderEnabled,
+            )
             .putString(KEY_LANGUAGE_MODE, portable.languageMode.name)
             .putString(KEY_THEME_MODE, portable.themeMode.name)
             .putString(KEY_THEME_COLOR, portable.themeColor.name)
@@ -1003,8 +1271,19 @@ class RuleRepository(context: Context) {
             .putLong(KEY_PROTECTION_MODE_GENERATION, protectionModeGeneration)
             .putBoolean(KEY_NON_ROOT_PROTECTION_ENABLED, device.protectionMode.usesNonRoot)
             .putString(KEY_NON_ROOT_COMPATIBILITY_MODE, device.nonRootCompatibilityMode.name)
-            .putBoolean(KEY_SHIZUKU_ENHANCEMENT_ENABLED, device.protectionMode.usesShizuku)
+            .putBoolean(
+                KEY_SHIZUKU_ENHANCEMENT_ENABLED,
+                device.protectionMode == ProtectionMode.ACCESSIBILITY &&
+                    device.accessibilityForceStopEnhancement == ForceStopEnhancement.SHIZUKU,
+            )
             .putLong(KEY_EXTENSION_SECONDS, portable.extensionSeconds)
+            .putBoolean(KEY_EXTENSION_ENABLED, portable.extensionEnabled)
+            .putLong(KEY_EXTENSION_DAILY_LIMIT, portable.extensionDailyLimit.toLong())
+            .putLong(KEY_EXTENSION_SESSION_LIMIT, portable.extensionSessionLimit.toLong())
+            .putLong(
+                KEY_EXTENSION_FREE_DAILY_LIMIT,
+                ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT.toLong(),
+            )
             .putBoolean(KEY_DIAGNOSTICS_ENABLED, portable.diagnosticsEnabled)
             .putBoolean(KEY_LAUNCHER_ICON_HIDDEN, device.launcherIconHidden)
             .putBoolean(KEY_USAGE_STATS_ENABLED, portable.usageStatsEnabled)
@@ -1122,6 +1401,8 @@ class RuleRepository(context: Context) {
             .remove("${prefix}runtime_cooldown_ends_at")
             .remove("${prefix}runtime_cooldown_incident")
             .remove("${prefix}runtime_cooldown_source_package")
+            .remove("${prefix}runtime_cooldown_started_elapsed_at")
+            .remove("${prefix}runtime_cooldown_ends_elapsed_at")
     }
 
     private fun removeGroupSessionRuntime(
@@ -1189,6 +1470,8 @@ class RuleRepository(context: Context) {
             "global.full_screen_exit_warning_enabled"
         const val KEY_EXIT_WARNING_VIBRATION_ENABLED =
             "global.exit_warning_vibration_enabled"
+        const val KEY_USAGE_MILESTONE_REMINDER_ENABLED =
+            "global.usage_milestone_reminder_enabled"
         const val KEY_LANGUAGE_MODE = "global.language_mode"
         const val KEY_THEME_MODE = "global.theme_mode"
         const val KEY_THEME_COLOR = "global.theme_color"
@@ -1206,17 +1489,27 @@ class RuleRepository(context: Context) {
             "global.non_root_compatibility_mode"
         const val KEY_SHIZUKU_ENHANCEMENT_ENABLED =
             "global.shizuku_enhancement_enabled"
+        const val KEY_EXTENSION_ENABLED = "global.extension_enabled"
         const val KEY_EXTENSION_SECONDS = "global.extension_seconds"
+        const val KEY_EXTENSION_DAILY_LIMIT = "global.extension_daily_limit"
+        const val KEY_EXTENSION_SESSION_LIMIT = "global.extension_session_limit"
+        const val KEY_EXTENSION_FREE_DAILY_LIMIT = "global.extension_free_daily_limit"
         const val KEY_DIAGNOSTICS_ENABLED = "global.diagnostics_enabled"
         const val KEY_LAUNCHER_ICON_HIDDEN = "global.launcher_icon_hidden"
         const val KEY_USAGE_STATS_ENABLED = "global.usage_stats_enabled"
         const val KEY_LIMIT_ENFORCEMENT_MODE = "global.limit_enforcement_mode"
+        const val KEY_ROOT_ENHANCEMENT_ENABLED = "device.root_enhancement_enabled"
+        const val KEY_XPOSED_ROOT_ENHANCEMENT_ENABLED =
+            "device.xposed_root_enhancement_enabled"
+        const val KEY_ACCESSIBILITY_FORCE_STOP_ENHANCEMENT =
+            "device.accessibility_force_stop_enhancement"
+        private const val DEVICE_SETTINGS_PREFS_NAME = "device_settings"
         const val DEFAULT_EXTENSION_SECONDS = 5L * 60L
         const val DEFAULT_COOLDOWN_SECONDS = 5L * 60L
         const val MIN_COOLDOWN_SECONDS = 60L
         const val MAX_COOLDOWN_SECONDS = 24L * 60L * 60L
         const val MIN_EXTENSION_SECONDS = 60L
-        const val MAX_EXTENSION_SECONDS = 60L * 60L
+        const val MAX_EXTENSION_SECONDS = 15L * 60L
         const val DEFAULT_PROTECTION_MODE_GENERATION = 1L
     }
 

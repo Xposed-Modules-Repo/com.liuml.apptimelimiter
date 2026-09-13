@@ -98,6 +98,15 @@ class MigrationCoordinator private constructor(context: Context) {
                 importedAtMillis = statePrefs.getLong(KEY_IMPORTED_AT, 0L),
             )
         }
+        // Direct legacy adoption is also a one-time migration. Do not re-read the legacy
+        // authority on every cold start; it may be temporarily unavailable after LSPosed or
+        // the provider is restarted even though the Modern store is already valid.
+        if (statePrefs.getBoolean(MigrationStorageGate.KEY_DIRECT_LEGACY_IMPORTED, false)) {
+            return MigrationState.DirectLegacyImported(
+                generation = statePrefs.getLong(KEY_IMPORTED_GENERATION, 0L),
+                importedAtMillis = statePrefs.getLong(KEY_IMPORTED_AT, 0L),
+            )
+        }
         if (!migrationFile.baseFile.exists()) {
             return if (isFreshInstall()) {
                 if (

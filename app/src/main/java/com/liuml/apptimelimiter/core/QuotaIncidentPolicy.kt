@@ -12,6 +12,8 @@ data class SharedCooldownRecord(
     val endsAtMillis: Long = 0L,
     val incidentId: String = "",
     val sourcePackage: String = "",
+    val startedAtElapsedMillis: Long = 0L,
+    val endsAtElapsedMillis: Long = 0L,
 )
 
 enum class SharedCooldownClaimStatus {
@@ -66,6 +68,7 @@ object SharedCooldownPolicy {
         occurredAtMillis: Long,
         durationMillis: Long,
         nowMillis: Long,
+        nowElapsedMillis: Long = 0L,
     ): SharedCooldownClaim {
         val handled = handledIncidentIds
             .asSequence()
@@ -89,7 +92,8 @@ object SharedCooldownPolicy {
                 handled,
             )
         }
-        if (existingRecord.endsAtMillis > nowMillis) {
+        val activeRemaining = remainingMillisDual(existingRecord, nowMillis, nowElapsedMillis)
+        if (activeRemaining > 0L) {
             return SharedCooldownClaim(
                 SharedCooldownClaimStatus.ABSORBED_BY_ACTIVE,
                 existingRecord,
@@ -107,6 +111,12 @@ object SharedCooldownPolicy {
                 endsAtMillis = safeEnd,
                 incidentId = incidentId,
                 sourcePackage = sourcePackage,
+                startedAtElapsedMillis = nowElapsedMillis,
+                endsAtElapsedMillis = if (nowElapsedMillis > 0L) {
+                    nowElapsedMillis + durationMillis
+                } else {
+                    0L
+                },
             )
         } else {
             SharedCooldownRecord()
@@ -125,6 +135,38 @@ object SharedCooldownPolicy {
     fun remainingMillis(record: SharedCooldownRecord, nowMillis: Long): Long =
         (record.endsAtMillis - nowMillis).coerceAtLeast(0L)
 
+    /** Uses the monotonic clock while it is trustworthy, and the wall clock as a bounded check. */
+    fun remainingMillisDual(
+        record: SharedCooldownRecord,
+        nowWallMillis: Long,
+        nowElapsedMillis: Long,
+    ): Long {
+        val wallRemaining = (record.endsAtMillis - nowWallMillis).coerceAtLeast(0L)
+        val elapsedRemaining = if (
+            record.startedAtElapsedMillis > 0L &&
+            record.endsAtElapsedMillis > record.startedAtElapsedMillis &&
+            nowElapsedMillis >= record.startedAtElapsedMillis
+        ) {
+            (record.endsAtElapsedMillis - nowElapsedMillis).coerceAtLeast(0L)
+        } else {
+            wallRemaining
+        }
+        // A manually advanced wall clock must not extend a cooldown; a manually moved-back
+        // clock must not make it longer than the monotonic deadline either.
+        return minOf(wallRemaining, elapsedRemaining)
+    }
+
+    fun wallAndElapsedAreConsistent(
+        record: SharedCooldownRecord,
+        nowWallMillis: Long,
+        nowElapsedMillis: Long,
+    ): Boolean {
+        if (record.startedAtElapsedMillis <= 0L || record.endsAtElapsedMillis <= 0L) return true
+        val elapsed = (nowElapsedMillis - record.startedAtElapsedMillis).coerceAtLeast(0L)
+        val wall = (nowWallMillis - record.startedAtMillis).coerceAtLeast(0L)
+        return kotlin.math.abs(elapsed - wall) <= CLOCK_SKEW_TOLERANCE_MILLIS
+    }
+
     private fun appendBounded(target: MutableList<String>, incidentId: String) {
         target.remove(incidentId)
         target.add(incidentId)
@@ -133,4 +175,6 @@ object SharedCooldownPolicy {
 
     private fun safeAdd(left: Long, right: Long): Long =
         if (right > 0L && left > Long.MAX_VALUE - right) Long.MAX_VALUE else left + right
+
+    private const val CLOCK_SKEW_TOLERANCE_MILLIS = 5_000L
 }

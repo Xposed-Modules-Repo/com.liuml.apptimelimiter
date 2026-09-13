@@ -11,10 +11,7 @@ class ProtectionExecutionPolicyTest {
         assertTrue(ProtectionExecutionPolicy.hookMayExecute(ProtectionMode.XPOSED))
         assertFalse(ProtectionExecutionPolicy.nonRootMayExecute(ProtectionMode.XPOSED))
 
-        listOf(
-            ProtectionMode.ACCESSIBILITY,
-            ProtectionMode.ACCESSIBILITY_SHIZUKU,
-        ).forEach { mode ->
+        listOf(ProtectionMode.ACCESSIBILITY).forEach { mode ->
             assertFalse(ProtectionExecutionPolicy.hookMayExecute(mode))
             assertFalse(ProtectionExecutionPolicy.acceptHookSideEffect(mode))
             assertFalse(

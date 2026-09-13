@@ -1,6 +1,7 @@
 package com.liuml.apptimelimiter.nonroot
 
 import com.liuml.apptimelimiter.data.ProtectionMode
+import com.liuml.apptimelimiter.data.ForceStopEnhancement
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -20,7 +21,8 @@ class ProtectionEnginePolicyTest {
     @Test
     fun `Shizuku mode falls back to accessibility when unavailable`() {
         val snapshot = ProtectionEnginePolicy.resolve(
-            protectionMode = ProtectionMode.ACCESSIBILITY_SHIZUKU,
+            protectionMode = ProtectionMode.ACCESSIBILITY,
+            accessibilityEnhancement = ForceStopEnhancement.SHIZUKU,
             accessibilityEnabled = true,
             usageAccessGranted = true,
             shizukuAvailable = false,

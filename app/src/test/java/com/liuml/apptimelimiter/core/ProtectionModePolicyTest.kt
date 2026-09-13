@@ -16,8 +16,16 @@ class ProtectionModePolicyTest {
             ProtectionModePolicy.parse(null, true, false),
         )
         assertEquals(
-            ProtectionMode.ACCESSIBILITY_SHIZUKU,
+            ProtectionMode.ACCESSIBILITY,
             ProtectionModePolicy.parse(null, true, true),
+        )
+    }
+
+    @Test
+    fun `stored legacy shizuku mode migrates to ordinary protection`() {
+        assertEquals(
+            ProtectionMode.ACCESSIBILITY,
+            ProtectionModePolicy.parse("ACCESSIBILITY_SHIZUKU", true, true),
         )
     }
 

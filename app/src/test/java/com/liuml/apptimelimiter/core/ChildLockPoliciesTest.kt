@@ -95,14 +95,22 @@ class ChildLockPoliciesTest {
     }
 
     @Test
-    fun `temporary override is bound to package session and generations`() {
+    fun `temporary override survives target process recreation but remains generation bound`() {
         val identity = TemporaryOverrideIdentity("app.a", "session-a", 2L, 3L, 4L)
         val granted = TemporaryParentOverride(identity, 1_000L, 61_000L)
         assertTrue(TemporaryParentOverridePolicy.isValid(granted, identity, true, 2_000L))
-        assertFalse(
+        assertTrue(
             TemporaryParentOverridePolicy.isValid(
                 granted,
                 identity.copy(processSessionId = "session-b"),
+                true,
+                2_000L,
+            ),
+        )
+        assertFalse(
+            TemporaryParentOverridePolicy.isValid(
+                granted,
+                identity.copy(ruleVersion = 5L),
                 true,
                 2_000L,
             ),

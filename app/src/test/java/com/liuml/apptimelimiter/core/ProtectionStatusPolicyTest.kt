@@ -133,16 +133,15 @@ class ProtectionStatusPolicyTest {
     }
 
     @Test
-    fun `Shizuku unavailable degrades to restriction page`() {
+    fun `ordinary protection remains active when Shizuku is not selected`() {
         val result = resolve(
-            selectedMode = ProtectionMode.ACCESSIBILITY_SHIZUKU,
+            selectedMode = ProtectionMode.ACCESSIBILITY,
             frameworkConnected = false,
             managedHookState = ManagedAppHookState.COMPATIBILITY_PENDING,
             shizukuState = ShizukuExecutionState.UNAVAILABLE,
         )
-        assertEquals(EffectiveController.ACCESSIBILITY_FALLBACK, result.controller)
-        assertEquals(ProtectionHealth.DEGRADED, result.health)
-        assertEquals(ProtectionProductMessage.SHIZUKU_FALLBACK, result.message)
+        assertEquals(EffectiveController.ACCESSIBILITY, result.controller)
+        assertEquals(ProtectionHealth.HEALTHY, result.health)
     }
 
     @Test

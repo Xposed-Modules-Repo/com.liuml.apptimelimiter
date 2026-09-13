@@ -36,14 +36,22 @@ enum class NonRootCompatibilityMode {
 enum class ProtectionMode {
     XPOSED,
     ACCESSIBILITY,
-    ACCESSIBILITY_SHIZUKU,
     ;
 
     val usesNonRoot: Boolean
         get() = this != XPOSED
 
-    val usesShizuku: Boolean
-        get() = this == ACCESSIBILITY_SHIZUKU
+}
+
+/**
+ * Optional termination backend for the accessibility controller.  This is deliberately
+ * separate from [ProtectionMode]: foreground tracking, timing and rule evaluation remain
+ * owned by accessibility in every ordinary-protection configuration.
+ */
+enum class ForceStopEnhancement {
+    NONE,
+    ROOT,
+    SHIZUKU,
 }
 
 enum class LimitEnforcementMode {
@@ -121,6 +129,7 @@ data class GlobalSettings(
     val exitWarningEnabled: Boolean = true,
     val fullScreenExitWarningEnabled: Boolean = false,
     val exitWarningVibrationEnabled: Boolean = false,
+    val usageMilestoneReminderEnabled: Boolean = false,
     val languageMode: AppLanguageMode = AppLanguageMode.SYSTEM,
     val themeMode: AppThemeMode = AppThemeMode.SYSTEM,
     val themeColor: AppThemeColor = AppThemeColor.GREEN,
@@ -132,9 +141,18 @@ data class GlobalSettings(
     val protectionModeGeneration: Long = 1L,
     val nonRootCompatibilityMode: NonRootCompatibilityMode =
         NonRootCompatibilityMode.STANDARD,
+    val extensionEnabled: Boolean = true,
     val extensionSeconds: Long = 5 * 60L,
+    /** Global daily limit shared by all controlled apps. Retains legacy storage name. */
+    val extensionDailyLimit: Int = 10,
+    val extensionSessionLimit: Int = 3,
+    val extensionFreeDailyLimit: Int = 3,
     val diagnosticsEnabled: Boolean = true,
     val launcherIconHidden: Boolean = false,
     val usageStatsEnabled: Boolean = true,
     val limitEnforcementMode: LimitEnforcementMode = LimitEnforcementMode.FORCE_EXIT,
+    /** Device-local; never exported to rules or portable backups. */
+    val xposedRootEnhancementEnabled: Boolean = false,
+    /** Device-local; only applies while [protectionMode] is [ProtectionMode.ACCESSIBILITY]. */
+    val accessibilityForceStopEnhancement: ForceStopEnhancement = ForceStopEnhancement.NONE,
 )

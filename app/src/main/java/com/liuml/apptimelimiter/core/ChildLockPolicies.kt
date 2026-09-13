@@ -130,8 +130,6 @@ object TemporaryParentOverridePolicy {
         nowElapsedMillis < granted.expiresAtElapsedMillis &&
         granted.identity.packageName.isNotBlank() &&
         granted.identity.packageName == current.packageName &&
-        granted.identity.processSessionId.isNotBlank() &&
-        granted.identity.processSessionId == current.processSessionId &&
         granted.identity.ruleVersion == current.ruleVersion &&
         granted.identity.groupVersion == current.groupVersion &&
         granted.identity.protectionModeGeneration == current.protectionModeGeneration

@@ -29,6 +29,7 @@ internal enum class WarningBannerKind {
     TIME_LIMIT,
     SCHEDULE,
     SESSION_PLAN,
+    USAGE_MILESTONE,
 }
 
 internal class TopWarningBanner private constructor(

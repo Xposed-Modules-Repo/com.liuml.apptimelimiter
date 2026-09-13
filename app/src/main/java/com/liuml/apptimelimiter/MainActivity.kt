@@ -8,21 +8,31 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.content.IntentFilter
 import android.app.TimePickerDialog
+import android.app.DatePickerDialog
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color as AndroidColor
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.net.Uri
 import android.provider.Settings
 import android.view.ContextThemeWrapper
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.fragment.app.FragmentActivity
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -61,6 +71,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -87,8 +98,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.material3.LocalTextStyle
@@ -105,6 +123,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.TextUnit
 import com.liuml.apptimelimiter.data.AppRule
 import com.liuml.apptimelimiter.data.AppGroup
@@ -114,6 +133,7 @@ import com.liuml.apptimelimiter.data.AppThemeMode
 import com.liuml.apptimelimiter.data.GlobalSettings
 import com.liuml.apptimelimiter.data.NonRootCompatibilityMode
 import com.liuml.apptimelimiter.data.ProtectionMode
+import com.liuml.apptimelimiter.data.ForceStopEnhancement
 import com.liuml.apptimelimiter.data.hasPersonalConfiguration
 import com.liuml.apptimelimiter.data.LimitEnforcementMode
 import com.liuml.apptimelimiter.data.InstalledApp
@@ -128,6 +148,7 @@ import com.liuml.apptimelimiter.backup.PortableBackupRepository
 import com.liuml.apptimelimiter.core.GroupUsagePolicy
 import com.liuml.apptimelimiter.core.HookStatusPresentationPolicy
 import com.liuml.apptimelimiter.core.CooldownPolicy
+import com.liuml.apptimelimiter.core.ExtensionQuotaPolicy
 import com.liuml.apptimelimiter.core.ProtectionSettingsPolicy
 import com.liuml.apptimelimiter.core.PermissionRepairPromptPolicy
 import com.liuml.apptimelimiter.core.ProtectionHealth
@@ -136,10 +157,15 @@ import com.liuml.apptimelimiter.core.ProtectionPresentationSeverity
 import com.liuml.apptimelimiter.core.ProtectionPresentationSnapshot
 import com.liuml.apptimelimiter.core.ProtectionPresentationState
 import com.liuml.apptimelimiter.core.ProtectionStatusPolicy
+import com.liuml.apptimelimiter.core.ProtectionModeRequirementsPolicy
+import com.liuml.apptimelimiter.core.ProtectionRequirement
 import com.liuml.apptimelimiter.core.ScopeState
 import com.liuml.apptimelimiter.core.TargetProtectionInput
 import com.liuml.apptimelimiter.core.TargetProtectionStatus
 import com.liuml.apptimelimiter.core.TimeQuotePolicy
+import com.liuml.apptimelimiter.core.RuleSimulationInput
+import com.liuml.apptimelimiter.core.RuleSimulationPolicy
+import com.liuml.apptimelimiter.core.RuleSimulationReason
 import com.liuml.apptimelimiter.core.VersionAnnouncementPolicy
 import com.liuml.apptimelimiter.localization.AppLocaleController
 import com.liuml.apptimelimiter.localization.SupportedLanguage
@@ -167,16 +193,32 @@ import com.liuml.apptimelimiter.security.PinVerificationResult
 import com.liuml.apptimelimiter.security.BiometricRecoveryManager
 import com.liuml.apptimelimiter.security.BiometricRecoveryResult
 import com.liuml.apptimelimiter.security.ParentAuthStore
+import com.liuml.apptimelimiter.security.DeviceAdminRepository
 import com.liuml.apptimelimiter.core.ManagerUnlockSessionPolicy
 import com.liuml.apptimelimiter.statistics.AppUsageSummary
 import com.liuml.apptimelimiter.statistics.CalculatedUsageSnapshot
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
 import com.liuml.apptimelimiter.statistics.UsageSummaryMergePolicy
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
+import com.liuml.apptimelimiter.statistics.StatisticsChartPolicy
+import com.liuml.apptimelimiter.statistics.StatisticsDisplayPolicy
+import com.liuml.apptimelimiter.nonroot.RootExecutor
+import com.liuml.apptimelimiter.statistics.StatisticsDateRangePolicy
+import com.liuml.apptimelimiter.statistics.WeeklyReport
+import com.liuml.apptimelimiter.statistics.WeeklyReportDay
+import com.liuml.apptimelimiter.statistics.WeeklyReportCache
+import com.liuml.apptimelimiter.statistics.WeeklyReportInsightPolicy
+import com.liuml.apptimelimiter.statistics.WeeklyReportPolicy
 import com.liuml.apptimelimiter.update.ReleaseInfo
 import com.liuml.apptimelimiter.update.AutomaticUpdatePolicy
 import com.liuml.apptimelimiter.update.UpdateCheckResult
 import com.liuml.apptimelimiter.update.UpdateChecker
+import com.liuml.apptimelimiter.backup.SavedWebDavConfig
+import com.liuml.apptimelimiter.backup.WebDavConfig
+import com.liuml.apptimelimiter.backup.WebDavRepository
+import com.liuml.apptimelimiter.backup.WebDavResult
+import com.liuml.apptimelimiter.backup.WebDavSettingsRepository
+import com.liuml.apptimelimiter.backup.PortableBackupV1
 import com.liuml.apptimelimiter.ui.theme.LocalTimeStopExtendedColors
 import com.liuml.apptimelimiter.ui.theme.LocalTimeStopThemeState
 import com.liuml.apptimelimiter.ui.theme.TimeStopTheme
@@ -190,13 +232,33 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import java.time.LocalDate
 import java.time.ZoneId
+import java.time.ZonedDateTime
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.cos
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.PI
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+private fun scheduleWebDavUpload(context: Context) {
+    val config = WebDavSettingsRepository(context).load()
+    if (!config.autoSync || config.endpoint.isBlank() || config.syncPassword.isBlank()) return
+    Thread {
+        WebDavRepository(context).upload(
+            WebDavConfig(
+                endpoint = config.endpoint,
+                username = config.username,
+                password = config.password,
+                syncPassword = config.syncPassword.toCharArray(),
+            ),
+        )
+    }.start()
+}
 
 @Composable
 private fun MigrationGateScreen(
@@ -234,9 +296,9 @@ private fun MigrationGateScreen(
                 } else if (legacy) {
                     "请确认 LSPosed 中已启用时停，然后强制停止并重新打开时停。迁移完成前不会提供 Modern 版本升级。"
                 } else if (english) {
-                    "This installation was upgraded from an older version, but no valid migration capsule from 0.11.13 was found. Initialization has stopped to prevent empty data from replacing rules, language settings, or child-lock state."
+                    "This installation was upgraded from an older version, but no valid migration capsule from 0.11.13 was found. Initialization has stopped to prevent empty data from replacing rules, language settings, or Control Lock state."
                 } else {
-                    "当前安装来自旧版本，但没有找到由 0.11.13 生成的迁移数据。为避免规则、语言或儿童锁被空数据覆盖，时停已停止初始化。"
+                    "当前安装来自旧版本，但没有找到由 0.11.13 生成的迁移数据。为避免规则、语言或管控锁被空数据覆盖，时停已停止初始化。"
                 },
                 style = MaterialTheme.typography.bodyLarge,
                 textAlign = TextAlign.Center,
@@ -259,8 +321,13 @@ private fun MigrationGateScreen(
 }
 
 class MainActivity : FragmentActivity() {
+    companion object {
+        const val EXTRA_OPEN_STATISTICS = "com.liuml.apptimelimiter.extra.OPEN_STATISTICS"
+    }
+
     private val xposedStatusRepository = XposedStatusRepository.instance
     private lateinit var nonRootStatusRepository: NonRootProtectionStatusRepository
+    private var openStatisticsFromIntent by mutableStateOf(false)
 
     override fun attachBaseContext(newBase: Context) {
         val migration = MigrationCoordinator.get(newBase)
@@ -275,6 +342,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        openStatisticsFromIntent = shouldOpenStatistics(intent)
         val migrationCoordinator = MigrationCoordinator.get(this)
         if (!migrationCoordinator.canInitializeRepositories()) {
             setContent {
@@ -402,6 +470,8 @@ class MainActivity : FragmentActivity() {
                             themeMode = mode
                             themeColor = color
                         },
+                        themeColor = themeColor,
+                        openStatisticsFromIntent = openStatisticsFromIntent,
                     )
                 }
             }
@@ -415,6 +485,32 @@ class MainActivity : FragmentActivity() {
             xposedStatusRepository.refresh()
         }
         if (::nonRootStatusRepository.isInitialized) nonRootStatusRepository.refresh()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        openStatisticsFromIntent = shouldOpenStatistics(intent)
+    }
+
+    private fun shouldOpenStatistics(intent: Intent?): Boolean =
+        intent?.getBooleanExtra(EXTRA_OPEN_STATISTICS, false) == true ||
+            intent?.data?.getQueryParameter("section") == "stats"
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP &&
+            getSharedPreferences(UI_PREFERENCES, Context.MODE_PRIVATE)
+                .getBoolean(HIDE_RECENTS_CARD_KEY, false) &&
+            !isChangingConfigurations
+        ) {
+            // The system has no dynamic API to remove only this task's card. Removing the
+            // manager task when the user explicitly leaves provides the requested behavior.
+            window.decorView.post {
+                if (!isFinishing && !isChangingConfigurations) finishAndRemoveTask()
+            }
+        }
     }
 }
 
@@ -432,9 +528,35 @@ private fun TimeLimiterScreen(
     appsRefreshing: Boolean,
     onRefreshApps: () -> Unit,
     onThemeChanged: (AppThemeMode, AppThemeColor) -> Unit,
+    themeColor: AppThemeColor,
+    openStatisticsFromIntent: Boolean,
 ) {
     val context = LocalContext.current
     val screenScope = rememberCoroutineScope()
+    val deviceAdminRepository = remember(context) { DeviceAdminRepository(context) }
+    var deviceAdminActive by remember { mutableStateOf(deviceAdminRepository.isActive()) }
+    val deviceAdminLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        deviceAdminActive = deviceAdminRepository.isActive()
+        if (!deviceAdminActive) {
+            Toast.makeText(
+                context,
+                localizedText(
+                    context,
+                    "设备管理器未启用，防止直接卸载未生效。请在系统安全设置中确认授权。",
+                    "Device administrator was not enabled. Uninstall protection is inactive; confirm the authorization in Security settings.",
+                ),
+                Toast.LENGTH_LONG,
+            ).show()
+        } else if (result.resultCode != Activity.RESULT_OK) {
+            Toast.makeText(
+                context,
+                localizedText(context, "设备管理器已启用", "Device administrator enabled."),
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
     val portableBackupRepository = remember(context) { PortableBackupRepository(context) }
     var backupPreview by remember { mutableStateOf<PortableBackupPreview?>(null) }
     var backupStatus by remember { mutableStateOf<String?>(null) }
@@ -523,7 +645,11 @@ private fun TimeLimiterScreen(
     var showSettings by remember { mutableStateOf(false) }
     var showAbout by remember { mutableStateOf(false) }
     var showFeedbackOptions by remember { mutableStateOf(false) }
+    var showFeedbackPreview by remember { mutableStateOf(false) }
+    var feedbackDraft by remember { mutableStateOf<FeedbackSender.Draft?>(null) }
     var showDonation by remember { mutableStateOf(false) }
+    var showWebDav by remember { mutableStateOf(false) }
+    var showWeeklyReport by remember { mutableStateOf(false) }
     var checkingUpdate by remember { mutableStateOf(false) }
     var updateResult by remember { mutableStateOf<UpdateCheckResult?>(null) }
     var pendingAutomaticUpdate by remember {
@@ -532,7 +658,12 @@ private fun TimeLimiterScreen(
     var pendingMigrationUpdate by remember {
         mutableStateOf<UpdateCheckResult.Available?>(null)
     }
-    var selectedSection by remember { mutableStateOf(MainSection.HOME) }
+    var selectedSection by remember {
+        mutableStateOf(if (openStatisticsFromIntent) MainSection.STATS else MainSection.HOME)
+    }
+    LaunchedEffect(openStatisticsFromIntent) {
+        if (openStatisticsFromIntent) selectedSection = MainSection.STATS
+    }
     var groups by remember { mutableStateOf(repository.getGroups()) }
     var editingGroup by remember { mutableStateOf<AppGroup?>(null) }
     var scopeReminderPackages by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -582,6 +713,29 @@ private fun TimeLimiterScreen(
     var childPinSaveInProgress by remember { mutableStateOf(false) }
     var pendingChildLockAction by remember { mutableStateOf<String?>(null) }
     var pendingProtectedAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val prepareFeedback: () -> Unit = {
+        FeedbackSender.prepare(context, diagnosticsRepository)
+            .onSuccess { draft ->
+                feedbackDraft = draft
+                showFeedbackOptions = false
+                showLogs = false
+                showFeedbackPreview = true
+            }
+            .onFailure { error ->
+                diagnosticsRepository.append(
+                    level = "WARN",
+                    packageName = context.packageName,
+                    event = "FEEDBACK_DRAFT_FAILED",
+                    message = error.javaClass.simpleName,
+                )
+                Toast.makeText(
+                    context,
+                    localizedText(context, "无法准备诊断日志，请稍后重试", "Unable to prepare diagnostic logs. Try again."),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        Unit
+    }
 
     LaunchedEffect(childLockRevision) {
         if (childLockRevision > 0 && BuildConfig.LEGACY_MIGRATION_EXPORT_ENABLED) {
@@ -656,6 +810,7 @@ private fun TimeLimiterScreen(
             showAbout ||
             showFeedbackOptions ||
             showDonation ||
+            showWebDav ||
             checkingUpdate ||
             updateResult != null ||
             scopeReminderPackages.isNotEmpty() ||
@@ -750,12 +905,25 @@ private fun TimeLimiterScreen(
         deviceUsageStatsRepository.hasUsageAccess()
     }
     val allLaunchablePackages = remember(apps) { apps.map(InstalledApp::packageName).toSet() }
-    val groupPackages = remember(groups) { groups.flatMapTo(mutableSetOf(), AppGroup::packageNames) }
-    val hookSummaries = remember(allLaunchablePackages, usageRevision) {
-        usageStatsRepository.summariesToday(allLaunchablePackages)
+    val systemPackages = remember(apps) {
+        apps.filter(InstalledApp::isSystemApp).mapTo(mutableSetOf(), InstalledApp::packageName)
     }
-    val systemTrackedPackages = remember(allLaunchablePackages, groupPackages, statsEnabled) {
-        if (statsEnabled) allLaunchablePackages else groupPackages
+    val statisticsApps = remember(apps, showSystemApps) {
+        if (showSystemApps) apps else apps.filterNot(InstalledApp::isSystemApp)
+    }
+    val statisticsPackages = remember(statisticsApps) {
+        statisticsApps.mapTo(mutableSetOf(), InstalledApp::packageName)
+    }
+    val groupPackages = remember(groups) { groups.flatMapTo(mutableSetOf(), AppGroup::packageNames) }
+    var hookSummaries by remember { mutableStateOf(emptyList<AppUsageSummary>()) }
+    LaunchedEffect(allLaunchablePackages, usageRevision) {
+        val requestedPackages = allLaunchablePackages.toSet()
+        hookSummaries = withContext(Dispatchers.IO) {
+            usageStatsRepository.summariesToday(requestedPackages)
+        }
+    }
+    val systemTrackedPackages = remember(statisticsPackages, groupPackages, statsEnabled) {
+        if (statsEnabled) statisticsPackages else groupPackages
     }
     var systemUsageSnapshot by remember { mutableStateOf(CalculatedUsageSnapshot()) }
     val systemSummaries = systemUsageSnapshot.summaries
@@ -776,7 +944,7 @@ private fun TimeLimiterScreen(
     ) {
         if (!statsEnabled) return@remember emptyList()
         val hookByPackage = hookSummaries.associateBy(AppUsageSummary::packageName)
-        apps.mapNotNull { app ->
+        statisticsApps.mapNotNull { app ->
             val hook = hookByPackage[app.packageName] ?: AppUsageSummary(
                 packageName = app.packageName,
                 durationMillis = 0L,
@@ -811,6 +979,62 @@ private fun TimeLimiterScreen(
                 .takeIf { usageAccessGranted },
             maximumDayDurationMillis = elapsedTodayMillis(),
         )
+    }
+    var statisticsDateText by rememberSaveable { mutableStateOf(LocalDate.now().toString()) }
+    val statisticsDate = remember(statisticsDateText) {
+        runCatching { LocalDate.parse(statisticsDateText) }.getOrElse { LocalDate.now() }
+    }
+    var statisticsSummaries by remember { mutableStateOf(todaySummaries) }
+    var statisticsTotalMillis by remember { mutableLongStateOf(todayTotalMillis) }
+    var statisticsLoading by remember { mutableStateOf(false) }
+    var statisticsError by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(
+        statisticsDate,
+        usageRevision,
+        statsEnabled,
+        usageAccessGranted,
+        todaySummaries,
+        todayTotalMillis,
+    ) {
+        if (statisticsDate == LocalDate.now()) {
+            statisticsSummaries = todaySummaries
+            statisticsTotalMillis = todayTotalMillis
+            statisticsLoading = false
+            statisticsError = null
+        } else if (!statsEnabled) {
+            statisticsSummaries = emptyList()
+            statisticsTotalMillis = 0L
+            statisticsLoading = false
+            statisticsError = null
+        } else {
+            statisticsLoading = true
+            val date = statisticsDate
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val hook = usageStatsRepository.summariesForDay(statisticsPackages, date)
+                    val system = if (usageAccessGranted) {
+                        deviceUsageStatsRepository.usageSnapshot(statisticsPackages, date)
+                    } else {
+                        CalculatedUsageSnapshot()
+                    }
+                    val merged = mergeUsageSummaries(statisticsApps, hook, system, usageAccessGranted)
+                    val total = UsageSummaryMergePolicy.authoritativeTotalDuration(
+                        appDurationsMillis = merged.map(AppUsageSummary::durationMillis),
+                        systemUnionDurationMillis = system.totalDurationMillis.takeIf { usageAccessGranted },
+                        maximumDayDurationMillis = 24L * 60L * 60L * 1000L,
+                    )
+                    merged to total
+                }
+            }
+            result.onSuccess { (loadedSummaries, loadedTotal) ->
+                statisticsSummaries = loadedSummaries
+                statisticsTotalMillis = loadedTotal
+                statisticsError = null
+            }.onFailure { error ->
+                statisticsError = error.javaClass.simpleName
+            }
+            statisticsLoading = false
+        }
     }
     val groupUsageById = remember(groups, hookSummaries, systemSummaries) {
         val moduleDurations = hookSummaries.associate { it.packageName to it.durationMillis }
@@ -879,7 +1103,10 @@ private fun TimeLimiterScreen(
                     accessibilityEnabled = nonRootSnapshot.accessibilityEnabled,
                     accessibilityConfigured = nonRootSnapshot.accessibilityConfigured,
                     usageAccessGranted = nonRootSnapshot.usageAccessGranted,
-                    shizukuState = if (currentSettings.protectionMode.usesShizuku) {
+                    shizukuState = if (
+                        currentSettings.accessibilityForceStopEnhancement ==
+                            ForceStopEnhancement.SHIZUKU
+                    ) {
                         shizukuState
                     } else {
                         shizukuRepairCapability
@@ -943,6 +1170,7 @@ private fun TimeLimiterScreen(
             accessibilityState = nonRootSnapshot.accessibilityRuntimeState,
             usageAccessGranted = nonRootSnapshot.usageAccessGranted,
             shizukuState = shizukuState,
+            accessibilityEnhancement = currentSettings.accessibilityForceStopEnhancement,
         )
     }
     val xposedSettingsAvailable = remember(
@@ -962,7 +1190,8 @@ private fun TimeLimiterScreen(
             nonRootEnabled = currentSettings.protectionMode.usesNonRoot,
             accessibilityState = nonRootSnapshot.accessibilityRuntimeState,
             usageAccessGranted = nonRootSnapshot.usageAccessGranted,
-            shizukuSelected = currentSettings.protectionMode.usesShizuku,
+            shizukuSelected = currentSettings.accessibilityForceStopEnhancement ==
+                ForceStopEnhancement.SHIZUKU,
             shizukuState = shizukuState,
         )
     }
@@ -1191,6 +1420,19 @@ private fun TimeLimiterScreen(
         }
     }
 
+    if (showWeeklyReport) {
+        WeeklyReportScreen(
+            apps = statisticsApps,
+            controlledPackages = enabledPackages,
+            weekStart = WeeklyReportPolicy.weekStart(LocalDate.now()),
+            usageStatsRepository = usageStatsRepository,
+            deviceUsageStatsRepository = deviceUsageStatsRepository,
+            usageAccessGranted = usageAccessGranted,
+            onBack = { showWeeklyReport = false },
+        )
+        return@TimeLimiterScreen
+    }
+
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
@@ -1237,15 +1479,15 @@ private fun TimeLimiterScreen(
                             usageRevision++
                         },
                         icon = {
-                            Text(
+                            FunctionIcon(
                                 when (section) {
-                                    MainSection.HOME -> "⌂"
-                                    MainSection.APPS -> "▦"
-                                    MainSection.GROUPS -> "◫"
-                                    MainSection.STATS -> "▥"
+                                    MainSection.HOME -> "home"
+                                    MainSection.APPS -> "apps"
+                                    MainSection.GROUPS -> "groups"
+                                    MainSection.STATS -> "stats"
                                 },
-                                style = MaterialTheme.typography.headlineSmall,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                tint = if (selected) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         },
                         label = { Text(section.label) },
@@ -1291,7 +1533,7 @@ private fun TimeLimiterScreen(
                         shape = RoundedCornerShape(16.dp),
                     )
                     Spacer(Modifier.height(10.dp))
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilterChip(
                             selected = onlyEnabled,
                             onClick = { onlyEnabled = !onlyEnabled },
@@ -1397,12 +1639,32 @@ private fun TimeLimiterScreen(
             MainSection.STATS -> UsageStatisticsScreen(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 apps = apps,
-                summaries = todaySummaries,
-                todayTotalMillis = todayTotalMillis,
+                summaries = statisticsSummaries,
+                totalMillis = statisticsTotalMillis,
+                selectedDate = statisticsDate,
+                loading = statisticsLoading,
                 controlledPackages = enabledPackages,
                 statsEnabled = statsEnabled,
                 usageAccessGranted = usageAccessGranted,
+                statisticsError = statisticsError,
+                showSystemApps = showSystemApps,
+                systemPackages = systemPackages,
+                themeColor = themeColor,
                 onRequestUsageAccess = deviceUsageStatsRepository::openUsageAccessSettings,
+                onOpenWeeklyReport = { showWeeklyReport = true },
+                onToggleShowSystemApps = {
+                    showSystemApps = !showSystemApps
+                    context.getSharedPreferences("ui", Context.MODE_PRIVATE)
+                        .edit()
+                        .putBoolean("show_system_apps", showSystemApps)
+                        .apply()
+                    usageRevision++
+                },
+                onDateChange = { statisticsDateText = it.toString() },
+                onOpenApp = { app ->
+                    groupByPackage[app.packageName]?.let { editingGroup = it }
+                        ?: run { editingApp = app }
+                },
                 onClear = {
                     val clearAction = {
                         usageStatsRepository.clearAll()
@@ -1448,6 +1710,7 @@ private fun TimeLimiterScreen(
                 }
                 rules[app.packageName] = repository.getRule(app.packageName)
                 scopeSyncCoordinator.notifyConfigurationChanged()
+                scheduleWebDavUpload(context)
                 editingApp = null
             },
         )
@@ -1464,6 +1727,7 @@ private fun TimeLimiterScreen(
                 if (repository.saveGroup(updated)) {
                     groups = repository.getGroups()
                     scopeSyncCoordinator.notifyConfigurationChanged()
+                    scheduleWebDavUpload(context)
                     editingGroup = null
                     usageRevision++
                 } else {
@@ -1498,7 +1762,7 @@ private fun TimeLimiterScreen(
     if (showLogs) {
         DiagnosticLogDialog(
             repository = diagnosticsRepository,
-            onFeedback = { FeedbackSender.send(context, diagnosticsRepository) },
+            onFeedback = { showFeedbackOptions = true },
             onClear = { clear ->
                 if (childLockSnapshot.enabled && !managerUnlocked) {
                     showLogs = false
@@ -1529,6 +1793,7 @@ private fun TimeLimiterScreen(
             xposedFrameworkConnected = xposedSnapshot.connected,
             xposedSnapshotStale = xposedSnapshot.stale,
             scopeSyncSnapshot = scopeSyncSnapshot,
+            deviceAdminActive = deviceAdminActive,
             missingBackupPackages = missingBackupPackages,
             backupStatus = backupStatus,
             onDismiss = {
@@ -1684,6 +1949,10 @@ private fun TimeLimiterScreen(
                 showSettings = false
                 showMissingBackupRules = true
             },
+            onWebDav = {
+                showSettings = false
+                showWebDav = true
+            },
             onOpenOemCompatibilitySettings = {
                 val result = OemCompatibilityNavigator.open(context)
                 diagnosticsRepository.append(
@@ -1707,6 +1976,29 @@ private fun TimeLimiterScreen(
                         Toast.LENGTH_LONG,
                     ).show()
                 }
+            },
+            onEnableDeviceAdmin = {
+                if (deviceAdminRepository.canActivate()) {
+                    runCatching {
+                        deviceAdminLauncher.launch(deviceAdminRepository.activationIntent())
+                    }.onFailure {
+                        Toast.makeText(
+                            context,
+                            localizedText(context, "无法打开设备管理器，请在系统设置中手动开启", "Unable to open device administrator; enable it in system settings."),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                } else {
+                    Toast.makeText(
+                        context,
+                        localizedText(context, "当前系统不支持直接打开设备管理器，请打开系统安全设置", "This system cannot open device administrator directly; open Security settings."),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    runCatching { deviceAdminLauncher.launch(deviceAdminRepository.activationIntent()) }
+                }
+            },
+            onDisableDeviceAdmin = {
+                deviceAdminActive = deviceAdminRepository.disable()
             },
             onSave = saveSettings@{ settings ->
                 val previousSettings = repository.getGlobalSettings().copy(
@@ -1799,6 +2091,7 @@ private fun TimeLimiterScreen(
                 nonRootStatusRepository.refresh()
                 showSettings = false
                 onThemeChanged(settings.themeMode, settings.themeColor)
+                scheduleWebDavUpload(context)
                 if (settings.languageMode != previousSettings.languageMode) {
                     val manualRecreate = AppLocaleController.apply(context, settings.languageMode)
                     if (manualRecreate) (context as? Activity)?.recreate()
@@ -1913,8 +2206,8 @@ private fun TimeLimiterScreen(
                     Text(
                         localizedText(
                             context,
-                            "将替换本机 ${preview.existingRuleCount} 项有效规则和 ${preview.existingGroupCount} 个分组。儿童锁和当前保护方式不会改变。",
-                            "This replaces ${preview.existingRuleCount} active rules and ${preview.existingGroupCount} groups. Child lock and the current protection mode will not change.",
+                            "将替换本机 ${preview.existingRuleCount} 项有效规则和 ${preview.existingGroupCount} 个分组。管控锁和当前保护方式不会改变。",
+                            "This replaces ${preview.existingRuleCount} active rules and ${preview.existingGroupCount} groups. Control Lock and the current protection mode will not change.",
                         ),
                         color = MaterialTheme.colorScheme.error,
                     )
@@ -2078,15 +2371,36 @@ private fun TimeLimiterScreen(
     if (showFeedbackOptions) {
         FeedbackOptionsDialog(
             onDismiss = { showFeedbackOptions = false },
-            onEmail = {
-                showFeedbackOptions = false
-                FeedbackSender.send(context, diagnosticsRepository)
-            },
+            onShare = prepareFeedback,
             onQqGroup = {
                 showFeedbackOptions = false
                 openQqGroup(context)
             },
         )
+    }
+
+    if (showFeedbackPreview) {
+        feedbackDraft?.let { draft ->
+            FeedbackPreviewDialog(
+                draft = draft,
+                onDismiss = { showFeedbackPreview = false },
+                onShare = {
+                    when (FeedbackSender.share(context, draft)) {
+                        FeedbackSender.ShareLaunchResult.OPENED -> Unit
+                        FeedbackSender.ShareLaunchResult.NO_SHARE_TARGET -> Toast.makeText(
+                            context,
+                            localizedText(context, "未找到可分享的应用，请复制日志后通过任意渠道发送", "No sharing app found. Copy the logs and send them with any app."),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        FeedbackSender.ShareLaunchResult.FAILED -> Toast.makeText(
+                            context,
+                            localizedText(context, "系统分享无法打开，日志仍可复制", "Unable to open the system share sheet. The logs can still be copied."),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                },
+            )
+        }
     }
 
     if (showDonation) {
@@ -2097,6 +2411,50 @@ private fun TimeLimiterScreen(
             },
             onOpenWechat = {
                 if (openWechatDonation(context)) showDonation = false
+            },
+        )
+    }
+
+    if (showWebDav) {
+        WebDavDialog(
+            initial = WebDavSettingsRepository(context).load(),
+            onDismiss = { showWebDav = false },
+            onSave = { config ->
+                if (!WebDavSettingsRepository(context).save(config)) {
+                    Toast.makeText(context, "WebDAV 配置保存失败", Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(context, "WebDAV 配置已保存", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onSync = { config ->
+                Thread {
+                    val result = WebDavRepository(context).upload(
+                        WebDavConfig(config.endpoint, config.username, config.password, config.syncPassword.toCharArray()),
+                    )
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(
+                            context,
+                            if (result is WebDavResult.Success) "WebDAV 上传成功" else "WebDAV 同步失败",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }.start()
+            },
+            onDownload = { config, onResult ->
+                Thread {
+                    val result = WebDavRepository(context).download(
+                        WebDavConfig(config.endpoint, config.username, config.password, config.syncPassword.toCharArray()),
+                    )
+                    Handler(Looper.getMainLooper()).post { onResult(result) }
+                }.start()
+            },
+            onApplyRemote = { backup ->
+                if (repository.replacePortableConfiguration(backup)) {
+                    repository.reconcileRuleAccess()
+                    Toast.makeText(context, "WebDAV 配置已导入", Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(context, "WebDAV 配置导入失败", Toast.LENGTH_LONG).show()
+                }
             },
         )
     }
@@ -2432,7 +2790,7 @@ private fun TimeLimiterScreen(
                     if (activity != null) {
                         biometricRecoveryManager.authenticate(
                             activity,
-                            localizedText(context, "找回儿童锁", "Recover child lock"),
+                            localizedText(context, "找回管控锁", "Recover Control Lock"),
                             localizedText(
                                 context,
                                 "验证后只能设置新 PIN，不会显示旧 PIN",
@@ -2483,6 +2841,7 @@ private fun TimeLimiterScreen(
                             repository.getGlobalSettings().copy(childLockEnabled = false),
                         )
                         if (privateCleared) {
+                            ParentAuthStore.initialize(context)
                             ParentAuthStore.clear()
                             biometricRecoveryManager.deleteRecoveryKey()
                         }
@@ -2500,8 +2859,8 @@ private fun TimeLimiterScreen(
                                 context,
                                 localizedText(
                                     context,
-                                    "关闭儿童锁失败，请重试",
-                                    "Failed to disable child lock. Try again.",
+                                    "关闭管控锁失败，请重试",
+                                    "Failed to disable Control Lock. Try again.",
                                 ),
                                 Toast.LENGTH_LONG,
                             ).show()
@@ -2644,7 +3003,7 @@ private fun TimeLimiterScreen(
                             childLockRevision++
                             android.util.Log.e(
                                 "TimeStopChildLock",
-                                "Child-lock PIN save failed; privateSaved=$privateSaved, replacing=$replacing",
+                                "Control Lock PIN save failed; privateSaved=$privateSaved, replacing=$replacing",
                             )
                             diagnosticsRepository.append(
                                 "ERROR",
@@ -2659,12 +3018,12 @@ private fun TimeLimiterScreen(
                                     if (replacing && privateSaved) {
                                         "PIN 已更新，但设置同步失败；请重新打开设置确认"
                                     } else {
-                                        "儿童锁保存失败，请重试"
+                                        "管控锁保存失败，请重试"
                                     },
                                     if (replacing && privateSaved) {
                                         "The PIN changed, but settings sync failed. Reopen settings to verify."
                                     } else {
-                                        "Failed to save child lock. Try again."
+                                        "Failed to save Control Lock. Try again."
                                     },
                                 ),
                                 Toast.LENGTH_LONG,
@@ -2732,8 +3091,8 @@ private fun ChildLockPinDialog(
                 PinVerificationResult.NotConfigured -> {
                     error = localizedText(
                         context,
-                        "儿童锁配置不可用",
-                        "Child lock is unavailable",
+                        "管控锁配置不可用",
+                        "Control Lock is unavailable",
                     )
                 }
                 is PinVerificationResult.Rejected -> {
@@ -2879,8 +3238,8 @@ private fun ChildLockPinSetupDialog(
             Text(
                 localizedText(
                     context,
-                    if (replacing) "设置新 PIN" else "创建儿童锁 PIN",
-                    if (replacing) "Set a new PIN" else "Create a child-lock PIN",
+                    if (replacing) "设置新 PIN" else "创建管控锁 PIN",
+                    if (replacing) "Set a new PIN" else "Create a Control Lock PIN",
                 ),
             )
         },
@@ -2994,7 +3353,7 @@ private fun HomeDashboard(
             ) {
                 DashboardMetricCard(
                     modifier = Modifier.weight(1f),
-                    symbol = "◷",
+                    iconKey = "timer",
                     symbolColor = MaterialTheme.colorScheme.tertiary,
                     value = formatDashboardDuration(todayTotalMillis),
                     label = "今日总使用",
@@ -3002,7 +3361,7 @@ private fun HomeDashboard(
                 )
                 DashboardMetricCard(
                     modifier = Modifier.weight(1f),
-                    symbol = "▦",
+                    iconKey = "apps",
                     symbolColor = MaterialTheme.colorScheme.primary,
                     value = "$enabledCount 个",
                     label = "管控应用数",
@@ -3022,7 +3381,7 @@ private fun HomeDashboard(
         }
         item {
             DashboardActionCard(
-                symbol = "▦",
+                iconKey = "apps",
                 title = "管理应用",
                 description = "选择需要管控的应用并设置时间限制",
                 onClick = onManageApps,
@@ -3030,7 +3389,7 @@ private fun HomeDashboard(
         }
         item {
             DashboardActionCard(
-                symbol = "▥",
+                iconKey = "stats",
                 title = "使用统计",
                 description = "查看各应用今天的使用时长记录",
                 onClick = onOpenStats,
@@ -3050,10 +3409,10 @@ private fun protectionPresentationTitle(
     presentation: ProtectionPresentationSnapshot,
 ): String = when (presentation.state) {
     ProtectionPresentationState.NO_TARGETS -> localizedText(context, "尚未配置管控应用", "No managed apps configured")
-    ProtectionPresentationState.XPOSED_SCOPE_READY -> localizedText(context, "LSPosed 作用域已就绪", "LSPosed scope is ready")
+    ProtectionPresentationState.XPOSED_SCOPE_READY -> localizedText(context, "LSPosed Hook 待验证", "LSPosed Hook is awaiting verification")
     ProtectionPresentationState.XPOSED_HOOK_VERIFIED -> localizedText(context, "LSPosed Hook 已验证", "LSPosed Hook verified")
-    ProtectionPresentationState.XPOSED_WAITING_VERIFICATION -> localizedText(context, "LSPosed 模式已选择", "LSPosed mode selected")
-    ProtectionPresentationState.XPOSED_REPAIR_REQUIRED -> localizedText(context, "LSPosed 配置需要处理", "LSPosed configuration needs attention")
+    ProtectionPresentationState.XPOSED_WAITING_VERIFICATION -> localizedText(context, "LSPosed Hook 待验证", "LSPosed Hook is awaiting verification")
+    ProtectionPresentationState.XPOSED_REPAIR_REQUIRED -> localizedText(context, "LSPosed Hook 需要处理", "LSPosed Hook needs attention")
     ProtectionPresentationState.ACCESSIBILITY_RUNNING -> localizedText(context, "普通保护运行中", "Basic protection is running")
     ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_RUNNING -> localizedText(context, "普通保护 + Shizuku 强停增强", "Basic protection + Shizuku force-stop")
     ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_FALLBACK -> localizedText(context, "普通保护运行中", "Basic protection is running")
@@ -3067,22 +3426,22 @@ private fun protectionPresentationDetail(
     snapshotStale: Boolean,
 ): String = when (presentation.state) {
     ProtectionPresentationState.NO_TARGETS -> localizedText(context, "保存规则后，这里会显示真实执行链路。", "The actual controller appears here after a rule is saved.")
-    ProtectionPresentationState.XPOSED_SCOPE_READY -> localizedText(context, "目标应用已加入作用域；无需先启动应用，打开后规则会生效。", "Targets are in scope and rules apply when opened.")
+    ProtectionPresentationState.XPOSED_SCOPE_READY -> localizedText(context, "目标应用已加入作用域，打开目标应用后即可验证 Hook。", "Targets are in scope. Open a target app to verify the Hook.")
     ProtectionPresentationState.XPOSED_HOOK_VERIFIED -> localizedText(context, "当前版本 Hook 已验证，普通保护不会重复接管。", "The current Hook is verified; basic protection will not take over.")
     ProtectionPresentationState.XPOSED_WAITING_VERIFICATION -> localizedText(
         context,
         when {
             snapshotStale -> "LSPosed 快照已过期，暂时无法直读；不会误报未加入作用域。"
             !frameworkConnected -> "当前无法直读作用域；打开管控应用后可通过 Hook 心跳验证。"
-            else -> "等待作用域或 Hook 证据，当前状态未知，不代表未生效。"
+            else -> "等待目标应用打开并完成 Hook 验证，当前状态未知，不代表未生效。"
         },
         when {
             snapshotStale -> "The LSPosed snapshot is stale; scope is not reported missing."
             !frameworkConnected -> "Scope cannot be read directly. Open a target app to verify via Hook heartbeat."
-            else -> "Waiting for scope or Hook evidence. This is unknown, not inactive."
+            else -> "Waiting for a target app to open and verify the Hook. This is unknown, not inactive."
         },
     )
-    ProtectionPresentationState.XPOSED_REPAIR_REQUIRED -> localizedText(context, "仅列出明确缺少作用域、旧版 Hook 或加载失败的应用。", "Only confirmed scope omissions, outdated Hooks, or load failures are listed.")
+    ProtectionPresentationState.XPOSED_REPAIR_REQUIRED -> localizedText(context, "仅列出明确未加入作用域、Hook 版本过旧或加载失败的应用。", "Only confirmed scope omissions, outdated Hooks, or Hook load failures are listed.")
     ProtectionPresentationState.ACCESSIBILITY_RUNNING -> localizedText(context, "无障碍识别前台，使用情况访问校准计时，到限使用独立限制页。", "Accessibility detects foreground apps, Usage Access calibrates timing, and limits use the standalone page.")
     ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_RUNNING -> localizedText(context, "普通保护负责计时，Shizuku 已就绪并优先执行强停。", "Basic protection tracks time and Shizuku is ready to force-stop.")
     ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_FALLBACK -> localizedText(context, "Shizuku 未就绪，基础计时仍生效；到限后回退独立限制页。", "Shizuku is not ready. Basic timing works and limits fall back to the standalone page.")
@@ -3115,9 +3474,57 @@ private fun UsageAccessCard(onRequestUsageAccess: () -> Unit) {
 }
 
 @Composable
+private fun FunctionIcon(
+    iconKey: String,
+    modifier: Modifier = Modifier.size(34.dp),
+    tint: Color = MaterialTheme.colorScheme.primary,
+) {
+    Canvas(modifier = modifier) {
+        val stroke = Stroke(
+            width = 2.1.dp.toPx(),
+            cap = StrokeCap.Round,
+            join = StrokeJoin.Round,
+        )
+        fun point(value: Float): Float = value / 24f * size.minDimension
+        fun path(draw: Path.() -> Unit) {
+            drawPath(Path().apply(draw), color = tint, style = stroke)
+        }
+        fun line(x1: Float, y1: Float, x2: Float, y2: Float) {
+            drawLine(tint, Offset(point(x1), point(y1)), Offset(point(x2), point(y2)), stroke.width, stroke.cap)
+        }
+        when (iconKey) {
+            "home" -> {
+                path { moveTo(point(3.5f), point(10.5f)); lineTo(point(12f), point(3f)); lineTo(point(20.5f), point(10.5f)) }
+                path { moveTo(point(5f), point(9.5f)); lineTo(point(5f), point(20f)); lineTo(point(19f), point(20f)); lineTo(point(19f), point(9.5f)) }
+                path { moveTo(point(9f), point(20f)); lineTo(point(9f), point(15f)); lineTo(point(15f), point(15f)); lineTo(point(15f), point(20f)) }
+            }
+            "apps" -> listOf(4f to 4f, 14f to 4f, 4f to 14f, 14f to 14f).forEach { (x, y) ->
+                drawRoundRect(tint, Offset(point(x), point(y)), androidx.compose.ui.geometry.Size(point(6f), point(6f)), CornerRadius(point(.8f), point(.8f)), style = stroke)
+            }
+            "groups" -> {
+                drawCircle(tint, point(3f), Offset(point(9f), point(8f)), style = stroke)
+                drawCircle(tint, point(2.5f), Offset(point(17f), point(9f)), style = stroke)
+                path { moveTo(point(3.5f), point(20f)); cubicTo(point(4f), point(16.8f), point(5.8f), point(15f), point(9f), point(15f)); cubicTo(point(12.1f), point(15f), point(14f), point(16.8f), point(14.5f), point(20f)) }
+                path { moveTo(point(14f), point(15.5f)); cubicTo(point(16.8f), point(15.3f), point(18.8f), point(17f), point(19.5f), point(20f)) }
+            }
+            "stats" -> { line(4f, 20f, 4f, 10f); line(10f, 20f, 10f, 5f); line(16f, 20f, 16f, 13f); line(2f, 20f, 22f, 20f) }
+            "timer" -> { drawCircle(tint, point(8f), Offset(point(12f), point(13f)), style = stroke); line(12f, 13f, 12f, 8f); line(9f, 3f, 15f, 3f); line(12f, 3f, 12f, 5f) }
+            else -> {
+                drawCircle(tint, point(7.5f), Offset(point(12f), point(12f)), style = stroke)
+                drawCircle(tint, point(3f), Offset(point(12f), point(12f)), style = stroke)
+                line(12f, 2.5f, 12f, 5f); line(12f, 19f, 12f, 21.5f)
+                line(2.5f, 12f, 5f, 12f); line(19f, 12f, 21.5f, 12f)
+                line(5.3f, 5.3f, 7.4f, 7.4f); line(16.6f, 16.6f, 18.7f, 18.7f)
+                line(18.7f, 5.3f, 16.6f, 7.4f); line(7.4f, 16.6f, 5.3f, 18.7f)
+            }
+        }
+    }
+}
+
+@Composable
 private fun DashboardMetricCard(
     modifier: Modifier,
-    symbol: String,
+    iconKey: String,
     symbolColor: Color,
     value: String,
     label: String,
@@ -3134,7 +3541,7 @@ private fun DashboardMetricCard(
             modifier = Modifier.padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            Text(symbol, color = symbolColor, style = MaterialTheme.typography.headlineMedium)
+            FunctionIcon(iconKey, tint = symbolColor)
             Text(
                 value,
                 style = MaterialTheme.typography.headlineMedium,
@@ -3154,7 +3561,7 @@ private fun DashboardMetricCard(
 
 @Composable
 private fun DashboardActionCard(
-    symbol: String,
+    iconKey: String,
     title: String,
     description: String,
     onClick: () -> Unit,
@@ -3169,11 +3576,7 @@ private fun DashboardActionCard(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(18.dp),
         ) {
-            Text(
-                symbol,
-                color = MaterialTheme.colorScheme.primary,
-                style = MaterialTheme.typography.headlineMedium,
-            )
+            FunctionIcon(iconKey, modifier = Modifier.size(38.dp))
             Column {
                 Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Text(
@@ -3191,24 +3594,139 @@ private fun UsageStatisticsScreen(
     modifier: Modifier,
     apps: List<InstalledApp>,
     summaries: List<AppUsageSummary>,
-    todayTotalMillis: Long,
+    totalMillis: Long,
+    selectedDate: LocalDate,
+    loading: Boolean,
     controlledPackages: Set<String>,
     statsEnabled: Boolean,
     usageAccessGranted: Boolean,
+    statisticsError: String?,
+    showSystemApps: Boolean,
+    systemPackages: Set<String>,
+    themeColor: AppThemeColor,
     onRequestUsageAccess: () -> Unit,
+    onOpenWeeklyReport: () -> Unit,
+    onToggleShowSystemApps: () -> Unit,
+    onDateChange: (LocalDate) -> Unit,
+    onOpenApp: (InstalledApp) -> Unit,
     onClear: () -> Unit,
 ) {
     val healthColors = LocalTimeStopExtendedColors.current
-    val appByPackage = remember(apps) { apps.associateBy(InstalledApp::packageName) }
-    val sorted = summaries.sortedWith(
+    val context = LocalContext.current
+    val appByPackage = remember(apps, showSystemApps) {
+        apps.filter { showSystemApps || !it.isSystemApp }
+            .associateBy(InstalledApp::packageName)
+    }
+    val visibleSummaries = remember(summaries, systemPackages, showSystemApps) {
+        StatisticsDisplayPolicy.filter(summaries, systemPackages, showSystemApps)
+    }
+    // Historical usage can outlive the launchable-app snapshot. Keep those packages in the
+    // chart map so a missing InstalledApp object cannot silently remove an icon from its arc.
+    val chartAppsByPackage = remember(appByPackage, visibleSummaries) {
+        buildMap {
+            putAll(appByPackage)
+            visibleSummaries.forEach { summary ->
+                putIfAbsent(
+                    summary.packageName,
+                    InstalledApp(
+                        label = summary.packageName,
+                        packageName = summary.packageName,
+                        isSystemApp = false,
+                    ),
+                )
+            }
+        }
+    }
+    val sorted = visibleSummaries.sortedWith(
         compareByDescending<AppUsageSummary> { it.packageName in controlledPackages }
             .thenByDescending { it.durationMillis }
             .thenByDescending { it.lastUsedAtMillis },
     )
+    val segments = remember(visibleSummaries) { StatisticsChartPolicy.segments(visibleSummaries) }
+    val chartColors = listOf(
+        MaterialTheme.colorScheme.primary,
+        MaterialTheme.colorScheme.tertiary,
+        healthColors.info,
+        healthColors.success,
+        MaterialTheme.colorScheme.secondary,
+        MaterialTheme.colorScheme.error,
+        MaterialTheme.colorScheme.outline,
+    )
+    val launchCount = visibleSummaries.sumOf { it.launchCount.coerceAtLeast(0) }
+    val limitHitCount = visibleSummaries.sumOf { it.limitHitCount.coerceAtLeast(0) }
+    val controlledCount = visibleSummaries.count { it.packageName in controlledPackages }
+    val recordedCount = visibleSummaries.count { it.durationMillis > 0L || it.launchCount > 0 || it.limitHitCount > 0 }
+    val today = LocalDate.now()
+    val canGoPrevious = StatisticsDateRangePolicy.canSelect(selectedDate.minusDays(1L), today)
+    val canGoNext = StatisticsDateRangePolicy.canSelect(selectedDate.plusDays(1L), today)
+    var showDatePicker by remember { mutableStateOf(false) }
+    var selectedChartPackage by rememberSaveable { mutableStateOf<String?>(null) }
+    val selectedChartSummary = visibleSummaries.firstOrNull {
+        it.packageName == selectedChartPackage
+    }
+    LaunchedEffect(showDatePicker) {
+        if (!showDatePicker) return@LaunchedEffect
+        val dark = (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+        val themedContext = ContextThemeWrapper(
+            context,
+            when (themeColor) {
+                AppThemeColor.GREEN -> if (dark) {
+                    R.style.Theme_AppTimeLimiter_TimePicker_Green_Dark
+                } else {
+                    R.style.Theme_AppTimeLimiter_TimePicker_Green_Light
+                }
+                AppThemeColor.BLUE -> if (dark) {
+                    R.style.Theme_AppTimeLimiter_TimePicker_Blue_Dark
+                } else {
+                    R.style.Theme_AppTimeLimiter_TimePicker_Blue_Light
+                }
+                AppThemeColor.PURPLE -> if (dark) {
+                    R.style.Theme_AppTimeLimiter_TimePicker_Purple_Dark
+                } else {
+                    R.style.Theme_AppTimeLimiter_TimePicker_Purple_Light
+                }
+            },
+        )
+        val dialog = DatePickerDialog(
+            themedContext,
+            { _, year, month, day ->
+                onDateChange(LocalDate.of(year, month + 1, day))
+                showDatePicker = false
+            },
+            selectedDate.year,
+            selectedDate.monthValue - 1,
+            selectedDate.dayOfMonth,
+        )
+        dialog.datePicker.minDate = today.minusDays(StatisticsDateRangePolicy.MAX_HISTORY_DAYS - 1L)
+            .atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        dialog.datePicker.maxDate = System.currentTimeMillis()
+        dialog.setOnDismissListener { showDatePicker = false }
+        dialog.show()
+        // Keep the platform calendar, but constrain the dialog so it does not dominate the
+        // statistics page on large screens or become an oversized vendor-specific sheet.
+        val density = context.resources.displayMetrics.density
+        val maxWidth = (360f * density).toInt()
+        val horizontalMargin = (32f * density).toInt()
+        val screenWidth = context.resources.displayMetrics.widthPixels
+        val dialogWidth = minOf(maxWidth, (screenWidth - horizontalMargin).coerceAtLeast(280))
+        dialog.window?.apply {
+            setBackgroundDrawable(
+                GradientDrawable().apply {
+                    cornerRadius = 24f * density
+                    setColor(
+                        if (dark) AndroidColor.rgb(31, 36, 33)
+                        else AndroidColor.rgb(248, 251, 248),
+                    )
+                },
+            )
+            setLayout(dialogWidth, WindowManager.LayoutParams.WRAP_CONTENT)
+        }
+    }
     LazyColumn(
         modifier = modifier,
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         if (!statsEnabled) {
             item {
@@ -3230,100 +3748,651 @@ private fun UsageStatisticsScreen(
             }
         }
         item {
-            BoxWithConstraints(Modifier.fillMaxWidth()) {
-                val compact = maxWidth < 520.dp
-                val summary: @Composable (Modifier) -> Unit = { summaryModifier ->
-                    Column(summaryModifier) {
-                        Text("今日总使用", style = MaterialTheme.typography.bodyMedium)
-                        Text(
-                            formatDashboardDuration(todayTotalMillis),
-                            style = MaterialTheme.typography.headlineMedium,
-                            fontWeight = FontWeight.Bold,
-                        )
-                        Text(
-                            if (usageAccessGranted) {
-                                "Android 系统前台区间去重 · 无后台服务"
-                            } else {
-                                "授权后显示系统使用时长"
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    localizedText(context, "屏幕使用时间", "Screen time"),
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    localizedText(context, "展示所选日期的应用使用情况", "App usage for the selected date"),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedButton(onClick = onOpenWeeklyReport) {
+                    Text(localizedText(context, "查看时间周报", "View weekly report"))
                 }
-                if (compact) {
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
+            }
+        }
+        item {
+            statisticsError?.let { error ->
+                Text(
+                    localizedText(
+                        context,
+                        "统计读取失败，已保留上次结果（$error）",
+                        "Could not load statistics; showing the previous result ($error)",
+                    ),
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    localizedText(context, "显示系统应用", "Show system apps"),
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Switch(checked = showSystemApps, onCheckedChange = { onToggleShowSystemApps() })
+            }
+        }
+        item {
+            if (loading) {
+                Box(Modifier.fillMaxWidth().height(250.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else {
+                StatisticsRingOverview(
+                    modifier = Modifier.fillMaxWidth(),
+                    totalMillis = totalMillis,
+                    segments = segments,
+                    appsByPackage = chartAppsByPackage,
+                    colors = chartColors,
+                    onAppClick = { selectedChartPackage = it },
+                )
+            }
+        }
+        item {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                StatisticsMetric(formatDashboardDuration(totalMillis), localizedText(context, "总使用", "Usage"), Modifier.weight(1f))
+                StatisticsMetric(launchCount.toString(), localizedText(context, "启动次数", "Launches"), Modifier.weight(1f))
+                StatisticsMetric(limitHitCount.toString(), localizedText(context, "限制触发", "Limits"), Modifier.weight(1f))
+                StatisticsMetric(controlledCount.toString(), localizedText(context, "管控应用", "Managed"), Modifier.weight(1f))
+                StatisticsMetric(recordedCount.toString(), localizedText(context, "记录应用", "Recorded"), Modifier.weight(1f))
+            }
+        }
+        item {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(
+                        enabled = canGoPrevious,
+                        onClick = { onDateChange(selectedDate.minusDays(1L)) },
                     ) {
-                        summary(Modifier.fillMaxWidth())
-                        TextButton(
-                            onClick = onClear,
-                            modifier = Modifier.align(Alignment.End),
-                        ) { Text("清空模块记录") }
+                        Text("‹", style = MaterialTheme.typography.headlineMedium)
                     }
-                } else {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    TextButton(
+                        onClick = { showDatePicker = true },
+                        modifier = Modifier.weight(1f),
                     ) {
-                        summary(Modifier.weight(1f))
-                        TextButton(onClick = onClear) { Text("清空模块记录") }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                localizedText(context, "统计日期", "Statistics date"),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(selectedDate.toString(), fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                    TextButton(
+                        enabled = canGoNext,
+                        onClick = { onDateChange(selectedDate.plusDays(1L)) },
+                    ) {
+                        Text("›", style = MaterialTheme.typography.headlineMedium)
                     }
                 }
             }
         }
+        item {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = onClear) { Text(localizedText(context, "清空模块记录", "Clear module records")) }
+            }
+        }
         if (sorted.isEmpty()) {
-            item { Text("今天暂无应用使用记录。") }
+            item {
+                Text(localizedText(context, "所选日期暂无应用使用记录。", "No app usage recorded for this date."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         } else {
-            items(sorted, key = AppUsageSummary::packageName) { summary ->
+            item {
+                Text(localizedText(context, "应用明细", "App details"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            }
+            items(sorted, key = { it.packageName }) { summary ->
                 val app = appByPackage[summary.packageName]
                 val controlled = summary.packageName in controlledPackages
                 Surface(
-                    color = if (controlled) {
-                        healthColors.managedContainer
-                    } else {
-                        MaterialTheme.colorScheme.surface
-                    },
-                    shape = RoundedCornerShape(18.dp),
-                    tonalElevation = 1.dp,
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    shape = RoundedCornerShape(8.dp),
                 ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        modifier = Modifier.fillMaxWidth().clickable(enabled = app != null) { app?.let(onOpenApp) }.padding(horizontal = 14.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        if (app != null) {
-                            Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
-                                AppIcon(app)
-                            }
-                        }
-                        Column(Modifier.weight(1f)) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                Text(
-                                    app?.label ?: summary.packageName,
-                                    modifier = Modifier.weight(1f, fill = false),
-                                    fontWeight = FontWeight.Medium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
+                        if (app != null) Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) { AppIcon(app) }
+                        else Spacer(Modifier.size(48.dp))
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(app?.label ?: summary.packageName, Modifier.weight(1f, fill = false), fontWeight = if (controlled) FontWeight.Bold else FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 if (controlled) ManagedBadge()
                             }
                             Text(
-                                if (controlled) {
-                                    "启动 ${summary.launchCount} 次 · 今日限制触发 ${summary.limitHitCount} 次"
-                                } else {
-                                    "Android 系统使用统计"
-                                },
+                                localizedText(context, "启动 ${summary.launchCount} 次 · 限制触发 ${summary.limitHitCount} 次", "${summary.launchCount} launches · ${summary.limitHitCount} limits"),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                             )
                         }
-                        Text(formatDashboardDuration(summary.durationMillis), fontWeight = FontWeight.Bold)
+                        Text(formatDashboardDuration(summary.durationMillis), fontWeight = FontWeight.Bold, maxLines = 1)
+                    }
+                }
+            }
+        }
+    }
+    selectedChartSummary?.let { summary ->
+        val app = appByPackage[summary.packageName]
+        AlertDialog(
+            onDismissRequest = { selectedChartPackage = null },
+            title = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    if (app != null) {
+                        Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) { AppIcon(app) }
+                    }
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            app?.label ?: summary.packageName,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            selectedDate.toString(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (summary.packageName in controlledPackages) ManagedBadge()
+                }
+            },
+            text = {
+                val usagePercent = StatisticsDisplayPolicy.ratio(
+                    summary.durationMillis,
+                    totalMillis,
+                ) * 100f
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        summary.packageName,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StatisticsDetailMetric(
+                            value = formatDashboardDuration(summary.durationMillis),
+                            label = localizedText(context, "使用时长", "Usage"),
+                            modifier = Modifier.weight(1f),
+                        )
+                        StatisticsDetailMetric(
+                            value = summary.launchCount.toString(),
+                            label = localizedText(context, "启动次数", "Launches"),
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StatisticsDetailMetric(
+                            value = summary.limitHitCount.toString(),
+                            label = localizedText(context, "限制触发", "Limits"),
+                            modifier = Modifier.weight(1f),
+                        )
+                        StatisticsDetailMetric(
+                            value = "${usagePercent.toInt()}%",
+                            label = localizedText(context, "占当日总时长", "Share of day"),
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    Text(
+                        localizedText(
+                            context,
+                            if (summary.packageName in controlledPackages) "已配置管控规则" else "未配置管控规则",
+                            if (summary.packageName in controlledPackages) "Control rules configured" else "No control rules configured",
+                        ),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    selectedChartPackage = null
+                    app?.let(onOpenApp)
+                }) { Text(localizedText(context, "查看规则", "View rules")) }
+            },
+            dismissButton = {
+                TextButton(onClick = { selectedChartPackage = null }) { Text(localizedText(context, "关闭", "Close")) }
+            },
+        )
+    }
+}
+
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
+private fun WeeklyReportScreen(
+    apps: List<InstalledApp>,
+    controlledPackages: Set<String>,
+    weekStart: LocalDate,
+    usageStatsRepository: UsageStatsRepository,
+    deviceUsageStatsRepository: DeviceUsageStatsRepository,
+    usageAccessGranted: Boolean,
+    onBack: () -> Unit,
+) {
+    val context = LocalContext.current
+    BackHandler(onBack = onBack)
+    val packages = remember(apps) { apps.mapTo(linkedSetOf(), InstalledApp::packageName) }
+    var showPrevious by rememberSaveable { mutableStateOf(false) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var report by remember { mutableStateOf<WeeklyReport?>(null) }
+    var selectedWeeklyPackage by rememberSaveable { mutableStateOf<String?>(null) }
+    val weeklyCache = remember { WeeklyReportCache() }
+    val selectedStart = if (showPrevious) weekStart.minusDays(7L) else weekStart
+    val cacheIdentity = remember(selectedStart, packages, usageAccessGranted) {
+        val packageKey = packages.sorted().joinToString(",")
+        "${selectedStart}|${usageAccessGranted}|$packageKey"
+    }
+    LaunchedEffect(selectedStart, packages, usageAccessGranted, cacheIdentity) {
+        weeklyCache.get(cacheIdentity)?.let {
+            report = it
+            loading = false
+            error = null
+            return@LaunchedEffect
+        }
+        loading = true
+        val result = runCatching {
+            withContext(Dispatchers.IO) {
+                fun loadWeek(start: LocalDate): WeeklyReport {
+                    val end = minOf(start.plusDays(6L), LocalDate.now())
+                    val module = usageStatsRepository.summariesBetween(start, end, packages)
+                    val days = (0L..6L).map { offset ->
+                        val date = start.plusDays(offset)
+                        if (date.isAfter(LocalDate.now())) {
+                            WeeklyReportDay(date, emptyList(), 0L)
+                        } else {
+                            val system = if (usageAccessGranted) deviceUsageStatsRepository.usageSnapshot(packages, date) else CalculatedUsageSnapshot()
+                            val summaries = apps.map { app ->
+                                val hook = module[date].orEmpty().firstOrNull { it.packageName == app.packageName }
+                                    ?: AppUsageSummary(app.packageName, 0L, 0, 0, 0L)
+                                val device = system.summaries[app.packageName]
+                                hook.copy(
+                                    durationMillis = maxOf(hook.durationMillis, device?.durationMillis ?: 0L),
+                                    launchCount = UsageSummaryMergePolicy.authoritativeLaunchCount(hook.launchCount, device?.launchCount),
+                                    lastUsedAtMillis = maxOf(hook.lastUsedAtMillis, device?.lastUsedAtMillis ?: 0L),
+                                )
+                            }.filter { it.durationMillis > 0L || it.launchCount > 0 || it.limitHitCount > 0 || it.reminderCount > 0 || it.parentUnlockCount > 0 }
+                            val total = UsageSummaryMergePolicy.authoritativeTotalDuration(
+                                summaries.map(AppUsageSummary::durationMillis),
+                                system.totalDurationMillis.takeIf { usageAccessGranted },
+                                24L * 60L * 60L * 1000L,
+                            )
+                            WeeklyReportDay(date, summaries, total)
+                        }
+                    }
+                    return WeeklyReport(start, days)
+                }
+                val loaded = loadWeek(selectedStart)
+                val previous = loadWeek(selectedStart.minusDays(7L))
+                loaded.copy(previousWeekTotalDurationMillis = previous.totalDurationMillis)
+            }
+        }
+        result.onSuccess {
+            weeklyCache.put(cacheIdentity, it)
+            report = it
+            error = null
+        }.onFailure { error = it.javaClass.simpleName }
+        loading = false
+    }
+    val current = report
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(localizedText(context, "时间周报", "Weekly report")) },
+                navigationIcon = { TextButton(onClick = onBack) { Text("‹") } },
+                actions = { TextButton(onClick = { showPrevious = !showPrevious }) { Text(if (showPrevious) "本周" else "上周") } },
+            )
+        },
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().padding(padding),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            item {
+                Text(
+                    current?.let { "${it.weekStart} - ${it.weekEnd}" } ?: "${selectedStart} - ${selectedStart.plusDays(6L)}",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            }
+            if (loading) item { Box(Modifier.fillMaxWidth().height(220.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() } }
+            error?.let { message -> item { Text("${localizedText(context, "统计读取失败", "Could not load report")}: $message", color = MaterialTheme.colorScheme.error) } }
+            current?.let { value ->
+                item {
+                    WeeklyReportOverview(value, apps, context) { selectedWeeklyPackage = it }
+                }
+                item { WeeklyReportBarChart(value, context) }
+                item { WeeklyReportInsights(value, apps, context) }
+                item { WeeklyReportTopList("TOP 3 使用时长", "TOP 3 usage", value, controlledPackages, apps, context) { _, summary -> summary.durationMillis } }
+                item { WeeklyReportTopList("TOP 3 启动", "TOP 3 launches", value, controlledPackages, apps, context) { _, summary -> summary.launchCount.toLong() } }
+                item { WeeklyReportTopList("TOP 3 限制触发", "TOP 3 limits", value, controlledPackages, apps, context) { _, summary -> summary.limitHitCount.toLong() } }
+                item { WeeklyReportTopList("TOP 3 时停提醒", "TOP 3 reminders", value, controlledPackages, apps, context) { _, summary -> summary.reminderCount.toLong() } }
+                item { WeeklyReportTopList("TOP 3 PIN 解锁", "TOP 3 PIN unlocks", value, controlledPackages, apps, context) { _, summary -> summary.parentUnlockCount.toLong() } }
+            }
+        }
+    }
+    val selectedWeeklySummary = current?.let { reportValue ->
+        weeklyAggregateSummaries(reportValue).firstOrNull { it.packageName == selectedWeeklyPackage }
+    }
+    selectedWeeklySummary?.let { summary ->
+        val app = apps.firstOrNull { it.packageName == summary.packageName }
+        AlertDialog(
+            onDismissRequest = { selectedWeeklyPackage = null },
+            title = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    if (app != null) Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) { AppIcon(app) }
+                    Column(Modifier.weight(1f)) {
+                        Text(app?.label ?: summary.packageName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            "${current?.weekStart} - ${current?.weekEnd}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (summary.packageName in controlledPackages) ManagedBadge()
+                }
+            },
+            text = {
+                val weekTotal = current?.totalDurationMillis ?: 0L
+                val share = StatisticsDisplayPolicy.ratio(summary.durationMillis, weekTotal) * 100f
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(summary.packageName, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StatisticsDetailMetric(formatDashboardDuration(summary.durationMillis), localizedText(context, "本周使用", "Weekly usage"), Modifier.weight(1f))
+                        StatisticsDetailMetric(summary.launchCount.toString(), localizedText(context, "启动次数", "Launches"), Modifier.weight(1f))
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StatisticsDetailMetric(summary.limitHitCount.toString(), localizedText(context, "限制触发", "Limits"), Modifier.weight(1f))
+                        StatisticsDetailMetric("${share.toInt()}%", localizedText(context, "占本周总时长", "Share of week"), Modifier.weight(1f))
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StatisticsDetailMetric(summary.reminderCount.toString(), localizedText(context, "时停提醒", "Reminders"), Modifier.weight(1f))
+                        StatisticsDetailMetric(summary.parentUnlockCount.toString(), localizedText(context, "PIN 解锁", "PIN unlocks"), Modifier.weight(1f))
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StatisticsDetailMetric(summary.extensionCount.toString(), localizedText(context, "延时次数", "Extensions"), Modifier.weight(1f))
+                        Spacer(Modifier.weight(1f))
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { selectedWeeklyPackage = null }) { Text(localizedText(context, "关闭", "Close")) }
+            },
+        )
+    }
+}
+
+@Composable
+private fun WeeklyReportInsights(
+    report: WeeklyReport,
+    apps: List<InstalledApp>,
+    context: Context,
+) {
+    val insights = remember(report, apps) {
+        WeeklyReportInsightPolicy.insights(report, apps.associate { it.packageName to it.label })
+    }
+    if (insights.isEmpty()) return
+    Surface(
+        Modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(16.dp),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(localizedText(context, "本周建议", "Weekly suggestions"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            insights.forEach { insight ->
+                Text(
+                    text = localizedText(context, insight.zh, insight.en),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+private fun weeklyAggregateSummaries(report: WeeklyReport): List<AppUsageSummary> = report.summaries
+    .groupBy(AppUsageSummary::packageName)
+    .map { (packageName, values) ->
+        AppUsageSummary(
+            packageName = packageName,
+            durationMillis = values.sumOf { it.durationMillis.coerceAtLeast(0L) },
+            launchCount = values.sumOf { it.launchCount.coerceAtLeast(0) },
+            limitHitCount = values.sumOf { it.limitHitCount.coerceAtLeast(0) },
+            lastUsedAtMillis = values.maxOfOrNull { it.lastUsedAtMillis } ?: 0L,
+            reminderCount = values.sumOf { it.reminderCount.coerceAtLeast(0) },
+            parentUnlockCount = values.sumOf { it.parentUnlockCount.coerceAtLeast(0) },
+            extensionCount = values.sumOf { it.extensionCount.coerceAtLeast(0) },
+        )
+    }
+
+@Composable
+private fun WeeklyReportOverview(
+    report: WeeklyReport,
+    apps: List<InstalledApp>,
+    context: Context,
+    onAppClick: (String) -> Unit,
+) {
+    val aggregate = weeklyAggregateSummaries(report)
+    Surface(Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(16.dp)) {
+        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(localizedText(context, "使用概览", "Usage overview"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(formatDashboardDuration(report.totalDurationMillis), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+            val delta = report.totalDurationMillis - report.previousWeekTotalDurationMillis
+            Text(localizedText(context, "较上一周 ${if (delta >= 0L) "+" else "-"}${formatDashboardDuration(kotlin.math.abs(delta))}", "vs previous week ${if (delta >= 0L) "+" else "-"}${formatDashboardDuration(kotlin.math.abs(delta))}"))
+            StatisticsRingOverview(
+                modifier = Modifier.fillMaxWidth().height(260.dp),
+                totalMillis = report.totalDurationMillis,
+                segments = StatisticsChartPolicy.segments(aggregate),
+                appsByPackage = apps.associateBy(InstalledApp::packageName),
+                colors = listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.secondary, MaterialTheme.colorScheme.tertiary, MaterialTheme.colorScheme.error),
+                onAppClick = onAppClick,
+            )
+        }
+    }
+}
+
+@Composable
+private fun WeeklyReportBarChart(report: WeeklyReport, context: Context) {
+    val maxValue = report.days.maxOfOrNull { it.totalDurationMillis }?.coerceAtLeast(1L) ?: 1L
+    Surface(Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(16.dp)) {
+        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(localizedText(context, "每日使用", "Daily usage"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Row(Modifier.fillMaxWidth().height(150.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.Bottom) {
+                report.days.forEach { day ->
+                    Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
+                        Box(Modifier.fillMaxWidth().height((120f * day.totalDurationMillis / maxValue).dp.coerceAtLeast(2.dp)).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(topStart = 4.dp, topEnd = 4.dp)))
+                        Text(day.date.dayOfMonth.toString(), style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WeeklyReportTopList(
+    titleZh: String,
+    titleEn: String,
+    report: WeeklyReport,
+    controlledPackages: Set<String>,
+    apps: List<InstalledApp>,
+    context: Context,
+    selector: (WeeklyReportDay, AppUsageSummary) -> Long,
+) {
+    val top = WeeklyReportPolicy.top(report.days, selector)
+    val appMap = apps.associateBy(InstalledApp::packageName)
+    Surface(Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(16.dp)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(localizedText(context, titleZh, titleEn), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            if (top.isEmpty()) Text(localizedText(context, "暂无记录", "No data"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            top.forEach { metric ->
+                val app = appMap[metric.packageName]
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (app != null) Box(Modifier.size(38.dp), contentAlignment = Alignment.Center) { AppIcon(app) } else Spacer(Modifier.size(38.dp))
+                    Text(app?.label ?: metric.packageName, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = if (metric.packageName in controlledPackages) FontWeight.Bold else FontWeight.Normal)
+                    val displayValue = if (titleZh.contains("使用时长")) {
+                        formatDashboardDuration(metric.value)
+                    } else {
+                        metric.value.toString()
+                    }
+                    Text(displayValue, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatisticsDetailMetric(
+    value: String,
+    label: String,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(value, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun StatisticsMetric(value: String, label: String, modifier: Modifier = Modifier) {
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(value, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
+private fun StatisticsRingOverview(
+    modifier: Modifier,
+    totalMillis: Long,
+    segments: List<com.liuml.apptimelimiter.statistics.StatisticsChartSegment>,
+    appsByPackage: Map<String, InstalledApp>,
+    colors: List<Color>,
+    onAppClick: (String) -> Unit,
+) {
+    BoxWithConstraints(modifier, contentAlignment = Alignment.Center) {
+        // Keep enough clear space around the ring for icons. The previous radius was larger
+        // than the container and used segment midpoints, so short segments collided or clipped.
+        val containerSize = minOf(maxWidth, 360.dp).coerceAtLeast(0.dp)
+        val iconSize = 36.dp
+        val ringStroke = 22.dp
+        // Keep the complete bitmap visibly outside the stroke. Different launcher icons have
+        // different transparent padding, so a 6dp mathematical gap still looked inconsistent.
+        val iconGap = 16.dp
+        val maxSafeChartSize = (containerSize - iconSize * 2f - ringStroke - iconGap * 2f - 8.dp)
+            .coerceAtLeast(100.dp)
+        val chartSize = minOf(
+            (containerSize - 150.dp).coerceAtLeast(100.dp),
+            maxSafeChartSize,
+        )
+        val baseIconRadius = chartSize / 2 + ringStroke / 2 + iconSize / 2 + iconGap
+        val trackColor = MaterialTheme.colorScheme.surfaceVariant
+        Box(
+            Modifier.size(containerSize).clip(RoundedCornerShape(0.dp)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Box(Modifier.size(chartSize), contentAlignment = Alignment.Center) {
+                Canvas(Modifier.fillMaxSize()) {
+                val stroke = ringStroke.toPx()
+                drawArc(trackColor, -90f, 360f, false, style = Stroke(stroke))
+                var angle = -90f
+                segments.forEachIndexed { index, segment ->
+                    val sweep = segment.fraction * 360f
+                    drawArc(colors[index % colors.size], angle, (sweep - 2f).coerceAtLeast(1f), false, style = Stroke(stroke))
+                    angle += sweep
+                }
+                }
+                Text(
+                    formatDashboardDuration(totalMillis),
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                )
+            }
+            val iconPlacements = StatisticsChartPolicy.iconPlacements(segments)
+            val displayPlacements = iconPlacements.filter { appsByPackage.containsKey(it.packageName) }
+            Layout(
+                content = {
+                    displayPlacements.forEach { placement ->
+                        val app = appsByPackage.getValue(placement.packageName)
+                        Box(
+                            Modifier
+                                .size(iconSize)
+                                .clickable { onAppClick(placement.packageName) },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            AppIcon(app)
+                        }
+                    }
+                },
+                modifier = Modifier.size(containerSize),
+            ) { measurables, constraints ->
+                val iconPx = iconSize.roundToPx()
+                val radiusPx = baseIconRadius.roundToPx()
+                val width = constraints.maxWidth
+                val height = constraints.maxHeight
+                val centerX = width / 2
+                val centerY = height / 2
+                val placeables = measurables.map {
+                    it.measure(Constraints.fixed(iconPx, iconPx))
+                }
+                layout(width, height) {
+                    placeables.forEachIndexed { index, placeable ->
+                        val radians = displayPlacements[index].angleDegrees * PI / 180.0
+                        val x = centerX + (radiusPx * cos(radians)).toInt() - placeable.width / 2
+                        val y = centerY + (radiusPx * sin(radians)).toInt() - placeable.height / 2
+                        placeable.placeRelative(x, y)
                     }
                 }
             }
@@ -3337,6 +4406,33 @@ private fun formatDashboardDuration(durationMillis: Long): String {
         "${totalMinutes}分"
     } else {
         "${totalMinutes / 60L}时${totalMinutes % 60L}分"
+    }
+}
+
+private fun mergeUsageSummaries(
+    apps: List<InstalledApp>,
+    hookSummaries: List<AppUsageSummary>,
+    systemSnapshot: CalculatedUsageSnapshot,
+    usageAccessGranted: Boolean,
+): List<AppUsageSummary> {
+    val hookByPackage = hookSummaries.associateBy(AppUsageSummary::packageName)
+    return apps.mapNotNull { app ->
+        val hook = hookByPackage[app.packageName] ?: AppUsageSummary(
+            packageName = app.packageName,
+            durationMillis = 0L,
+            launchCount = 0,
+            limitHitCount = 0,
+            lastUsedAtMillis = 0L,
+        )
+        val system = systemSnapshot.summaries[app.packageName]
+        hook.copy(
+            durationMillis = maxOf(hook.durationMillis, if (usageAccessGranted) system?.durationMillis ?: 0L else 0L),
+            launchCount = UsageSummaryMergePolicy.authoritativeLaunchCount(
+                moduleLaunchCount = hook.launchCount,
+                systemLaunchCount = system?.launchCount,
+            ),
+            lastUsedAtMillis = maxOf(hook.lastUsedAtMillis, system?.lastUsedAtMillis ?: 0L),
+        ).takeIf { it.durationMillis > 0L || it.launchCount > 0 || it.limitHitCount > 0 }
     }
 }
 
@@ -4278,6 +5374,7 @@ private fun SettingsDialog(
     xposedFrameworkConnected: Boolean,
     xposedSnapshotStale: Boolean,
     scopeSyncSnapshot: ScopeSyncSnapshot,
+    deviceAdminActive: Boolean,
     missingBackupPackages: Set<String>,
     backupStatus: String?,
     onDismiss: () -> Unit,
@@ -4304,6 +5401,9 @@ private fun SettingsDialog(
     onExportBackup: () -> Unit,
     onImportBackup: () -> Unit,
     onManageMissingBackupRules: () -> Unit,
+    onWebDav: () -> Unit,
+    onEnableDeviceAdmin: () -> Unit,
+    onDisableDeviceAdmin: () -> Unit,
     onSave: (GlobalSettings) -> Unit,
 ) {
     val context = LocalContext.current
@@ -4320,6 +5420,9 @@ private fun SettingsDialog(
     var vibrationEnabled by remember {
         mutableStateOf(initialSettings.exitWarningVibrationEnabled)
     }
+    var usageMilestoneReminderEnabled by remember {
+        mutableStateOf(initialSettings.usageMilestoneReminderEnabled)
+    }
     var languageMode by remember { mutableStateOf(initialSettings.languageMode) }
     var themeMode by remember { mutableStateOf(initialSettings.themeMode) }
     var themeColor by remember { mutableStateOf(initialSettings.themeColor) }
@@ -4335,21 +5438,56 @@ private fun SettingsDialog(
     }
     var diagnosticsEnabled by remember { mutableStateOf(initialSettings.diagnosticsEnabled) }
     var launcherIconHidden by remember { mutableStateOf(initialSettings.launcherIconHidden) }
+    var hideRecentsPreview by remember {
+        mutableStateOf(
+            context.getSharedPreferences(UI_PREFERENCES, Context.MODE_PRIVATE)
+                .getBoolean(HIDE_RECENTS_CARD_KEY, false),
+        )
+    }
     var usageStatsEnabled by remember { mutableStateOf(initialSettings.usageStatsEnabled) }
     var limitEnforcementMode by remember {
         mutableStateOf(initialSettings.limitEnforcementMode)
     }
+    var rootEnhancementEnabled by remember {
+        mutableStateOf(initialSettings.xposedRootEnhancementEnabled)
+    }
+    var accessibilityEnhancement by remember {
+        mutableStateOf(initialSettings.accessibilityForceStopEnhancement)
+    }
+    var extensionEnabled by remember { mutableStateOf(initialSettings.extensionEnabled) }
     var extensionMinutes by remember {
         mutableStateOf((initialSettings.extensionSeconds / 60L).coerceAtLeast(1L).toString())
     }
+    var extensionDailyLimitText by remember {
+        mutableStateOf(initialSettings.extensionDailyLimit.toString())
+    }
+    var extensionSessionLimitText by remember {
+        mutableStateOf(initialSettings.extensionSessionLimit.toString())
+    }
     val parsedMinutes = extensionMinutes.toLongOrNull()?.takeIf { it in 1L..60L }
+    val parsedExtensionDailyLimit = extensionDailyLimitText.toIntOrNull()
+        ?.takeIf { it in 1..ExtensionQuotaPolicy.MAX_DAILY_LIMIT }
+    val parsedExtensionSessionLimit = extensionSessionLimitText.toIntOrNull()
+        ?.takeIf { it in 1..ExtensionQuotaPolicy.MAX_SESSION_LIMIT }
     val healthColors = LocalTimeStopExtendedColors.current
     val settingsVisibility = ProtectionSettingsPolicy.resolve(
         xposedAvailable = xposedAvailable,
         nonRootEnabled = protectionMode.usesNonRoot,
-        shizukuSelected = protectionMode.usesShizuku,
+        shizukuSelected = accessibilityEnhancement == ForceStopEnhancement.SHIZUKU,
         launcherIconHidden = launcherIconHidden,
     )
+    val modeStatus = ProtectionModeRequirementsPolicy.resolve(
+        mode = protectionMode,
+        hookState = null,
+        accessibilityState = accessibilityRuntimeState,
+        usageAccessGranted = usageAccessGranted,
+        shizukuState = shizukuState,
+        xposedRootEnhancementEnabled = rootEnhancementEnabled,
+        accessibilityEnhancement = accessibilityEnhancement,
+    )
+    val showNonRootRequirements = modeStatus.items.any {
+        it.requirement == ProtectionRequirement.ACCESSIBILITY_SERVICE
+    }
     val displayedProtectionPresentation = if (
         protectionMode == initialSettings.protectionMode
     ) {
@@ -4361,6 +5499,7 @@ private fun SettingsDialog(
             accessibilityState = accessibilityRuntimeState,
             usageAccessGranted = usageAccessGranted,
             shizukuState = shizukuState,
+            accessibilityEnhancement = accessibilityEnhancement,
         )
     }
     val missingScopePackages = xposedTargets.filter {
@@ -4377,7 +5516,7 @@ private fun SettingsDialog(
             ) {
                 item {
                     SettingsSectionTitle(
-                        localizedText(context, "安全与儿童锁", "Security and child lock"),
+                        localizedText(context, "安全与管控锁", "Security and Control Lock"),
                     )
                 }
                 item {
@@ -4396,7 +5535,7 @@ private fun SettingsDialog(
                             ) {
                                 Column(Modifier.weight(1f)) {
                                     Text(
-                                        localizedText(context, "儿童锁", "Child lock"),
+                                        localizedText(context, "管控锁", "Control Lock"),
                                         fontWeight = FontWeight.Bold,
                                     )
                                     Text(
@@ -4465,6 +5604,54 @@ private fun SettingsDialog(
                         }
                     }
                 }
+                item {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainer,
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        localizedText(context, "防止直接卸载", "Protect against direct uninstall"),
+                                        fontWeight = FontWeight.Bold,
+                                    )
+                                    Text(
+                                        localizedText(
+                                            context,
+                                            if (deviceAdminActive) "设备管理器已启用" else "启用后卸载前需先解除设备管理权限",
+                                            if (deviceAdminActive) "Device administrator is active" else "Uninstalling requires disabling device administrator first",
+                                        ),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Switch(
+                                    checked = deviceAdminActive,
+                                    onCheckedChange = { enabled ->
+                                        if (enabled) onEnableDeviceAdmin() else onDisableDeviceAdmin()
+                                    },
+                                )
+                            }
+                            Text(
+                                localizedText(
+                                    context,
+                                    "这是系统设备管理器保护，不是不可绕过的防篡改功能；清除数据、关闭权限或 Root 操作仍可能绕过。",
+                                    "This uses Android device administrator protection. It is not tamper-proof; clearing data, revoking permissions, or using Root can still bypass it.",
+                                ),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
                 item { HorizontalDivider() }
                 item {
                     SettingsSectionTitle("保护方式")
@@ -4483,15 +5670,11 @@ private fun SettingsDialog(
                             val label = when (mode) {
                                 ProtectionMode.XPOSED -> "LSPosed"
                                 ProtectionMode.ACCESSIBILITY -> "普通保护"
-                                ProtectionMode.ACCESSIBILITY_SHIZUKU ->
-                                    "普通保护 + Shizuku"
                             }
                             val description = when (mode) {
                                 ProtectionMode.XPOSED -> "由目标应用内 Hook 精确计时并执行限制"
                                 ProtectionMode.ACCESSIBILITY ->
                                     "无障碍识别前台，UsageStats 校准，到限显示独立限制页"
-                                ProtectionMode.ACCESSIBILITY_SHIZUKU ->
-                                    "普通保护计时，到限优先通过 Shizuku 强停"
                             }
                             Surface(
                                 modifier = Modifier.fillMaxWidth().clickable {
@@ -4638,7 +5821,114 @@ private fun SettingsDialog(
                         }
                     }
                 }
-                if (protectionMode.usesNonRoot) {
+                if (protectionMode == ProtectionMode.XPOSED || protectionMode == ProtectionMode.ACCESSIBILITY) {
+                    if (protectionMode == ProtectionMode.XPOSED) {
+                        item {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        localizedText(context, "Root 强停增强", "Root force-stop enhancement"),
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                    Text(
+                                        localizedText(
+                                            context,
+                                            if (protectionMode == ProtectionMode.XPOSED) {
+                                                "LSPosed 无法完全停止时，可用 Root 强停整个应用包；失败仍执行原有退出逻辑。"
+                                            } else {
+                                                "普通保护可用。首次达到限制时请求 Root；失败会回退独立限制页。"
+                                            },
+                                            if (protectionMode == ProtectionMode.XPOSED) {
+                                                "Use Root to stop the whole package when LSPosed cannot fully stop it; failures keep the existing exit behavior."
+                                            } else {
+                                                "Available for basic protection. Root is requested on the first limit; failures fall back to the restriction page."
+                                            },
+                                        ),
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
+                                Switch(
+                                    checked = rootEnhancementEnabled,
+                                    onCheckedChange = { enabled ->
+                                        rootEnhancementEnabled = enabled
+                                        if (enabled) {
+                                            Thread {
+                                                val available = RootExecutor(context).isAvailable()
+                                                Handler(Looper.getMainLooper()).post {
+                                                    Toast.makeText(
+                                                        context,
+                                                        if (available) "Root 已授权，保存后可用于强停目标应用。"
+                                                        else "未获得 Root，仍会使用原有退出逻辑。",
+                                                        Toast.LENGTH_SHORT,
+                                                    ).show()
+                                                }
+                                            }.apply {
+                                                isDaemon = true
+                                                name = "TimeStop-RootAvailability"
+                                                start()
+                                            }
+                                        }
+                                    },
+                                )
+                            }
+                        }
+                    } else {
+                        rootEnhancementEnabled = false
+                    }
+                    if (protectionMode == ProtectionMode.ACCESSIBILITY) {
+                        item {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(
+                                    localizedText(context, "普通保护到限执行", "Basic protection limit action"),
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    localizedText(
+                                        context,
+                                        "无障碍始终负责识别和计时；强停失败会回退独立限制页。",
+                                        "Accessibility always owns detection and timing. Failed force-stops fall back to the restriction page.",
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    ForceStopEnhancement.entries.forEach { enhancement ->
+                                        FilterChip(
+                                            selected = accessibilityEnhancement == enhancement,
+                                            onClick = {
+                                                accessibilityEnhancement = enhancement
+                                                if (enhancement == ForceStopEnhancement.ROOT) {
+                                                    Thread {
+                                                        val available = RootExecutor(context).isAvailable()
+                                                        Handler(Looper.getMainLooper()).post {
+                                                            Toast.makeText(
+                                                                context,
+                                                                if (available) "Root 已授权，保存后可用于普通保护强停。" else "未获得 Root，到限将回退独立限制页。",
+                                                                Toast.LENGTH_SHORT,
+                                                            ).show()
+                                                        }
+                                                    }.apply { isDaemon = true; start() }
+                                                }
+                                            },
+                                            label = {
+                                                Text(
+                                                    when (enhancement) {
+                                                        ForceStopEnhancement.NONE -> localizedText(context, "独立管控页", "Restriction page")
+                                                        ForceStopEnhancement.ROOT -> "Root"
+                                                        ForceStopEnhancement.SHIZUKU -> "Shizuku"
+                                                    },
+                                                )
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (showNonRootRequirements) {
                     item {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -4846,6 +6136,7 @@ private fun SettingsDialog(
                                 }
                             }
                         }
+                    }
                     }
                     if (settingsVisibility.showShizukuDetails) {
                         item {
@@ -5149,20 +6440,113 @@ private fun SettingsDialog(
                         }
                     }
                     item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(localizedText(context, "使用时长提醒", "Usage duration reminder"), fontWeight = FontWeight.Medium)
+                                Text(
+                                    localizedText(
+                                        context,
+                                        "已管控应用每累计 30 分钟提示一次；普通模式需允许通知。",
+                                        "Remind once every 30 minutes for managed apps. Normal mode needs notification permission.",
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            Switch(
+                                checked = usageMilestoneReminderEnabled,
+                                onCheckedChange = { enabled ->
+                                    usageMilestoneReminderEnabled = enabled
+                                    if (
+                                        enabled &&
+                                            protectionMode.usesNonRoot &&
+                                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+                                            android.content.pm.PackageManager.PERMISSION_GRANTED
+                                    ) {
+                                        (context as? Activity)?.requestPermissions(
+                                            arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                                            USAGE_MILESTONE_NOTIFICATION_PERMISSION_REQUEST,
+                                        )
+                                    }
+                                },
+                            )
+                        }
+                    }
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("延时功能", fontWeight = FontWeight.Medium)
+                                Text(
+                                    "到达限制提醒时允许临时延长使用；关闭后不显示延时和广告延时入口。",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            Switch(
+                                checked = extensionEnabled,
+                                onCheckedChange = { extensionEnabled = it },
+                                enabled = warningEnabled,
+                            )
+                        }
+                    }
+                    item {
                         TextField(
                             value = extensionMinutes,
                             onValueChange = {
                                 extensionMinutes = it.filter(Char::isDigit).take(2)
                             },
-                            label = { Text("每次点击延时（分钟）") },
+                            label = { Text("每次延时（分钟）") },
                             supportingText = {
-                                Text("仅对 Hook 提醒生效；可设置 1–60 分钟")
+                                Text("可设置 1–15 分钟")
                             },
                             keyboardOptions =
                                 KeyboardOptions(keyboardType = KeyboardType.Number),
                             isError = extensionMinutes.isNotEmpty() &&
                                 parsedMinutes == null,
-                            enabled = warningEnabled,
+                            enabled = warningEnabled && extensionEnabled,
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    item {
+                        TextField(
+                            value = extensionDailyLimitText,
+                            onValueChange = {
+                                extensionDailyLimitText = it.filter(Char::isDigit).take(2)
+                            },
+                            label = { Text("每日最多延时次数（全部应用共享）") },
+                            supportingText = {
+                                Text("可设置 1–${ExtensionQuotaPolicy.MAX_DAILY_LIMIT} 次，默认 10 次")
+                            },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            isError = extensionDailyLimitText.isNotEmpty() &&
+                                parsedExtensionDailyLimit == null,
+                            enabled = warningEnabled && extensionEnabled,
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    item {
+                        TextField(
+                            value = extensionSessionLimitText,
+                            onValueChange = {
+                                extensionSessionLimitText = it.filter(Char::isDigit).take(2)
+                            },
+                            label = { Text("每轮使用最多延时次数") },
+                            supportingText = {
+                                Text("每个应用或分组的连续使用轮次，可设置 1–${ExtensionQuotaPolicy.MAX_SESSION_LIMIT} 次，默认 3 次")
+                            },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            isError = extensionSessionLimitText.isNotEmpty() &&
+                                parsedExtensionSessionLimit == null,
+                            enabled = warningEnabled && extensionEnabled,
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
@@ -5344,6 +6728,32 @@ private fun SettingsDialog(
                         }
                     }
                 }
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("隐藏后台任务卡片", fontWeight = FontWeight.Medium)
+                            Text(
+                                "离开时停后从最近任务中移除时停卡片；重新打开时自动创建新的任务",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = hideRecentsPreview,
+                            onCheckedChange = { hidden ->
+                                hideRecentsPreview = hidden
+                                context.getSharedPreferences(UI_PREFERENCES, Context.MODE_PRIVATE)
+                                    .edit()
+                                    .putBoolean(HIDE_RECENTS_CARD_KEY, hidden)
+                                    .apply()
+                            },
+                        )
+                    }
+                }
                 item { HorizontalDivider() }
                 item {
                     SettingsSectionTitle(
@@ -5367,11 +6777,23 @@ private fun SettingsDialog(
                         title = localizedText(context, "导入配置", "Import configuration"),
                         description = localizedText(
                             context,
-                            "预览后全量替换当前规则；设备保护方式和儿童锁保持不变",
-                            "Preview, then replace all current rules. Device protection mode and child lock remain unchanged.",
+                            "预览后全量替换当前规则；设备保护方式和管控锁保持不变",
+                            "Preview, then replace all current rules. Device protection mode and Control Lock remain unchanged.",
                         ),
                         action = localizedText(context, "选择文件 ›", "Choose file ›"),
                         onClick = onImportBackup,
+                    )
+                }
+                item {
+                    SettingsEntry(
+                        title = localizedText(context, "WebDAV 同步", "WebDAV sync"),
+                        description = localizedText(
+                            context,
+                            "加密上传和下载便携配置，不包含管控锁、统计或运行状态",
+                            "Encrypted portable configuration sync. Control Lock, statistics, and runtime state are excluded.",
+                        ),
+                        action = localizedText(context, "配置 ›", "Configure ›"),
+                        onClick = onWebDav,
                     )
                 }
                 if (missingBackupPackages.isNotEmpty()) {
@@ -5499,6 +6921,7 @@ private fun SettingsDialog(
                             exitWarningEnabled = warningEnabled,
                             fullScreenExitWarningEnabled = fullScreenWarningEnabled,
                             exitWarningVibrationEnabled = vibrationEnabled,
+                            usageMilestoneReminderEnabled = usageMilestoneReminderEnabled,
                             languageMode = languageMode,
                             themeMode = themeMode,
                             themeColor = themeColor,
@@ -5510,15 +6933,26 @@ private fun SettingsDialog(
                             automaticUpdateCheckEnabled = automaticUpdateCheckEnabled,
                             protectionMode = protectionMode,
                             nonRootCompatibilityMode = nonRootCompatibilityMode,
+                            extensionEnabled = extensionEnabled,
                             extensionSeconds = (parsedMinutes ?: 5L) * 60L,
+                            extensionDailyLimit = parsedExtensionDailyLimit
+                                ?: ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT,
+                            extensionSessionLimit = parsedExtensionSessionLimit
+                                ?: ExtensionQuotaPolicy.DEFAULT_SESSION_LIMIT,
+                            extensionFreeDailyLimit = ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT,
                             limitEnforcementMode = limitEnforcementMode,
+                            xposedRootEnhancementEnabled = rootEnhancementEnabled,
+                            accessibilityForceStopEnhancement = accessibilityEnhancement,
                             diagnosticsEnabled = diagnosticsEnabled,
                             launcherIconHidden = launcherIconHidden,
                             usageStatsEnabled = usageStatsEnabled,
                         ),
                     )
                 },
-                enabled = !warningEnabled || parsedMinutes != null,
+                enabled = (!warningEnabled || !extensionEnabled || parsedMinutes != null) &&
+                    (!warningEnabled || !extensionEnabled ||
+                        (parsedExtensionDailyLimit != null &&
+                            parsedExtensionSessionLimit != null)),
             ) { Text("保存") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
@@ -5699,7 +7133,7 @@ private fun UpdateResultDialog(
 @Composable
 private fun FeedbackOptionsDialog(
     onDismiss: () -> Unit,
-    onEmail: () -> Unit,
+    onShare: () -> Unit,
     onQqGroup: () -> Unit,
 ) {
     AlertDialog(
@@ -5712,10 +7146,10 @@ private fun FeedbackOptionsDialog(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 OutlinedButton(
-                    onClick = onEmail,
+                    onClick = onShare,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text("邮件反馈")
+                    Text("分享诊断日志")
                 }
                 OutlinedButton(
                     onClick = onQqGroup,
@@ -5728,6 +7162,55 @@ private fun FeedbackOptionsDialog(
         confirmButton = {
             TextButton(onClick = onDismiss) { Text("取消") }
         },
+    )
+}
+
+@Composable
+private fun FeedbackPreviewDialog(
+    draft: FeedbackSender.Draft,
+    onDismiss: () -> Unit,
+    onShare: () -> Unit,
+) {
+    val context = LocalContext.current
+    val copyText: (String, String) -> Unit = { label, value ->
+        context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
+            ClipData.newPlainText(label, value),
+        )
+        Toast.makeText(
+            context,
+            localizedText(context, "已复制，可粘贴到 QQ、邮件或其他反馈渠道", "Copied. Paste it into QQ, email, or another feedback channel."),
+            Toast.LENGTH_LONG,
+        ).show()
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("诊断日志已准备") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "日志已在时停内生成。点击分享诊断日志会打开系统分享面板，可选择 QQ、微信、邮件或其他应用；复制功能保留为兜底。",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "文件：${draft.attachment.name}（${draft.diagnosticsText.length} 字符）",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Button(
+                    onClick = onShare,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("分享诊断日志") }
+                OutlinedButton(
+                    onClick = { copyText("Time Stop diagnostics", draft.diagnosticsText) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("复制完整诊断日志") }
+                OutlinedButton(
+                    onClick = { copyText("Time Stop feedback", draft.body) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("复制反馈邮件内容") }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
     )
 }
 
@@ -5794,6 +7277,70 @@ private fun DonationPromptDialog(
             }
         },
     )
+}
+
+@Composable
+@OptIn(ExperimentalLayoutApi::class)
+private fun WebDavDialog(
+    initial: SavedWebDavConfig,
+    onDismiss: () -> Unit,
+    onSave: (SavedWebDavConfig) -> Unit,
+    onSync: (SavedWebDavConfig) -> Unit,
+    onDownload: (SavedWebDavConfig, (Result<PortableBackupV1>) -> Unit) -> Unit,
+    onApplyRemote: (PortableBackupV1) -> Unit,
+) {
+    var endpoint by remember { mutableStateOf(initial.endpoint) }
+    var username by remember { mutableStateOf(initial.username) }
+    var password by remember { mutableStateOf(initial.password) }
+    var syncPassword by remember { mutableStateOf(initial.syncPassword) }
+    var autoSync by remember { mutableStateOf(initial.autoSync) }
+    var remoteBackup by remember { mutableStateOf<PortableBackupV1?>(null) }
+    var remoteError by remember { mutableStateOf<String?>(null) }
+    val config = SavedWebDavConfig(endpoint.trim(), username, password, syncPassword, autoSync)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("WebDAV 同步") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("备份使用 AES-GCM 加密。同步密码不会上传云端，请牢记。", style = MaterialTheme.typography.bodySmall)
+                OutlinedTextField(endpoint, { endpoint = it }, label = { Text("WebDAV 地址") }, singleLine = true)
+                OutlinedTextField(username, { username = it }, label = { Text("用户名") }, singleLine = true)
+                OutlinedTextField(password, { password = it }, label = { Text("WebDAV 密码") }, singleLine = true)
+                OutlinedTextField(syncPassword, { syncPassword = it }, label = { Text("同步密码") }, singleLine = true)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("打开时自动同步", Modifier.weight(1f))
+                    Switch(checked = autoSync, onCheckedChange = { autoSync = it })
+                }
+            }
+        },
+        confirmButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = { onDownload(config) { result ->
+                    result.onSuccess { remoteBackup = it }.onFailure { remoteError = it.message }
+                } }) { Text("下载") }
+                TextButton(onClick = { onSync(config) }) { Text("上传") }
+                Button(onClick = { onSave(config); onDismiss() }) { Text("保存") }
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+    remoteBackup?.let { backup ->
+        AlertDialog(
+            onDismissRequest = { remoteBackup = null },
+            title = { Text("发现云端配置") },
+            text = { Text("创建于 ${backup.createdAtMillis}，包含 ${backup.rules.size} 项规则和 ${backup.groups.size} 个分组。确认后将替换本机便携配置。") },
+            confirmButton = {
+                Button(onClick = { onApplyRemote(backup); remoteBackup = null; onDismiss() }) {
+                    Text("使用云端配置")
+                }
+            },
+            dismissButton = { TextButton(onClick = { remoteBackup = null }) { Text("取消") } },
+        )
+    }
+    remoteError?.let { message ->
+        LaunchedEffect(message) { }
+        Text("下载失败：$message", color = MaterialTheme.colorScheme.error)
+    }
 }
 
 @Composable
@@ -6047,6 +7594,9 @@ private fun openQqGroup(context: Context) {
 
 private const val QQ_GROUP_NUMBER = "1009712674"
 private val QQ_PACKAGES = listOf("com.tencent.mobileqq", "com.tencent.tim")
+private const val UI_PREFERENCES = "ui"
+private const val USAGE_MILESTONE_NOTIFICATION_PERMISSION_REQUEST = 7601
+private const val HIDE_RECENTS_CARD_KEY = "hide_recents_card"
 private const val FEATURE_INTRO_DISABLED_KEY = "feature_intro_disabled"
 private const val PROTECTION_DEGRADED_SIGNATURE_KEY = "protection_degraded_signature"
 private const val NON_ROOT_REPAIR_SUPPRESSED_SIGNATURES_KEY =
@@ -6214,6 +7764,27 @@ private fun RuleDialog(
         (!cooldownEnabled || parsedCooldownMinutes != null) &&
         scheduleValid
     val healthColors = LocalTimeStopExtendedColors.current
+    val rulePreview = remember(
+        dailyEnabled, parsedDailyMinutes, perLaunchEnabled, parsedPerLaunchMinutes,
+        scheduleEnabled, scheduleMode, scheduleWindows, cooldownEnabled, parsedCooldownMinutes,
+    ) {
+        RuleSimulationPolicy.evaluate(
+            RuleSimulationInput(
+                rule = initialRule.copy(
+                    dailyEnabled = dailyEnabled,
+                    dailyLimitSeconds = (parsedDailyMinutes ?: 1L) * 60L,
+                    perLaunchEnabled = perLaunchEnabled,
+                    perLaunchLimitSeconds = (parsedPerLaunchMinutes ?: 1L) * 60L,
+                    scheduleEnabled = scheduleEnabled && scheduleValid,
+                    scheduleMode = scheduleMode,
+                    scheduleWindows = scheduleWindows,
+                    cooldownEnabled = cooldownEnabled && cooldownAvailable,
+                    cooldownSeconds = (parsedCooldownMinutes ?: 1L) * 60L,
+                ),
+                now = ZonedDateTime.now(),
+            ),
+        )
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -6356,6 +7927,27 @@ private fun RuleDialog(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.primary,
                         )
+                    }
+                }
+                item { HorizontalDivider() }
+                item {
+                    val previewText = when (rulePreview.reason) {
+                        RuleSimulationReason.ALLOWED -> "按当前时间，这个规则允许使用"
+                        RuleSimulationReason.SCHEDULE -> "按当前时间，时段规则会限制使用"
+                        RuleSimulationReason.COOLDOWN -> "按当前时间，冷却状态会限制使用"
+                        RuleSimulationReason.DAILY_QUOTA -> "按当前时间，每日额度会限制使用"
+                        RuleSimulationReason.SESSION_QUOTA -> "按当前时间，单次额度会限制使用"
+                        RuleSimulationReason.PLAN -> "按当前时间，本次计划会限制使用"
+                    }
+                    Surface(
+                        color = if (rulePreview.allowed) healthColors.successContainer else healthColors.warningContainer,
+                        contentColor = if (rulePreview.allowed) healthColors.onSuccessContainer else healthColors.onWarningContainer,
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text("规则模拟", fontWeight = FontWeight.Medium)
+                            Text(previewText, style = MaterialTheme.typography.bodySmall)
+                        }
                     }
                 }
             }
