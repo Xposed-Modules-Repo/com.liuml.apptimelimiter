@@ -1,20 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 13+ themed icon mask. -->
-<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <path
-        android:fillColor="@android:color/transparent"
-        android:pathData="M54,19 A35,35 0,0 1,85.72 39.21 M89,54 A35,35 0,0 1,68.79 85.72 M54,89 A35,35 0,0 1,22.28 68.79 M19,54 A35,35 0,0 1,39.21 22.28"
-        android:strokeColor="#FFFFFF"
-        android:strokeLineCap="square"
-        android:strokeWidth="4" />
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M27,29 L81,29 L81,41 L61,41 L61,73 L54,82 L47,73 L47,41 L27,41 Z" />
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M51,16 L57,16 L57,22 L51,22 Z M86,51 L92,51 L92,57 L86,57 Z M51,86 L57,86 L57,92 L51,92 Z M16,51 L22,51 L22,57 L16,57 Z" />
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFFFF" android:pathData="M54,15 A39,39 0,1 1,53.99,15 M28,35 A4,4 0,0 1,32 31 L74,31 A4,4 0,0 1,78 35 L78,37 A4,4 0,0 1,74 41 L61,41 L61,72 L72,72 A4,4 0,0 1,76 76 L76,78 A4,4 0,0 1,72 82 L36,82 A4,4 0,0 1,32 78 L32,76 A4,4 0,0 1,36 72 L47,72 L47,41 L32,41 A4,4 0,0 1,28 37 Z" />
 </vector>

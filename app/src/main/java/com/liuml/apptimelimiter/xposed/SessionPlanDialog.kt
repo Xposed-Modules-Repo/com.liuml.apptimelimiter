@@ -78,6 +78,10 @@ internal class SessionPlanDialog private constructor(
                     holder?.dismiss()
                     onExit()
                 },
+                onClose = {
+                    holder?.dismiss()
+                    onWithoutPlan()
+                },
             )
             val dialog = Dialog(activity).apply {
                 requestWindowFeature(Window.FEATURE_NO_TITLE)

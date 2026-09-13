@@ -2,6 +2,7 @@ package com.liuml.apptimelimiter.ipc
 
 import android.app.AppOpsManager
 import android.content.ContentProvider
+import android.content.Context
 import android.content.ContentValues
 import android.database.Cursor
 import android.net.Uri
@@ -21,6 +22,7 @@ import com.liuml.apptimelimiter.core.PackageNamePolicy
 import com.liuml.apptimelimiter.core.ParentOverrideDurationPolicy
 import com.liuml.apptimelimiter.core.ProtectionExecutionPolicy
 import com.liuml.apptimelimiter.core.RuleActivationPolicy
+import com.liuml.apptimelimiter.core.RestrictionPagePresentationPolicy
 import com.liuml.apptimelimiter.core.TemporaryOverrideIdentity
 import com.liuml.apptimelimiter.core.GroupUsagePolicy
 import com.liuml.apptimelimiter.core.SharedCooldownClaimStatus
@@ -28,12 +30,17 @@ import com.liuml.apptimelimiter.core.SharedGroupSessionAction
 import com.liuml.apptimelimiter.core.SharedGroupSessionPolicy
 import com.liuml.apptimelimiter.core.TimeQuotePolicy
 import com.liuml.apptimelimiter.core.UsageReportingPolicy
+import com.liuml.apptimelimiter.core.UsageMilestonePolicy
 import com.liuml.apptimelimiter.data.LimitEnforcementMode
 import com.liuml.apptimelimiter.data.RuleRepository
+import com.liuml.apptimelimiter.data.ProtectionMode
 import com.liuml.apptimelimiter.data.ScheduleCodec
 import com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository
+import com.liuml.apptimelimiter.core.RestrictionExecutionResult
+import com.liuml.apptimelimiter.core.RestrictionRequest
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
+import com.liuml.apptimelimiter.nonroot.RootExecutor
 import com.liuml.apptimelimiter.security.ChildLockRepository
 import com.liuml.apptimelimiter.security.ParentAuthStatus
 import com.liuml.apptimelimiter.security.ParentAuthStore
@@ -54,14 +61,39 @@ class RuleProvider : ContentProvider() {
     private val warningVibrationLock = Any()
     private val lastWarningVibrationByPackage = mutableMapOf<String, Long>()
     private val breakSessionLock = Any()
+    private val restrictionUiLock = Any()
+    private val rewardedAdPendingLock = Any()
+    private val rootForceStopLock = Any()
+    private val rootForceStopExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "time-stop-root-force-stop").apply { isDaemon = true }
+    }
     private val secureRandom = SecureRandom()
 
     override fun onCreate(): Boolean {
-        context?.let { deviceUsageStatsRepository = DeviceUsageStatsRepository(it) }
+        context?.let {
+            deviceUsageStatsRepository = DeviceUsageStatsRepository(it)
+            ParentAuthStore.initialize(it)
+        }
         return true
     }
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
+        return runCatching { callInternal(method, arg, extras) }.getOrElse { error ->
+            context?.let { appContext ->
+                runCatching {
+                    DiagnosticsRepository(appContext).append(
+                        level = "ERROR",
+                        packageName = arg.orEmpty().take(160),
+                        event = "IPC_CALL_FAILED",
+                        message = "method=${method.take(80)}, exception=${error.javaClass.simpleName}",
+                    )
+                }
+            }
+            denied("provider_exception")
+        }
+    }
+
+    private fun callInternal(method: String, arg: String?, extras: Bundle?): Bundle? {
         val appContext = context ?: return Bundle().apply { putBoolean(RuleContract.KEY_OK, false) }
         if (
             BuildConfig.MODERN_XPOSED_ENABLED &&
@@ -220,6 +252,10 @@ class RuleProvider : ContentProvider() {
                     )
                     putBoolean(RuleContract.KEY_EXIT_WARNING_ENABLED, settings.exitWarningEnabled)
                     putBoolean(
+                        RuleContract.KEY_USAGE_MILESTONE_REMINDER_ENABLED,
+                        settings.usageMilestoneReminderEnabled,
+                    )
+                    putBoolean(
                         RuleContract.KEY_CHILD_LOCK_ENABLED,
                         settings.childLockEnabled && ChildLockRepository(appContext).isEnabled(),
                     )
@@ -246,12 +282,27 @@ class RuleProvider : ContentProvider() {
                         RuleContract.KEY_CUSTOM_TIME_QUOTES,
                         TimeQuotePolicy.encode(settings.customTimeQuotes),
                     )
+                    putBoolean(RuleContract.KEY_EXTENSION_ENABLED, settings.extensionEnabled)
                     putLong(RuleContract.KEY_EXTENSION_SECONDS, settings.extensionSeconds)
+                    putInt(RuleContract.KEY_EXTENSION_DAILY_LIMIT, settings.extensionDailyLimit)
+                    putInt(RuleContract.KEY_EXTENSION_SESSION_LIMIT, settings.extensionSessionLimit)
+                    putInt(RuleContract.KEY_EXTENSION_FREE_DAILY_LIMIT, settings.extensionFreeDailyLimit)
+                    putInt(
+                        RuleContract.KEY_EXTENSION_REMAINING_COUNT,
+                        ruleRepository.extensionRemainingCount(packageName, LocalDate.now().toString()),
+                    )
                     putBoolean(RuleContract.KEY_DIAGNOSTICS_ENABLED, settings.diagnosticsEnabled)
                     putBoolean(RuleContract.KEY_USAGE_STATS_ENABLED, settings.usageStatsEnabled)
                     putString(
                         RuleContract.KEY_LIMIT_ENFORCEMENT_MODE,
                         settings.limitEnforcementMode.name,
+                    )
+                    // Device-local setting. It is returned only through the caller-validated
+                    // provider response and is never written to the world-readable rules mirror.
+                    putBoolean(
+                        RuleContract.KEY_ROOT_ENHANCEMENT_ENABLED,
+                        settings.protectionMode == ProtectionMode.XPOSED &&
+                            settings.xposedRootEnhancementEnabled,
                     )
                     putLong(RuleContract.KEY_SYSTEM_TODAY_USED_MS, systemTodayUsedMillis)
                     putLong(
@@ -409,6 +460,185 @@ class RuleProvider : ContentProvider() {
                         },
                     )
                 }
+            }
+
+            RuleContract.METHOD_CLAIM_EXTENSION -> {
+                val packageName = arg.orEmpty()
+                if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
+                if (!isCallerAllowed(packageName)) return denied("caller_mismatch")
+                if (!isConfiguredPackage(ruleRepository, packageName)) return denied("rule_not_configured")
+                if (!ProtectionExecutionPolicy.acceptHookSideEffect(
+                        ruleRepository.getGlobalSettings().protectionMode,
+                    )
+                ) return denied("inactive_protection_mode")
+                if (!ruleRepository.getGlobalSettings().extensionEnabled) {
+                    return Bundle().apply {
+                        putBoolean(RuleContract.KEY_OK, true)
+                        putBoolean(RuleContract.KEY_EXTENSION_ALLOWED, false)
+                        putBoolean(RuleContract.KEY_EXTENSION_REQUIRES_AD, false)
+                        putInt(RuleContract.KEY_EXTENSION_REMAINING_COUNT, 0)
+                    }
+                }
+                val dayToken = extras?.getString(RuleContract.KEY_DAY_TOKEN).orEmpty()
+                val sessionId = extras?.getString(RuleContract.KEY_EXTENSION_SESSION_ID).orEmpty()
+                if (dayToken.isBlank() || dayToken.length > 32 || dayToken.any { it == '\n' || it == '\r' } ||
+                    sessionId.isBlank() || sessionId.length > 160 || sessionId.any { it == '\n' || it == '\r' }) {
+                    return denied("invalid_day_token")
+                }
+                val decision = runCatching {
+                    ruleRepository.claimExtension(packageName, dayToken, sessionId)
+                }.getOrNull() ?: return denied("extension_quota_persist_failed")
+                if (ruleRepository.getGlobalSettings().diagnosticsEnabled) {
+                    DiagnosticsRepository(appContext).append(
+                        level = "INFO",
+                        packageName = packageName,
+                        event = "GROUP_DELAY_COUNT_UPDATED",
+                        message = "day=$dayToken allowed=${decision.allowed} remaining=${decision.remainingCount}",
+                    )
+                }
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, true)
+                    putBoolean(RuleContract.KEY_EXTENSION_ALLOWED, decision.allowed)
+                    putBoolean(RuleContract.KEY_EXTENSION_REQUIRES_AD, decision.requiresAd)
+                    putInt(RuleContract.KEY_EXTENSION_REMAINING_COUNT, decision.remainingCount)
+                }
+            }
+
+            RuleContract.METHOD_CLAIM_REWARDED_AD -> {
+                val packageName = arg.orEmpty()
+                if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
+                if (Binder.getCallingUid() != Process.myUid()) return denied("manager_only")
+                if (!isConfiguredPackage(ruleRepository, packageName)) return denied("rule_not_configured")
+                val request = extras ?: return denied("missing_ad_request")
+                val tx = request.getString(RuleContract.KEY_AD_TRANSACTION_ID).orEmpty()
+                val session = request.getString(RuleContract.KEY_AD_SESSION_ID).orEmpty()
+                if (tx.isBlank() || tx.length > 100 || session.isBlank() || session.length > 160) {
+                    return denied("invalid_ad_identity")
+                }
+                val rule = ruleRepository.getRule(packageName)
+                val currentGroupVersion = ruleRepository.groupForPackage(packageName)?.version ?: 0L
+                val ruleVersion = request.getLong(RuleContract.KEY_AD_RULE_VERSION, Long.MIN_VALUE)
+                val groupVersion = request.getLong(RuleContract.KEY_AD_GROUP_VERSION, Long.MIN_VALUE)
+                val modeGeneration = request.getLong(RuleContract.KEY_AD_MODE_GENERATION, Long.MIN_VALUE)
+                if (rule.version != ruleVersion ||
+                    currentGroupVersion != groupVersion ||
+                    ruleRepository.getGlobalSettings().protectionModeGeneration != modeGeneration
+                ) return denied("stale_ad_request")
+                if (!ruleRepository.getGlobalSettings().extensionEnabled) {
+                    return denied("extension_disabled")
+                }
+                val configuredRewardMillis = ruleRepository.getGlobalSettings().extensionSeconds
+                    .coerceIn(
+                        RuleRepository.MIN_LIMIT_SECONDS,
+                        RuleRepository.MAX_LIMIT_SECONDS,
+                    ) * 1_000L
+                val groupId = ruleRepository.groupForPackage(packageName)?.id.orEmpty()
+                val dailyIdentity = if (groupId.isBlank()) "package:$packageName" else "group:$groupId"
+                val sessionIdentity = "$dailyIdentity:session:$session"
+                val decision = runCatching {
+                    com.liuml.apptimelimiter.ads.RewardedAdStateRepository(appContext).claim(
+                        dailyIdentity = dailyIdentity,
+                        sessionIdentity = sessionIdentity,
+                        dayToken = LocalDate.now().toString(),
+                        configuredExtensionMillis = configuredRewardMillis,
+                        ruleRemainingMillis = configuredRewardMillis,
+                        transactionId = tx,
+                    )
+                }.getOrNull() ?: return denied("ad_state_persist_failed")
+                if (!decision.allowed) return Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, false)
+                    putInt(RuleContract.KEY_AD_DAILY_REMAINING_COUNT, decision.remainingDailyCount)
+                    putLong(RuleContract.KEY_AD_DAILY_REMAINING_MILLIS, decision.remainingDailyMillis)
+                }
+                if (!putRewardedAdPending(packageName, session, tx, decision.rewardMillis,
+                        rule.version, currentGroupVersion, modeGeneration)) {
+                    com.liuml.apptimelimiter.ads.RewardedAdStateRepository(appContext).rollbackClaim(
+                        dailyIdentity = dailyIdentity,
+                        sessionIdentity = sessionIdentity,
+                        transactionId = tx,
+                        rewardMillis = decision.rewardMillis,
+                    )
+                    return denied("ad_pending_persist_failed")
+                }
+                val extensionDecision = runCatching {
+                    ruleRepository.claimRewardedExtension(
+                        packageName = packageName,
+                        dayToken = LocalDate.now().toString(),
+                        sessionId = session,
+                    )
+                }.getOrNull()
+                if (extensionDecision?.allowed != true) {
+                    removeRewardedAdPending(packageName, session, tx)
+                    com.liuml.apptimelimiter.ads.RewardedAdStateRepository(appContext).rollbackClaim(
+                        dailyIdentity, sessionIdentity, tx, decision.rewardMillis,
+                    )
+                    if (extensionDecision == null) return denied("rewarded_extension_quota_persist_failed")
+                    return Bundle().apply {
+                        putBoolean(RuleContract.KEY_OK, false)
+                        putInt(RuleContract.KEY_EXTENSION_REMAINING_COUNT, extensionDecision.remainingCount)
+                    }
+                }
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, true)
+                    putLong(RuleContract.KEY_AD_REWARD_MILLIS, decision.rewardMillis)
+                    putInt(RuleContract.KEY_AD_DAILY_REMAINING_COUNT, decision.remainingDailyCount)
+                    putLong(RuleContract.KEY_AD_DAILY_REMAINING_MILLIS, decision.remainingDailyMillis)
+                }
+            }
+
+            RuleContract.METHOD_CONSUME_REWARDED_AD -> {
+                val packageName = arg.orEmpty()
+                if (!PackageNamePolicy.isValid(packageName) || !isCallerAllowed(packageName)) return denied("caller_mismatch")
+                val request = extras ?: return denied("missing_ad_consume_request")
+                val session = request.getString(RuleContract.KEY_AD_SESSION_ID).orEmpty()
+                val tx = request.getString(RuleContract.KEY_AD_TRANSACTION_ID).orEmpty()
+                if (session.isBlank()) return denied("invalid_ad_consume_identity")
+                synchronized(rewardedAdPendingLock) {
+                    val pending = readRewardedAdPending(packageName, session, tx)
+                        ?: return Bundle().apply { putBoolean(RuleContract.KEY_OK, false) }
+                    val rule = ruleRepository.getRule(packageName)
+                    if (rule.version != pending.ruleVersion ||
+                        (ruleRepository.groupForPackage(packageName)?.version ?: 0L) != pending.groupVersion ||
+                        ruleRepository.getGlobalSettings().protectionModeGeneration != pending.modeGeneration) {
+                        return denied("stale_ad_reward")
+                    }
+                    if (!removeRewardedAdPending(packageName, session, pending.transactionId)) {
+                        return denied("ad_reward_consume_failed")
+                    }
+                    return Bundle().apply {
+                        putBoolean(RuleContract.KEY_OK, true)
+                        putLong(RuleContract.KEY_AD_REWARD_MILLIS, pending.rewardMillis)
+                        putString(RuleContract.KEY_AD_TRANSACTION_ID, pending.transactionId)
+                    }
+                }
+            }
+
+            RuleContract.METHOD_RESET_REWARDED_AD_SESSION -> {
+                val packageName = arg.orEmpty()
+                if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
+                if (!isCallerAllowed(packageName)) return denied("caller_mismatch")
+                if (!isConfiguredPackage(ruleRepository, packageName)) return denied("rule_not_configured")
+                val session = extras?.getString(RuleContract.KEY_AD_SESSION_ID).orEmpty()
+                if (session.isBlank() || session.length > 160 || session.any { it == '\n' || it == '\r' }) {
+                    return denied("invalid_ad_session")
+                }
+                val groupId = ruleRepository.groupForPackage(packageName)?.id.orEmpty()
+                val dailyIdentity = if (groupId.isBlank()) "package:$packageName" else "group:$groupId"
+                val reset = runCatching {
+                    com.liuml.apptimelimiter.ads.RewardedAdStateRepository(appContext).resetSession(
+                        "$dailyIdentity:session:$session",
+                    )
+                }.isSuccess
+                if (!reset) return denied("ad_session_reset_failed")
+                if (ruleRepository.getGlobalSettings().diagnosticsEnabled) {
+                    DiagnosticsRepository(appContext).append(
+                        level = "INFO",
+                        packageName = packageName,
+                        event = "REWARDED_AD_SESSION_RESET",
+                        message = "identity=${dailyIdentity.take(80)}",
+                    )
+                }
+                Bundle().apply { putBoolean(RuleContract.KEY_OK, true) }
             }
 
             RuleContract.METHOD_SYNC_GROUP_PER_LAUNCH_SESSION -> {
@@ -611,6 +841,66 @@ class RuleProvider : ContentProvider() {
                 Bundle().apply { putBoolean(RuleContract.KEY_OK, accepted) }
             }
 
+            RuleContract.METHOD_CLAIM_RESTRICTION_UI -> {
+                val packageName = arg.orEmpty()
+                if (Binder.getCallingUid() != Process.myUid()) return denied("manager_only")
+                if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
+                if (!isConfiguredPackage(ruleRepository, packageName)) return denied("rule_not_configured")
+                val incidentId = extras?.getString(RuleContract.KEY_INCIDENT_ID).orEmpty()
+                if (!isValidRestrictionUiIncident(incidentId)) return denied("invalid_incident")
+                val nowMillis = System.currentTimeMillis()
+                val result = synchronized(restrictionUiLock) {
+                    val prefs = appContext.getSharedPreferences(
+                        RESTRICTION_UI_PREFS,
+                        Context.MODE_PRIVATE,
+                    )
+                    val key = "$RESTRICTION_UI_PREFIX$packageName"
+                    val existing = decodeRestrictionUiClaim(prefs.getString(key, null))
+                    when {
+                        existing == null || existing.expiresAtMillis <= nowMillis -> {
+                            val record = RestrictionUiClaim(incidentId, nowMillis + RESTRICTION_UI_TTL_MS)
+                            val persisted = prefs.edit().putString(key, encodeRestrictionUiClaim(record)).commit()
+                            RestrictionUiClaimResult(persisted, true, record.incidentId)
+                        }
+                        RestrictionPagePresentationPolicy.mayClaimPage(
+                            activeIncidentId = existing.incidentId,
+                            activeExpiresAtMillis = existing.expiresAtMillis,
+                            requestedIncidentId = incidentId,
+                            nowMillis = nowMillis,
+                        ) -> RestrictionUiClaimResult(true, false, existing.incidentId)
+                        else -> RestrictionUiClaimResult(false, false, existing.incidentId)
+                    }
+                }
+                if (!result.accepted) return denied("restriction_ui_active")
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, true)
+                    putBoolean(RuleContract.KEY_INCIDENT_NEW, result.newClaim)
+                    putString(RuleContract.KEY_INCIDENT_ID, result.activeIncidentId)
+                    putString(RuleContract.KEY_RESTRICTION_UI_STATE, "RESTRICTION_VISIBLE")
+                }
+            }
+
+            RuleContract.METHOD_RELEASE_RESTRICTION_UI -> {
+                val packageName = arg.orEmpty()
+                if (Binder.getCallingUid() != Process.myUid()) return denied("manager_only")
+                if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
+                val incidentId = extras?.getString(RuleContract.KEY_INCIDENT_ID).orEmpty()
+                if (!isValidRestrictionUiIncident(incidentId)) return denied("invalid_incident")
+                val released = synchronized(restrictionUiLock) {
+                    val prefs = appContext.getSharedPreferences(
+                        RESTRICTION_UI_PREFS,
+                        Context.MODE_PRIVATE,
+                    )
+                    val key = "$RESTRICTION_UI_PREFIX$packageName"
+                    val existing = decodeRestrictionUiClaim(prefs.getString(key, null))
+                    if (existing?.incidentId != incidentId) false else prefs.edit().remove(key).commit()
+                }
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, released)
+                    putString(RuleContract.KEY_RESTRICTION_UI_STATE, "CANCELLED")
+                }
+            }
+
             RuleContract.METHOD_CREATE_PARENT_AUTH_CHALLENGE -> {
                 val packageName = arg.orEmpty()
                 if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
@@ -734,6 +1024,18 @@ class RuleProvider : ContentProvider() {
                             parentOverride.expiresAtElapsedMillis,
                         )
                     }
+                }
+            }
+
+            RuleContract.METHOD_MARK_PARENT_AUTH_VERIFIED_FOR_AD -> {
+                if (Binder.getCallingUid() != Process.myUid()) return denied()
+                val token = extras?.getString(RuleContract.KEY_PARENT_AUTH_TOKEN)
+                    .orEmpty().take(MAX_BREAK_SESSION_TOKEN_LENGTH)
+                val verified = ParentAuthStore.markVerifiedWaitingForAd(token, System.currentTimeMillis())
+                    ?: return denied("parent_auth_verification_expired")
+                Bundle().apply {
+                    putBoolean(RuleContract.KEY_OK, true)
+                    putString(RuleContract.KEY_PARENT_AUTH_STATUS, verified.status.name)
                 }
             }
 
@@ -885,17 +1187,50 @@ class RuleProvider : ContentProvider() {
                     } else {
                         0
                     },
+                    reminderIncrement = if (settings.usageStatsEnabled) {
+                        extras?.getInt(RuleContract.KEY_REMINDER_INCREMENT, 0)
+                            ?.coerceIn(0, 1) ?: 0
+                    } else {
+                        0
+                    },
                     hookVersionCode = hookVersionCode,
                     hookModeGeneration = extras?.getLong(
                         RuleContract.KEY_HOOK_MODE_GENERATION,
                         0L,
                     )?.coerceAtLeast(0L) ?: 0L,
                     dayToken = extras?.getString(RuleContract.KEY_DAY_TOKEN),
+                    eventId = extras?.getString(RuleContract.KEY_USAGE_EVENT_ID),
                 )
                 if (persisted && hookVersionCode > 0) {
                     appContext.contentResolver.notifyChange(
                         RuleContract.HOOK_STATUS_URI,
                         null,
+                    )
+                }
+                Bundle().apply { putBoolean(RuleContract.KEY_OK, persisted) }
+            }
+
+            RuleContract.METHOD_CLAIM_USAGE_MILESTONE_REMINDER -> {
+                val packageName = arg.orEmpty()
+                if (!isCallerAllowed(packageName)) return denied()
+                if (!isConfiguredPackage(ruleRepository, packageName)) return denied()
+                val settings = ruleRepository.getGlobalSettings()
+                if (!settings.usageMilestoneReminderEnabled) return denied()
+                val day = extras?.getString(RuleContract.KEY_DAY_TOKEN)
+                    ?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+                    ?: return denied()
+                // Delayed callbacks crossing midnight must not create yesterday's reminder.
+                if (day != LocalDate.now()) return denied()
+                val index = extras?.getInt(RuleContract.KEY_USAGE_MILESTONE_INDEX, 0) ?: 0
+                if (!UsageMilestonePolicy.isValidMilestoneIndex(index)) return denied()
+                val persisted = UsageStatsRepository(appContext)
+                    .claimUsageMilestoneReminder(packageName, day, index)
+                if (persisted && settings.diagnosticsEnabled) {
+                    DiagnosticsRepository(appContext).append(
+                        "INFO",
+                        packageName,
+                        "USAGE_MILESTONE_REMINDER_RECORDED",
+                        "day=$day,milestone=$index",
                     )
                 }
                 Bundle().apply { putBoolean(RuleContract.KEY_OK, persisted) }
@@ -943,6 +1278,10 @@ class RuleProvider : ContentProvider() {
                 }
             }
 
+            RuleContract.METHOD_ROOT_FORCE_STOP_SELF -> {
+                rootForceStopSelf(appContext, ruleRepository, arg, extras)
+            }
+
             else -> super.call(method, arg, extras)
         }
     }
@@ -955,8 +1294,93 @@ class RuleProvider : ContentProvider() {
         return runCatching {
             // checkPackage is authoritative and is not affected by Android package-visibility filters.
             appOps.checkPackage(callingUid, requestedPackage)
-            true
+            // Keep an explicit PackageManager check as a second guard for shared-UID callers and
+            // vendor AppOps implementations that only validate the operation owner.
+            val packages = context?.packageManager?.getPackagesForUid(callingUid)
+            packages?.contains(requestedPackage) == true
         }.getOrDefault(false)
+    }
+
+    private fun isValidRestrictionUiIncident(incidentId: String): Boolean =
+        incidentId.isNotBlank() &&
+            incidentId.length <= MAX_INCIDENT_ID_LENGTH &&
+            incidentId.none { it == '\n' || it == '\r' }
+
+    private fun encodeRestrictionUiClaim(record: RestrictionUiClaim): String =
+        "${Base64.encodeToString(record.incidentId.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)}.${record.expiresAtMillis}"
+
+    private fun decodeRestrictionUiClaim(raw: String?): RestrictionUiClaim? {
+        val parts = raw?.split('.', limit = 2) ?: return null
+        if (parts.size != 2) return null
+        val incidentId = runCatching {
+            String(Base64.decode(parts[0], Base64.NO_WRAP), Charsets.UTF_8)
+        }.getOrNull() ?: return null
+        if (!isValidRestrictionUiIncident(incidentId)) return null
+        val expiresAtMillis = parts[1].toLongOrNull()?.takeIf { it > 0L } ?: return null
+        return RestrictionUiClaim(incidentId, expiresAtMillis)
+    }
+
+    private data class RestrictionUiClaim(
+        val incidentId: String,
+        val expiresAtMillis: Long,
+    )
+
+    private data class RestrictionUiClaimResult(
+        val accepted: Boolean,
+        val newClaim: Boolean,
+        val activeIncidentId: String,
+    )
+
+    private data class PendingReward(
+        val rewardMillis: Long,
+        val transactionId: String,
+        val ruleVersion: Long,
+        val groupVersion: Long,
+        val modeGeneration: Long,
+    )
+
+    private fun putRewardedAdPending(
+        packageName: String,
+        sessionId: String,
+        transactionId: String,
+        rewardMillis: Long,
+        ruleVersion: Long,
+        groupVersion: Long,
+        modeGeneration: Long,
+    ): Boolean {
+        if (packageName.contains('|') || sessionId.contains('|') || transactionId.contains('|')) return false
+        val key = "${packageName.take(100)}.${sessionId.take(120)}"
+        return synchronized(rewardedAdPendingLock) {
+            context?.getSharedPreferences("rewarded_ad_pending_private", Context.MODE_PRIVATE)
+                ?.let {
+                    it.edit().putString(key, listOf(rewardMillis, transactionId.take(100), ruleVersion, groupVersion, modeGeneration)
+                        .joinToString("|"))
+                        .putLong("${key}.expires", SystemClock.elapsedRealtime() + 30_000L).commit()
+                } ?: false
+        }
+    }
+
+    private fun readRewardedAdPending(packageName: String, sessionId: String, transactionId: String): PendingReward? {
+        val key = "${packageName.take(100)}.${sessionId.take(120)}"
+        val prefs = context?.getSharedPreferences("rewarded_ad_pending_private", Context.MODE_PRIVATE) ?: return null
+        val raw = prefs.getString(key, null) ?: return null
+        val values = raw.split('|')
+        if (values.size != 5) return null
+        val pending = runCatching {
+            PendingReward(values[0].toLong(), values[1], values[2].toLong(), values[3].toLong(), values[4].toLong())
+        }.getOrNull()
+        if (pending == null || (transactionId.isNotBlank() && pending.transactionId != transactionId) ||
+            prefs.getLong("${key}.expires", 0L) < SystemClock.elapsedRealtime()) {
+            return null
+        }
+        return pending
+    }
+
+    private fun removeRewardedAdPending(packageName: String, sessionId: String, transactionId: String): Boolean {
+        val key = "${packageName.take(100)}.${sessionId.take(120)}"
+        val prefs = context?.getSharedPreferences("rewarded_ad_pending_private", Context.MODE_PRIVATE) ?: return false
+        if (prefs.getString(key, null)?.split('|')?.getOrNull(1) != transactionId) return false
+        return prefs.edit().remove(key).remove("${key}.expires").commit()
     }
 
     private fun isConfiguredPackage(repository: RuleRepository, packageName: String): Boolean {
@@ -967,6 +1391,157 @@ class RuleProvider : ContentProvider() {
             assignedGroup = repository.groupForPackage(packageName),
         )
     }
+
+    /**
+     * The target process is intentionally not allowed to execute su. It can only ask this
+     * provider to perform a validated, package-scoped operation in the manager process.
+     */
+    private fun rootForceStopSelf(
+        appContext: android.content.Context,
+        repository: RuleRepository,
+        packageNameArg: String?,
+        extras: Bundle?,
+    ): Bundle {
+        val packageName = packageNameArg.orEmpty()
+        val callingUid = Binder.getCallingUid()
+        val incidentId = extras?.getString(RuleContract.KEY_INCIDENT_ID).orEmpty()
+        if (!PackageNamePolicy.isValid(packageName) || !isCallerAllowed(packageName)) {
+            return denied("caller_mismatch")
+        }
+        if (!isConfiguredPackage(repository, packageName)) return denied("rule_not_configured")
+        if (
+            incidentId.isBlank() || incidentId.length > MAX_INCIDENT_ID_LENGTH ||
+            incidentId.any { it == '\n' || it == '\r' }
+        ) {
+            return denied("invalid_incident")
+        }
+        val settings = repository.getGlobalSettings()
+        if (
+            settings.protectionMode != ProtectionMode.XPOSED ||
+                !settings.xposedRootEnhancementEnabled
+        ) {
+            return denied("root_not_enabled")
+        }
+        val appInfo = runCatching {
+            appContext.packageManager.getApplicationInfo(packageName, 0)
+        }.getOrNull() ?: return denied("package_not_found")
+        val protectedPackages = setOf(
+            appContext.packageName,
+            "android",
+            "com.android.systemui",
+            "com.android.permissioncontroller",
+        )
+        val homePackage = runCatching {
+            appContext.packageManager.resolveActivity(
+                android.content.Intent(android.content.Intent.ACTION_MAIN)
+                    .addCategory(android.content.Intent.CATEGORY_HOME),
+                android.content.pm.PackageManager.MATCH_DEFAULT_ONLY,
+            )?.activityInfo?.packageName
+        }.getOrNull()
+        if (
+            appInfo.flags and (android.content.pm.ApplicationInfo.FLAG_SYSTEM or
+                android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0 ||
+            packageName in protectedPackages || packageName == homePackage
+        ) {
+            return denied("protected_package")
+        }
+        val request = RestrictionRequest(
+            packageName = packageName,
+            userId = (callingUid / 100_000).coerceAtLeast(0),
+            reason = "root_force_stop",
+            incidentId = incidentId,
+            ruleVersion = repository.getRule(packageName).version,
+            groupVersion = repository.groupForPackage(packageName)?.version ?: 0L,
+            modeGeneration = settings.protectionModeGeneration,
+            foregroundPackage = packageName,
+            foregroundGeneration = extras?.getLong("foreground_generation", 0L) ?: 0L,
+            sessionId = extras?.getString(RuleContract.KEY_PROCESS_SESSION_ID)
+                .orEmpty().take(MAX_SESSION_ID_LENGTH).ifBlank { "root:$incidentId" },
+            allowDelay = false,
+            allowPin = false,
+            allowAd = false,
+        )
+        diagnosticParentAuth(
+            appContext,
+            settings.diagnosticsEnabled,
+            packageName,
+            "ROOT_FORCE_STOP_REQUESTED",
+            "incident=${incidentId.take(80)}",
+        )
+        if (!claimRootForceStopIncident(appContext, incidentId)) {
+            if (settings.diagnosticsEnabled) {
+                diagnosticParentAuth(
+                    appContext,
+                    true,
+                    packageName,
+                    "ROOT_FORCE_STOP_RESULT",
+                    "result=duplicate; incident=${incidentId.take(80)}",
+                )
+            }
+            return Bundle().apply {
+                putBoolean(RuleContract.KEY_OK, true)
+                putString(RuleContract.KEY_MESSAGE, "ALREADY_QUEUED")
+            }
+        }
+        rootForceStopExecutor.execute {
+            val result = if (isRootForceStopRequestStillValid(appContext, request)) {
+                RootExecutor(appContext).execute(request)
+            } else {
+                RestrictionExecutionResult.REJECTED
+            }
+            if (settings.diagnosticsEnabled) {
+                diagnosticParentAuth(
+                    appContext,
+                    true,
+                    packageName,
+                    "ROOT_FORCE_STOP_RESULT",
+                    "result=${result.name.lowercase(java.util.Locale.ROOT)}; incident=${incidentId.take(80)}",
+                )
+            }
+        }
+        return Bundle().apply {
+            putBoolean(RuleContract.KEY_OK, true)
+            putString(RuleContract.KEY_MESSAGE, "QUEUED")
+        }
+    }
+
+    private fun isRootForceStopRequestStillValid(
+        appContext: Context,
+        request: RestrictionRequest,
+    ): Boolean {
+        val repository = RuleRepository(appContext)
+        val settings = repository.getGlobalSettings()
+        if (
+            settings.protectionMode != ProtectionMode.XPOSED ||
+                !settings.xposedRootEnhancementEnabled
+        ) {
+            return false
+        }
+        val rule = repository.getRule(request.packageName) ?: return false
+        val group = repository.groupForPackage(request.packageName)
+        return isConfiguredPackage(repository, request.packageName) &&
+            rule.version == request.ruleVersion &&
+            (group?.version ?: 0L) == request.groupVersion &&
+            settings.protectionModeGeneration == request.modeGeneration
+    }
+
+    private fun claimRootForceStopIncident(appContext: Context, incidentId: String): Boolean =
+        synchronized(rootForceStopLock) {
+            val prefs = appContext.getSharedPreferences(ROOT_FORCE_STOP_PREFS, Context.MODE_PRIVATE)
+            val key = "$ROOT_FORCE_STOP_INCIDENT_PREFIX$incidentId"
+            if (prefs.contains(key)) return@synchronized false
+            val records = prefs.all
+                .asSequence()
+                .filter { (storedKey, value) ->
+                    storedKey.startsWith(ROOT_FORCE_STOP_INCIDENT_PREFIX) && value is Long
+                }
+                .sortedBy { (_, value) -> value as Long }
+                .toList()
+            val editor = prefs.edit().putLong(key, System.currentTimeMillis())
+            records.take((records.size + 1 - MAX_ROOT_FORCE_STOP_INCIDENTS).coerceAtLeast(0))
+                .forEach { (oldKey, _) -> editor.remove(oldKey) }
+            editor.commit()
+        }
 
     private fun denied() = Bundle().apply { putBoolean(RuleContract.KEY_OK, false) }
 
@@ -1139,6 +1714,12 @@ class RuleProvider : ContentProvider() {
         const val WARNING_VIBRATION_DURATION_MS = 1_200L
         const val WARNING_VIBRATION_MIN_INTERVAL_MS = 30_000L
         const val BREAK_SESSION_PREFS = "break_sessions"
+        const val RESTRICTION_UI_PREFS = "restriction_ui_private"
+        const val RESTRICTION_UI_PREFIX = "active."
+        const val RESTRICTION_UI_TTL_MS = 10L * 60L * 1_000L
+        const val ROOT_FORCE_STOP_PREFS = "root_force_stop_private"
+        const val ROOT_FORCE_STOP_INCIDENT_PREFIX = "incident."
+        const val MAX_ROOT_FORCE_STOP_INCIDENTS = 128
         const val KEY_BREAK_SESSION_RECORDS = "records"
         const val BREAK_SESSION_TOKEN_BYTES = 24
         const val MAX_BREAK_SESSION_TOKEN_LENGTH = 128

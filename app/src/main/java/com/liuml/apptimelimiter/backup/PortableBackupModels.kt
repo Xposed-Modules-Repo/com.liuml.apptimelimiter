@@ -1,6 +1,7 @@
 package com.liuml.apptimelimiter.backup
 
 import com.liuml.apptimelimiter.core.CooldownPolicy
+import com.liuml.apptimelimiter.core.ExtensionQuotaPolicy
 import com.liuml.apptimelimiter.core.PackageNamePolicy
 import com.liuml.apptimelimiter.data.AppGroup
 import com.liuml.apptimelimiter.data.AppLanguageMode
@@ -16,6 +17,7 @@ data class PortableGlobalSettings(
     val exitWarningEnabled: Boolean = true,
     val fullScreenExitWarningEnabled: Boolean = false,
     val exitWarningVibrationEnabled: Boolean = false,
+    val usageMilestoneReminderEnabled: Boolean = false,
     val languageMode: AppLanguageMode = AppLanguageMode.SYSTEM,
     val themeMode: AppThemeMode = AppThemeMode.SYSTEM,
     val themeColor: AppThemeColor = AppThemeColor.GREEN,
@@ -23,7 +25,11 @@ data class PortableGlobalSettings(
     val builtInTimeQuotesEnabled: Boolean = true,
     val customTimeQuotes: List<String> = emptyList(),
     val automaticUpdateCheckEnabled: Boolean = true,
+    val extensionEnabled: Boolean = true,
     val extensionSeconds: Long = RuleRepository.DEFAULT_EXTENSION_SECONDS,
+    val extensionDailyLimit: Int = ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT,
+    val extensionSessionLimit: Int = ExtensionQuotaPolicy.DEFAULT_SESSION_LIMIT,
+    val extensionFreeDailyLimit: Int = ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT,
     val diagnosticsEnabled: Boolean = true,
     val usageStatsEnabled: Boolean = true,
 )
@@ -131,6 +137,11 @@ object PortableBackupPolicy {
         val settings = backup.settings
         if (settings.extensionSeconds !in RuleRepository.MIN_EXTENSION_SECONDS..RuleRepository.MAX_EXTENSION_SECONDS) {
             return invalid("invalid_extension")
+        }
+        if (settings.extensionDailyLimit !in 1..ExtensionQuotaPolicy.MAX_DAILY_LIMIT ||
+            settings.extensionSessionLimit !in 1..ExtensionQuotaPolicy.MAX_SESSION_LIMIT
+        ) {
+            return invalid("invalid_extension_daily_limit")
         }
         if (settings.customTimeQuotes.size > MAX_QUOTES ||
             settings.customTimeQuotes.any { it.isBlank() || it.length > MAX_QUOTE_LENGTH }

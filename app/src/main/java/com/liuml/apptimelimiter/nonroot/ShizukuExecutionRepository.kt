@@ -105,7 +105,9 @@ class ShizukuExecutionRepository private constructor(
     }
 
     fun refresh() {
-        val enabled = RuleRepository(appContext).getGlobalSettings().protectionMode.usesShizuku
+        val enabled = RuleRepository(appContext).getGlobalSettings()
+            .accessibilityForceStopEnhancement ==
+            com.liuml.apptimelimiter.data.ForceStopEnhancement.SHIZUKU
         if (!enabled && pendingRepair == null && !repairOnlyBinding) {
             if (remote != null || binding) {
                 runCatching {
@@ -269,7 +271,10 @@ class ShizukuExecutionRepository private constructor(
     private fun finishRepairBinding() {
         if (!repairOnlyBinding) return
         repairOnlyBinding = false
-        if (!RuleRepository(appContext).getGlobalSettings().protectionMode.usesShizuku) {
+        if (
+            RuleRepository(appContext).getGlobalSettings().accessibilityForceStopEnhancement !=
+                com.liuml.apptimelimiter.data.ForceStopEnhancement.SHIZUKU
+        ) {
             runCatching { Shizuku.unbindUserService(userServiceArgs, connection, true) }
             remote = null
             binding = false

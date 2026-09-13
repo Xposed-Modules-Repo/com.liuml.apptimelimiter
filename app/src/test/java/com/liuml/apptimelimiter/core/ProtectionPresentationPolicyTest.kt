@@ -1,6 +1,7 @@
 package com.liuml.apptimelimiter.core
 
 import com.liuml.apptimelimiter.data.ProtectionMode
+import com.liuml.apptimelimiter.data.ForceStopEnhancement
 import com.liuml.apptimelimiter.nonroot.AccessibilityRuntimeState
 import com.liuml.apptimelimiter.nonroot.ShizukuExecutionState
 import com.liuml.apptimelimiter.xposedstatus.ManagedAppHookState
@@ -38,9 +39,10 @@ class ProtectionPresentationPolicyTest {
     @Test
     fun `unavailable Shizuku presents basic protection fallback`() {
         val result = present(
-            mode = ProtectionMode.ACCESSIBILITY_SHIZUKU,
-            target = target(selectedMode = ProtectionMode.ACCESSIBILITY_SHIZUKU),
+            mode = ProtectionMode.ACCESSIBILITY,
+            target = target(selectedMode = ProtectionMode.ACCESSIBILITY),
             shizukuState = ShizukuExecutionState.UNAVAILABLE,
+            accessibilityEnhancement = ForceStopEnhancement.SHIZUKU,
         )
         assertEquals(
             ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_FALLBACK,
@@ -65,12 +67,14 @@ class ProtectionPresentationPolicyTest {
         target: TargetProtectionStatus,
         accessibilityState: AccessibilityRuntimeState = AccessibilityRuntimeState.CONNECTED,
         shizukuState: ShizukuExecutionState = ShizukuExecutionState.READY,
+        accessibilityEnhancement: ForceStopEnhancement = ForceStopEnhancement.NONE,
     ) = ProtectionPresentationPolicy.resolve(
         selectedMode = mode,
         targets = listOf(target),
         accessibilityState = accessibilityState,
         usageAccessGranted = true,
         shizukuState = shizukuState,
+        accessibilityEnhancement = accessibilityEnhancement,
     )
 
     private fun target(

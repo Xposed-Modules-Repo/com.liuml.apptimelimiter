@@ -1,6 +1,7 @@
 package com.liuml.apptimelimiter.nonroot
 
 import com.liuml.apptimelimiter.data.ProtectionMode
+import com.liuml.apptimelimiter.data.ForceStopEnhancement
 
 enum class ProtectionEngine {
     XPOSED,
@@ -37,6 +38,7 @@ data class ProtectionEngineSnapshot(
 object ProtectionEnginePolicy {
     fun resolve(
         protectionMode: ProtectionMode,
+        accessibilityEnhancement: ForceStopEnhancement = ForceStopEnhancement.NONE,
         accessibilityEnabled: Boolean,
         accessibilityConfigured: Boolean = accessibilityEnabled,
         usageAccessGranted: Boolean,
@@ -61,7 +63,7 @@ object ProtectionEnginePolicy {
                 degradedReason = ProtectionDegradedReason.NONE,
             )
         }
-        val shizukuEnabled = protectionMode == ProtectionMode.ACCESSIBILITY_SHIZUKU
+        val shizukuEnabled = accessibilityEnhancement == ForceStopEnhancement.SHIZUKU
         val reason = when {
             !accessibilityConfigured -> ProtectionDegradedReason.ACCESSIBILITY_DISABLED
             !accessibilityEnabled -> ProtectionDegradedReason.ACCESSIBILITY_DISCONNECTED

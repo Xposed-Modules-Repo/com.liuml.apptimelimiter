@@ -1,0 +1,7 @@
+What's new in 0.11.22
+
+- Added historical usage charts, weekly summaries, launch counts, and limit-hit records.
+- Added optional encrypted WebDAV sync for portable rules, groups, and settings.
+- Added Root and Shizuku force-stop options for Basic protection, with restriction-page fallback.
+- Added an optional rewarded extension from the restriction page, bounded by daily, session, schedule, cooldown, PIN, and group rules.
+- Improved restriction-page recovery, rule reads, and protection-status reliability.

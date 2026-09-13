@@ -2,7 +2,7 @@
 
 Precision app-time control for Android power users who want policy, telemetry, and enforcement in the same loop.
 
-Transition builds: `0.11.13 (52)` legacy migration / `0.11.14 (53)` Modern
+Current development build: `0.11.22 (61)` Modern. Legacy migration builds are retained only for existing users completing the two-stage upgrade.
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -26,10 +26,13 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | --- | --- |
 | Independent app rules | Each app keeps its own enabled state, daily quota, per-launch quota, schedule windows, warning style, and cooldown behavior. The launcher-app list refreshes after package changes or returning to Time Stop and also supports pull-to-refresh. |
 | App groups and shared rules | Enable shared daily, continuous per-launch, weekly schedule, and cooldown rules for a group. Switching directly between members keeps one per-launch balance; leaving the group for the configured rest starts a new cycle. |
-| Child lock and parent override | Optionally protects rule-changing settings with a private 4–8 digit PIN. PIN derivation runs off the UI thread, repeated submissions are suppressed, and an active lockout shows a live countdown instead of freezing or closing the manager. At a hard limit, a parent can temporarily allow only the current app session. |
+| Control Lock and parent override | Optionally protects rule-changing settings with a private 4–8 digit PIN for family or personal use. PIN derivation runs off the UI thread, repeated submissions are suppressed, and an active lockout shows a live countdown instead of freezing or closing the manager. At a hard limit, a parent can temporarily allow only the current app session. |
 | Non-root basic protection | Uses content-blind accessibility foreground events and Android usage access. An opt-in enhanced compatibility mode adds package-only content-change events for ROMs that miss normal window events; it still retrieves no nodes, text, or input and adds no foreground service or continuous polling. |
-| Global protection mode | Select exactly one controller for all targets: LSPosed, Basic protection, or Basic protection + Shizuku. Controllers never take over automatically. |
-| Optional Shizuku enhancement | Only executes a validated force-stop for configured third-party targets; unavailable or failed states fall back to the normal restriction page without switching to LSPosed. |
+| Global protection mode | Select exactly one controller for all targets: LSPosed or Basic protection. Controllers never take over automatically. |
+| Optional force-stop enhancement | Basic protection can select the restriction page, Root, or Shizuku as one mutually exclusive limit action. Root and Shizuku only force-stop validated configured third-party targets; unavailable or failed actions fall back to the restriction page. |
+| Rewarded extension | A user may voluntarily watch a rewarded ad only from Time Stop's restriction page to request a temporary extension. Privacy consent is required; only a confirmed reward grants time, and quotas, schedules, cooldowns, PIN, and group limits still apply. |
+| Historical statistics | Review daily history with usage charts, weekly summaries, limit-hit counts, launch counts, and a system-app filter without uploading usage data. |
+| Encrypted WebDAV sync | Manually upload or download portable rules, groups, and portable settings through a user-configured HTTPS WebDAV endpoint. Payloads are encrypted with AES-GCM; PIN material, statistics, diagnostics, and runtime state stay local. |
 | Protection status in Settings | Settings shows the selected mode, actual execution path, confirmed issues, and repair actions. Unknown LSPosed evidence is shown as waiting for verification rather than inactive; unavailable Shizuku is shown as a basic-protection fallback. |
 | Daily cumulative mode | Uses the stronger source for each app: Android system usage when available, or Hook-local foreground accounting, then resets at local midnight. |
 | Per-launch mode | Starts a fresh foreground timer for the target process. If the process survives in the background, staying away for at least the configured cooldown counts as an effective rest and starts a new cycle. |
@@ -38,7 +41,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Foreground-only accounting | Counts only the `onResume` to `onPause` phase. Background residency does not burn the quota. |
 | Warning UI | LSPosed Hook targets can show a five-second top or full-screen warning matching the selected global color, optionally vibrate once, and offer exit or a 1-60 minute extension. Pure non-root mode hides these Hook-only settings; its session plan offers exit or replan five seconds before expiry. |
 | Enforcement mode | Settings expose only actions supported by each engine. LSPosed force-exit closes the task and terminates the current Hook process; separate background processes may survive, while package-wide force-stop requires Standard protection + Shizuku. LSPosed also offers a themed standalone break page with an exit-to-Home action. Non-root basic protection offers the same styled restriction page or Shizuku force-stop, with automatic page fallback if Shizuku is unavailable or fails. |
-| Parent temporary override | With child lock enabled, each PIN verification selects 1-60 minutes and defaults to 5 minutes without remembering the previous choice. In the Modern build, switching to another app and returning keeps the override until its fixed deadline; expiry, screen-off, target-process end, or a rule/mode change still invalidates it. |
+| Parent temporary override | With Control Lock enabled, each PIN verification selects 1-60 minutes and defaults to 5 minutes without remembering the previous choice. In the Modern build, switching to another app and returning keeps the override until its fixed deadline; expiry, screen-off, target-process end, or a rule/mode change still invalidates it. |
 | Language | Supports system-default, Simplified Chinese, and English UI; Hook warnings use the same preference. |
 | Appearance | Offers health green, calm blue, and focus purple across all in-app and target-side surfaces, each with follow-system, light, and dark modes. Plan prompts, full-screen warnings, and restriction pages can also show built-in or custom time-reflection lines. |
 | Delay action | Lets the user add 1-60 minutes for normal time limits while keeping schedule blocks strict. |
@@ -52,6 +55,21 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Updates and diagnostics | Checks GitHub Releases automatically when the manager opens (rate-limited and configurable), actively prompts for a new stable release, uses Android's download manager for APK updates, and can attach local diagnostics to an email report. |
 
 Changing a rule resets the Hook-local accumulator for that app, but Android's system usage for the current day remains part of the daily baseline when usage access is granted. That makes rule tweaking visible, not a loophole.
+
+## Local TopOn Configuration
+
+TopOn credentials are read only from `%USERPROFILE%\.gradle\gradle.properties`; they are never stored in this repository, project `gradle.properties`, source code, diagnostics, backups, or Git. A local build that needs real rewarded-ad requests must provide:
+
+```properties
+toponAppId=<TopOn App ID>
+toponAppKey=<TopOn App Key>
+toponPlacementId=<rewarded_extension_v1 placement ID>
+toponTestMode=false
+# Debug uses the deterministic local reward simulation unless this is explicitly true.
+toponLiveTestAds=false
+```
+
+Set `toponLiveTestAds=true` only after registering the device as a TopOn test device. If any required local value is absent, real ad display safely fails and no temporary extension is granted.
 
 ## Architecture
 
@@ -119,13 +137,15 @@ The variant APKs are generated below `app/build/outputs/apk/legacyMigration/debu
 1. Install the APK, open **Time Stop**, select target apps, and save rules or groups.
 2. For non-root protection, enable it in Settings, accept the accessibility disclosure, and grant accessibility plus usage access.
 3. Select one global protection mode. Basic protection requires Accessibility and Usage Access; the Shizuku mode additionally requires Shizuku authorization. Protection status and repair actions are shown at the top of Settings. After switching modes, the next real target-app window is owned by the new mode; only confirmed outdated or failed Hooks require a targeted reopen.
-4. On rooted devices, enable the LSPosed module and scope controlled apps. Force-stop and reopen targets after changing scope; a current Hook heartbeat automatically takes priority.
+4. On rooted devices, enable the LSPosed module and scope controlled apps. Force-stop and reopen targets after changing scope. In Settings, LSPosed mode can optionally use Root force-stop to stop the whole target package when closing only the current Hook process is insufficient; it is off by default and falls back to the existing exit path when unavailable.
 
 Time Stop checks required non-root permissions only when non-root mode has managed targets. Choosing Later suppresses the same issue combination for 72 hours, while “Do not show this type again” suppresses that signature until reminders are restored in Settings. Missing Shizuku capability never disables basic timing; enforcement falls back to the standalone restriction page.
 
-Upgrade legacy installations through `0.11.13 (52)` before installing `0.11.14 (53)`. Version 52 contains only `assets/xposed_init`; while the legacy LSPosed store is still authoritative it writes an AES-GCM encrypted capsule into app-private, no-backup storage and refreshes it after configuration or child-lock changes. Once that capsule is valid, every cold start offers the exact 0.11.14 release again. Version 53 imports the capsule before initializing Modern remote preferences or scope synchronization, then retains the consumed capsule for 30 days. If a user upgrades directly from an older version to 53 and the legacy authoritative store is still readable, 53 adopts it once and continues without requiring a data wipe. If legacy data is detected but cannot be confirmed, initialization stops rather than replacing rules with an empty store.
+Upgrade legacy installations through `0.11.13 (52)` before installing `0.11.14 (53)`. Version 52 contains only `assets/xposed_init`; while the legacy LSPosed store is still authoritative it writes an AES-GCM encrypted capsule into app-private, no-backup storage and refreshes it after configuration or Control Lock changes. Once that capsule is valid, every cold start offers the exact 0.11.14 release again. Version 53 imports the capsule before initializing Modern remote preferences or scope synchronization, then retains the consumed capsule for 30 days. If a user upgrades directly from an older version to 53 and the legacy authoritative store is still readable, 53 adopts it once and continues without requiring a data wipe. If legacy data is detected but cannot be confirmed, initialization stops rather than replacing rules with an empty store.
 
-Settings also provides a portable plaintext JSON export/import flow through Android's document picker. It previews and validates the file before atomically replacing app and group rules, preserves rules for apps not currently installed, and keeps device-specific protection settings and child lock unchanged. Portable backups contain package names and time rules, but never PIN material, statistics, diagnostics, runtime cooldowns, challenges, or temporary overrides.
+Settings also provides a portable plaintext JSON export/import flow through Android's document picker. It previews and validates the file before atomically replacing app and group rules, preserves rules for apps not currently installed, and keeps device-specific protection settings and Control Lock unchanged. Portable backups contain package names and time rules, but never PIN material, statistics, diagnostics, runtime cooldowns, challenges, or temporary overrides.
+
+The same portable configuration can be manually synchronized through a user-configured HTTPS WebDAV endpoint. Before upload, Time Stop encrypts the portable payload with the user-selected sync password using AES-GCM. WebDAV credentials are used only for the requested transfer and are not included in portable backups; PIN material, statistics, diagnostics, and runtime state remain local.
 
 On frameworks that expose API 102 service access, Time Stop registers its listener when the manager process is created, reads scope before a target app opens, automatically requests missing packages after a personal rule or active group is saved, and removes packages after their last effective rule is deleted. LSPosed still shows its own approval UI, and running targets must be force-stopped and reopened after a scope change. Older or temporarily disconnected frameworks fall back to the persisted `HOOK_READY` heartbeat without reporting an unknown scope as missing.
 
@@ -149,7 +169,7 @@ Obtainium is a third-party updater. It does not change Time Stop's protection en
 
 ### F-Droid
 
-Time Stop is licensed as GPL-3.0-only so it can be submitted to F-Droid-compatible repositories. Packaging metadata is kept in `packaging/fdroid/`. Until the official F-Droid review is accepted, use GitHub Releases, LSPosed, Obtainium, or a self-hosted F-Droid repository.
+Time Stop is licensed as GPL-3.0-only. The current release includes the proprietary TopOn advertising SDK, so it is not eligible for the official F-Droid repository as built. `packaging/fdroid/` is retained for a future flavor that removes proprietary dependencies. Use GitHub Releases, LSPosed, or Obtainium for the current release.
 
 ## Diagnostics
 

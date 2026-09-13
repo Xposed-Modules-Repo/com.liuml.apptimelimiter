@@ -43,26 +43,37 @@ class DeviceUsageStatsRepository(context: Context) {
     }
 
     fun todayUsageSnapshot(packageNames: Collection<String>): CalculatedUsageSnapshot {
+        return usageSnapshot(packageNames, LocalDate.now())
+    }
+
+    fun usageSnapshot(packageNames: Collection<String>, date: LocalDate): CalculatedUsageSnapshot {
         if (packageNames.isEmpty() || !hasUsageAccess()) return CalculatedUsageSnapshot()
         val now = System.currentTimeMillis()
-        val today = LocalDate.now()
         val tracked = packageNames.toSet()
+        val zoneId = ZoneId.systemDefault().id
         val nowElapsed = SystemClock.elapsedRealtime()
         synchronized(this) {
             summariesCache?.takeIf {
-                it.day == today &&
+                it.day == date &&
+                    it.zoneId == zoneId &&
                     it.packageNames == tracked &&
                     nowElapsed - it.measuredAtElapsedMillis <= PROVIDER_CACHE_MS
             }?.let { return it.snapshot }
         }
-        val startOfDay = today
+        val startOfDay = date
             .atStartOfDay(ZoneId.systemDefault())
             .toInstant()
             .toEpochMilli()
+        val endOfDay = date.plusDays(1L)
+            .atStartOfDay(ZoneId.systemDefault())
+            .toInstant()
+            .toEpochMilli()
+        val queryEnd = minOf(System.currentTimeMillis(), endOfDay)
+        if (queryEnd <= startOfDay) return CalculatedUsageSnapshot()
         val manager = appContext.getSystemService(UsageStatsManager::class.java)
             ?: return CalculatedUsageSnapshot()
         val usageEvents = runCatching {
-            manager.queryEvents((startOfDay - EVENT_LOOKBACK_MS).coerceAtLeast(0L), now)
+            manager.queryEvents((startOfDay - EVENT_LOOKBACK_MS).coerceAtLeast(0L), queryEnd)
         }.getOrElse { return CalculatedUsageSnapshot() }
         val transitions = buildList<UsageTimelineEvent> {
             val event = UsageEvents.Event()
@@ -95,11 +106,11 @@ class DeviceUsageStatsRepository(context: Context) {
         val snapshot = UsageEventDurationCalculator.calculateSnapshot(
             tracked,
             startOfDay,
-            now,
+            queryEnd,
             transitions,
         )
         synchronized(this) {
-            summariesCache = CachedSummaries(today, tracked, nowElapsed, snapshot)
+            summariesCache = CachedSummaries(date, zoneId, tracked, nowElapsed, snapshot)
         }
         return snapshot
     }
@@ -243,6 +254,7 @@ class DeviceUsageStatsRepository(context: Context) {
 
     private data class CachedSummaries(
         val day: LocalDate,
+        val zoneId: String,
         val packageNames: Set<String>,
         val measuredAtElapsedMillis: Long,
         val snapshot: CalculatedUsageSnapshot,

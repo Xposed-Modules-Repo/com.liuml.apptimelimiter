@@ -99,7 +99,7 @@ object UpdateChecker {
             if (responseCode !in 200..299) error(
                 if (english) "GitHub returned HTTP $responseCode" else "GitHub 返回 HTTP $responseCode",
             )
-            val releases = JSONArray(connection.inputStream.bufferedReader().use { it.readText() })
+            val releases = JSONArray(readBoundedText(connection, MAX_RELEASE_RESPONSE_BYTES))
             val release = (0 until releases.length())
                 .asSequence()
                 .map(releases::getJSONObject)
@@ -151,7 +151,7 @@ object UpdateChecker {
         }
         return try {
             if (connection.responseCode !in 200..299) error("GitHub HTTP ${connection.responseCode}")
-            val releases = JSONArray(connection.inputStream.bufferedReader().use { it.readText() })
+            val releases = JSONArray(readBoundedText(connection, MAX_RELEASE_RESPONSE_BYTES))
             val release = (0 until releases.length())
                 .asSequence()
                 .map(releases::getJSONObject)
@@ -196,6 +196,24 @@ object UpdateChecker {
         context,
         RuleRepository(context).getGlobalSettings().languageMode,
     ) == SupportedLanguage.ENGLISH
+
+    private fun readBoundedText(connection: HttpURLConnection, maxBytes: Int): String {
+        val output = StringBuilder()
+        connection.inputStream.bufferedReader().use { reader ->
+            val buffer = CharArray(8 * 1024)
+            var total = 0
+            while (true) {
+                val count = reader.read(buffer)
+                if (count < 0) break
+                total += count
+                require(total <= maxBytes) { "release_response_too_large" }
+                output.append(buffer, 0, count)
+            }
+        }
+        return output.toString()
+    }
+
+    private const val MAX_RELEASE_RESPONSE_BYTES = 512 * 1024
 }
 
 internal fun isStableRelease(draft: Boolean, prerelease: Boolean): Boolean = !draft && !prerelease
