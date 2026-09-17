@@ -66,6 +66,35 @@ class RewardedAdStateRepository(context: Context) {
     }
 
     @Synchronized
+    fun previewClaim(
+        dailyIdentity: String,
+        sessionIdentity: String,
+        dayToken: String,
+        configuredExtensionMillis: Long,
+        ruleRemainingMillis: Long,
+        transactionId: String,
+    ): RewardedAdDecision {
+        val dailyPrefix = "${dailyIdentity.take(100)}.daily."
+        val sessionPrefix = "${sessionIdentity.take(100)}.session."
+        val state = RewardedAdQuotaState(
+            dayToken = prefs.getString(dailyPrefix + KEY_DAY, "").orEmpty(),
+            dailyCount = prefs.getInt(dailyPrefix + KEY_DAILY_COUNT, 0),
+            dailyExtensionMillis = prefs.getLong(dailyPrefix + KEY_DAILY_MILLIS, 0L),
+            sessionCount = prefs.getInt(sessionPrefix + KEY_SESSION_COUNT, 0),
+            sessionExtensionMillis = prefs.getLong(sessionPrefix + KEY_SESSION_MILLIS, 0L),
+        )
+        if (prefs.getString(dailyPrefix + KEY_LAST_TRANSACTION, "") == transactionId) {
+            return RewardedAdDecision(false, 0L, state, 0, 0L)
+        }
+        return RewardedAdPolicy.claim(
+            state,
+            dayToken.take(32),
+            configuredExtensionMillis,
+            ruleRemainingMillis,
+        )
+    }
+
+    @Synchronized
     fun resetSession(identity: String): Boolean {
         val prefix = "${identity.take(100)}.session."
         return prefs.edit().remove(prefix + KEY_SESSION_COUNT).remove(prefix + KEY_SESSION_MILLIS).commit()

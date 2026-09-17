@@ -27,10 +27,10 @@ data class WeeklyReportDay(
     val summaries: List<AppUsageSummary>,
     val totalDurationMillis: Long,
 ) {
-    val launchCount: Int get() = summaries.sumOf { it.launchCount.coerceAtLeast(0) }
-    val limitHitCount: Int get() = summaries.sumOf { it.limitHitCount.coerceAtLeast(0) }
-    val reminderCount: Int get() = summaries.sumOf { it.reminderCount.coerceAtLeast(0) }
-    val parentUnlockCount: Int get() = summaries.sumOf { it.parentUnlockCount.coerceAtLeast(0) }
+    val launchCount: Int get() = summaries.boundedCount { it.launchCount }
+    val limitHitCount: Int get() = summaries.boundedCount { it.limitHitCount }
+    val reminderCount: Int get() = summaries.boundedCount { it.reminderCount }
+    val parentUnlockCount: Int get() = summaries.boundedCount { it.parentUnlockCount }
 }
 
 data class WeeklyReport(
@@ -40,11 +40,11 @@ data class WeeklyReport(
 ) {
     val weekEnd: LocalDate get() = weekStart.plusDays(6L)
     val summaries: List<AppUsageSummary> get() = days.flatMap { it.summaries }
-    val totalDurationMillis: Long get() = days.sumOf { it.totalDurationMillis.coerceAtLeast(0L) }
-    val launchCount: Int get() = days.sumOf { it.launchCount }
-    val limitHitCount: Int get() = days.sumOf { it.limitHitCount }
-    val reminderCount: Int get() = days.sumOf { it.reminderCount }
-    val parentUnlockCount: Int get() = days.sumOf { it.parentUnlockCount }
+    val totalDurationMillis: Long get() = days.boundedTotal { it.totalDurationMillis.coerceIn(0L, 86_400_000L) }
+    val launchCount: Int get() = days.boundedCount { it.launchCount }
+    val limitHitCount: Int get() = days.boundedCount { it.limitHitCount }
+    val reminderCount: Int get() = days.boundedCount { it.reminderCount }
+    val parentUnlockCount: Int get() = days.boundedCount { it.parentUnlockCount }
 }
 
 data class WeeklyReportMetric(val packageName: String, val value: Long)
@@ -64,11 +64,20 @@ object WeeklyReportPolicy {
     ): List<WeeklyReportMetric> = days.flatMap { day -> day.summaries.map { day to it } }
         .groupBy { it.second.packageName }
         .map { (packageName, entries) ->
-            WeeklyReportMetric(packageName, entries.sumOf { selector(it.first, it.second).coerceAtLeast(0L) })
+            WeeklyReportMetric(packageName, entries.boundedTotal { selector(it.first, it.second) })
         }
-        .sortedByDescending { it.value }
+        .filter { it.value > 0L }
+        .sortedWith(compareByDescending<WeeklyReportMetric> { it.value }.thenBy { it.packageName })
         .take(3)
 }
+
+private inline fun <T> Iterable<T>.boundedTotal(value: (T) -> Long): Long = fold(0L) { total, item ->
+    val increment = value(item).coerceAtLeast(0L)
+    if (increment > Long.MAX_VALUE - total) Long.MAX_VALUE else total + increment
+}
+
+private inline fun <T> Iterable<T>.boundedCount(value: (T) -> Int): Int =
+    boundedTotal { value(it).coerceAtLeast(0).toLong() }.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
 /** Short, factual suggestions derived only from the weekly aggregate on screen. */
 object WeeklyReportInsightPolicy {

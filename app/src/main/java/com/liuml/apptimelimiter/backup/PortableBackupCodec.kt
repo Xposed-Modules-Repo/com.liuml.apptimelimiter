@@ -43,7 +43,7 @@ object PortableBackupCodec {
         return PortableBackupPolicy.normalize(backup)
     }
 
-    private fun bodyToJson(backup: PortableBackupV1): JSONObject = JSONObject()
+    internal fun bodyToJson(backup: PortableBackupV1): JSONObject = JSONObject()
         .put("createdAtMillis", backup.createdAtMillis)
         .put("sourceVersionName", backup.sourceVersionName)
         .put("sourceVersionCode", backup.sourceVersionCode)
@@ -125,6 +125,7 @@ object PortableBackupCodec {
         .put("fullScreenExitWarningEnabled", settings.fullScreenExitWarningEnabled)
         .put("exitWarningVibrationEnabled", settings.exitWarningVibrationEnabled)
         .put("usageMilestoneReminderEnabled", settings.usageMilestoneReminderEnabled)
+        .put("openUsageTipEnabled", settings.openUsageTipEnabled)
         .put("languageMode", settings.languageMode.name)
         .put("themeMode", settings.themeMode.name)
         .put("themeColor", settings.themeColor.name)
@@ -145,6 +146,7 @@ object PortableBackupCodec {
         fullScreenExitWarningEnabled = value.optBoolean("fullScreenExitWarningEnabled", false),
         exitWarningVibrationEnabled = value.optBoolean("exitWarningVibrationEnabled", false),
         usageMilestoneReminderEnabled = value.optBoolean("usageMilestoneReminderEnabled", false),
+        openUsageTipEnabled = value.optBoolean("openUsageTipEnabled", true),
         languageMode = enum(value.optString("languageMode"), AppLanguageMode.SYSTEM),
         themeMode = enum(value.optString("themeMode"), AppThemeMode.SYSTEM),
         themeColor = enum(value.optString("themeColor"), AppThemeColor.GREEN),

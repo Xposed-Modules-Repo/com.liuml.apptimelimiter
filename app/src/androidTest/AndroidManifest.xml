@@ -1,0 +1,11 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity android:name="com.liuml.apptimelimiter.xposed.CooldownTestHostActivity"
+            android:exported="true" android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+        <!-- Both workers belong to the test APK UID; instrumentation only coordinates them. -->
+        <service android:name="com.liuml.apptimelimiter.xposed.CooldownTestService"
+            android:exported="true" android:process=":cooldown_test_local" />
+        <service android:name="com.liuml.apptimelimiter.xposed.CooldownRemoteTestService"
+            android:exported="true" android:process=":cooldown_test_remote" />
+    </application>
+</manifest>

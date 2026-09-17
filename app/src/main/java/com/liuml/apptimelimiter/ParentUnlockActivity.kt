@@ -217,6 +217,14 @@ class ParentUnlockActivity : FragmentActivity() {
                             color = MaterialTheme.colorScheme.primary,
                         )
                         Spacer(Modifier.height(18.dp))
+                        Text(
+                            if (com.liuml.apptimelimiter.security.ParentAuthStore.isAdRequired(System.currentTimeMillis())) {
+                                if (english) "After PIN verification, watch an ad to allow access." else "验证 PIN 后需观看广告，成功后开始放行计时。"
+                            } else {
+                                if (english) "Today's first PIN allowance is free." else "今日首次 PIN 放行免费。"
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
                         OutlinedTextField(
                             value = pin,
                             onValueChange = { value ->
@@ -429,13 +437,7 @@ class ParentUnlockActivity : FragmentActivity() {
     }
 
     private fun completeAfterSuccessfulPin(durationMinutes: Int) {
-        if (!deferGrantForAd) {
-            complete(granted = true, event = "PARENT_AUTH_SUCCEEDED", durationMinutes = durationMinutes)
-            return
-        }
-        val adRequired = RuleRepository(this).claimParentUnlockAdRequired(
-            java.time.LocalDate.now().toString(),
-        )
+        val adRequired = com.liuml.apptimelimiter.security.ParentAuthStore.isAdRequired(System.currentTimeMillis())
         if (!adRequired) {
             complete(granted = true, event = "PARENT_AUTH_SUCCEEDED", durationMinutes = durationMinutes)
             return
@@ -449,8 +451,8 @@ class ParentUnlockActivity : FragmentActivity() {
             )
         }.getOrNull()?.getBoolean(RuleContract.KEY_OK, false) == true
         if (!marked) {
-            // A successful parent verification must never be lost because the ad handoff expired.
-            complete(granted = true, event = "PARENT_AUTH_SUCCEEDED_AD_HANDOFF_FAILED", durationMinutes = durationMinutes)
+            // Do not downgrade an ad-gated challenge into a free override when the handoff fails.
+            complete(granted = false, event = "PARENT_AUTH_AD_HANDOFF_FAILED")
             return
         }
         completed = true
@@ -482,7 +484,7 @@ class ParentUnlockActivity : FragmentActivity() {
         if (completed) return
         completed = true
         handler.removeCallbacksAndMessages(null)
-        val persisted = runCatching {
+        val response = runCatching {
             contentResolver.call(
                 RuleContract.CONTENT_URI,
                 RuleContract.METHOD_COMPLETE_PARENT_AUTH_CHALLENGE,
@@ -498,7 +500,13 @@ class ParentUnlockActivity : FragmentActivity() {
                     }
                 },
             )
-        }.getOrNull()?.getBoolean(RuleContract.KEY_OK, false) == true
+        }.getOrNull()
+        if (granted && response?.getString(RuleContract.KEY_MESSAGE) == "parent_ad_required") {
+            completed = false
+            completeAfterSuccessfulPin(durationMinutes)
+            return
+        }
+        val persisted = response?.getBoolean(RuleContract.KEY_OK, false) == true
         val effectiveGrant = granted && persisted
         if (effectiveGrant) {
             UsageStatsRepository(this).recordParentUnlockEvent(

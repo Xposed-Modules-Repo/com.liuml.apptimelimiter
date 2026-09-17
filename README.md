@@ -1,5 +1,7 @@
 # Time Stop
 
+限制页可展开查看主要原因及其他同时生效的限制，区分个人/分组每日额度、单次额度、时段和冷却。本次计划保持到期退出、不触发冷却的语义。预计可用时间同时考虑全部已知解除条件；单次重置时间或统计未知时不承诺具体时间，实际恢复时仍复检规则。
+
 > Precision app-time control for Android power users who want policy, telemetry, and enforcement in the same loop.
 
 ![Android 8.1+](https://img.shields.io/badge/Android-8.1%2B-3DDC84?logo=android&logoColor=white)
@@ -35,7 +37,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | --- | --- |
 | Independent app rules | Each app keeps its own enabled state, daily quota, per-launch quota, schedule windows, warning style, and cooldown behavior. The launcher-app list refreshes after package changes or returning to Time Stop and also supports pull-to-refresh. |
 | App groups and shared allowance | Put multiple apps into one group with shared daily, continuous per-launch, schedule, and cooldown rules. Switching directly between members keeps one per-launch balance; leaving the group for the configured rest starts a new cycle. Group members run only the group policy. |
-| Control Lock and parent override | Optionally protects rule-changing settings with a private 4–8 digit PIN for family or personal use. PIN derivation runs off the UI thread, repeated submissions are suppressed, and an active lockout shows a live countdown instead of freezing or closing the manager. At a hard limit, a parent can temporarily allow only the current app session. |
+| Control Lock and parent override | Optionally protects rule-changing settings with a private 4–8 digit PIN for family or personal use. PIN derivation runs off the UI thread, repeated submissions are suppressed, and an active lockout shows a live countdown instead of freezing or closing the manager. At a hard limit, a parent can temporarily allow the target app until a fixed deadline, including app re-entry. |
 | Non-root basic protection | Uses a content-blind accessibility service for foreground package changes plus Android usage access for daily calibration. An opt-in enhanced compatibility mode adds package-only content-change events for ROMs that miss normal window events; it still retrieves no nodes, text, input, or notifications and uses no foreground service or continuous polling. |
 | Optional force-stop enhancement | Basic protection selects one limit action: restriction page, Root force-stop, or Shizuku force-stop. Root and Shizuku only execute validated force-stops for configured third-party targets; missing permission, a stopped service, binder failure, or a protected package falls back to the restriction page. |
 | Rewarded extension | A user may voluntarily watch a rewarded ad only from Time Stop's restriction page to request a temporary extension. Privacy consent is required; only a confirmed reward grants time, and quotas, schedules, cooldowns, PIN, and group limits still apply. |
@@ -286,7 +288,8 @@ This tool should be used only by the device owner or on explicitly authorized ma
 | 精确前台计时 | 仅统计 Activity 处于前台的时间，应用切到后台后暂停计时。 |
 | 到期提醒与延时 | LSPosed Hook 目标到期前 5 秒可显示与全局颜色主题一致的顶部或全屏倒计时、触发一次长震动，并提供退出应用或临时延长 1-60 分钟；纯非 Root 模式不显示这些 Hook 专属设置，本次计划在结束前 5 秒提供退出或重新计划入口。 |
 | 限制执行方式 | 设置页按引擎分别显示有效选项：LSPosed 可选“强制退出”或“独立休息页”；非 Root 普通保护可选“独立限制页”或需要 Shizuku 的“强制退出”。LSPosed 强制退出会关闭任务并结束当前 Hook 进程，但多进程应用的独立后台服务仍可能存活；需要整包强停时使用普通保护 + Shizuku。独立页跟随全局颜色和明暗主题并提供退出到桌面的按钮；Shizuku 不可用或执行失败时自动回退限制页。 |
-| 家长临时放行 | 管控锁开启后，每次 PIN 验证可选择 1–60 分钟，默认 5 分钟且不记忆上次选择。Modern 版在固定截止时间前可切换其他应用后再返回，不重复限制；到期、息屏、目标进程结束或规则/模式变化仍会撤销。 |
+| PIN 临时放行 | 可选择 1–60 分钟，默认 5 分钟。每天所有应用共享首次免费 PIN 放行，其后需验证 PIN 并主动观看激励广告，获得奖励才放行。目标应用恢复前台后开始固定计时；Modern 版支持息屏、退出重进及目标/时停进程重建，截止前不重复限制或弹时间定制。设备重启、相关规则/模式变更、关闭管控锁或到期失效。广告无填充、失败或未获奖励时保持限制。 |
+| 开屏使用时间提示 | 默认开启，仅在重新进入管控应用时短暂显示今日使用时间和可用余额，PIN 放行期间显示放行剩余时间。可在设置关闭，与每半小时提醒独立，不新增权限。 |
 | 管控锁与安全验证 | 使用私有 4–8 位 PIN 保护规则、分组和设置修改，适用于家长管控和成人自我约束；PIN 派生不在主线程执行，失败次数递增锁定并显示实时倒计时。可选强生物识别找回，但只能重设 PIN，不能显示旧 PIN。 |
 | 语言 | 支持跟随系统、简体中文和 English，管理界面与目标应用内 Hook 提醒使用同一设置。 |
 | 外观 | 提供健康绿、宁静蓝、专注紫三套全局颜色，并分别支持跟随系统、浅色和深色；计划弹窗、全屏提醒和独立限制页还可随机显示内置或自定义时间短句。 |
@@ -299,11 +302,13 @@ This tool should be used only by the device owner or on explicitly authorized ma
 | 个性化设置 | 可选择顶部或全屏退出提醒、长震动，并控制主题、语言、诊断记录和默认延时时长；修改规则后会重置 Hook 本地累计，系统当日时长仍保留。 |
 | 隐藏桌面入口 | 只在可确认 LSPosed 模块设置入口时提供隐藏选项；`MainActivity` 保留标准模块入口并提供 ADB 恢复。纯非 Root 模式不会显示无效的隐藏开关，旧配置已隐藏时只提供恢复入口。 |
 | 功能导览与设置 | 每次打开管理应用时可左右滑动查看主要功能；设置与“关于”页集中提供权限状态、保护模式、诊断和软件声明。 |
-| 更新与反馈 | 默认在打开管理应用时限频检查 GitHub Releases，发现稳定新版后主动提醒；可关闭自动检查，并可调用系统下载管理器更新、通过邮件附带诊断日志反馈问题。 |
+| 更新与反馈 | 默认在打开管理应用时限频检查 GitHub Releases，发现稳定新版后主动提醒；可关闭自动检查。反馈通过系统分享面板发送诊断日志文件；邮件预填收件人、主题和问题说明，由用户确认发送。 |
 
 Hook 计时仅覆盖 `Activity.onResume` 到 `Activity.onPause` 的前台阶段，切到后台会暂停。修改规则时会重置该应用的 Hook 本地累计；如果已授权系统使用统计，Android 记录的当日时长仍会参与每日限制，不能通过修改规则清零。
 
 ## 架构
+
+Root 增强开启时由时停请求授权，最多等待 30 秒；未授权会关闭增强选择并提示，基础管控不受影响。广告失败不消耗延时次数，广告源错误与明确无填充分开提示。
 
 ```mermaid
 flowchart LR
@@ -475,3 +480,16 @@ Obtainium 是第三方更新工具，只负责检查 Release 页面并由用户�
 ## 软件许可与版权
 
 时停是采用 GPL-3.0-only 授权的自由软件。你可以在 GNU General Public License 第 3 版的条款下使用、学习、修改和再分发本项目。完整条款见 [LICENSE](LICENSE)，第三方组件仍分别遵循其原有许可证。
+# 2026-09-17 可靠性修复说明
+
+PIN 每日首次免费资格先预占，恢复目标应用才正式计次；两分钟未恢复不消耗免费机会。广告加载超时后可重新请求，迟到回调不会发放奖励。普通模式半小时提醒在展示前去重；更新检查支持同版本名称下更高版本号的修复包。真实广告能否展示仍取决于广告源填充。
+
+日统计和周报均通过点击圆环分段查看详情，外圈应用图标只作标识。小占比、图标无法解析或因拥挤省略的应用合并为灰色“其他”，点击可查看汇总和成员；不会从总时长中扣除这些应用。
+
+统计事件使用覆盖重试窗口的按日去重记录；旧版本已经淘汰的事件身份无法恢复。半小时提醒采用持久预占，只有明确确认展示才计数；若进程在展示和确认之间退出，可能少计或漏提醒，但不反复弹出同一个节点。
+
+冷却记录区分同一次设备启动和重启恢复，同次启动使用单调时钟，重启后按有界墙上时间恢复并保存新的单调截止时间。Root 强停后核验当前用户的进程表，无法确认退出时按失败回退，不宣称未知进程已终止。
+
+诊断入口支持按限制事件查看时间线，以及切回原始文本日志。时间线在本机记录包名、时间、管控阶段和结果，事件标识经过摘要处理，不包含 PIN、授权令牌或广告密钥；保留最近 7 天、最多 10,000 条。关键状态事件与管控事务同时写入待处理记录，打开诊断或导出文件时按需归档，不新增后台服务。历史文本不会被推测为完整事件链；缺少诊断记录不代表动作一定未发生。反馈文件包含可用的结构化事件，仍由用户主动分享。
+
+备份恢复保留整体替换方式。确认前可以比较规则、分组和设置的新增、修改与删除；如果当前配置在预览后发生变化，必须重新预览。自动回滚快照与配置比较、替换使用同一写入锁，不包含 PIN 或运行时授权。

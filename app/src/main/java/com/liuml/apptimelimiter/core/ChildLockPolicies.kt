@@ -107,6 +107,8 @@ data class TemporaryParentOverride(
     val identity: TemporaryOverrideIdentity,
     val grantedAtElapsedMillis: Long,
     val expiresAtElapsedMillis: Long,
+    val pendingDurationMillis: Long = 0L,
+    val pendingQuotaDay: String = "",
 )
 
 object ParentOverrideDurationPolicy {
@@ -125,7 +127,7 @@ object TemporaryParentOverridePolicy {
         current: TemporaryOverrideIdentity,
         screenInteractive: Boolean,
         nowElapsedMillis: Long,
-    ): Boolean = screenInteractive &&
+    ): Boolean =
         nowElapsedMillis >= granted.grantedAtElapsedMillis &&
         nowElapsedMillis < granted.expiresAtElapsedMillis &&
         granted.identity.packageName.isNotBlank() &&

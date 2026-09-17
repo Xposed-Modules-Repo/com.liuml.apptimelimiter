@@ -31,7 +31,7 @@ import com.liuml.apptimelimiter.core.GroupRulePolicy
 import com.liuml.apptimelimiter.core.HookProcessOwnershipPolicy
 import com.liuml.apptimelimiter.core.LimitBlockReason
 import com.liuml.apptimelimiter.core.LimitEnforcementPolicy
-import com.liuml.apptimelimiter.core.LimitGateSnapshot
+import com.liuml.apptimelimiter.core.RuleDecisionSnapshot
 import com.liuml.apptimelimiter.core.PerLaunchRestPolicy
 import com.liuml.apptimelimiter.core.ParentControlSessionPolicy
 import com.liuml.apptimelimiter.core.QuotaIncidentPolicy
@@ -42,6 +42,7 @@ import com.liuml.apptimelimiter.core.ResumedActivityRegistry
 import com.liuml.apptimelimiter.core.RuleSnapshotSelectionPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownRecord
+import com.liuml.apptimelimiter.core.CooldownClock
 import com.liuml.apptimelimiter.core.SharedGroupSessionAction
 import com.liuml.apptimelimiter.core.UsageMath
 import com.liuml.apptimelimiter.core.UsageReportingPolicy
@@ -58,6 +59,7 @@ import com.liuml.apptimelimiter.core.ScheduleEvaluator
 import com.liuml.apptimelimiter.core.SessionPlanPolicy
 import com.liuml.apptimelimiter.core.SessionPlanInterruptionAction
 import com.liuml.apptimelimiter.core.SessionPlanInterruptionPolicy
+import com.liuml.apptimelimiter.core.SessionPlanPromptPolicy
 import com.liuml.apptimelimiter.core.TimeQuotePolicy
 import com.liuml.apptimelimiter.core.ThemeColorPolicy
 import com.liuml.apptimelimiter.data.RuleRepository
@@ -309,7 +311,6 @@ internal class RuntimeLimiter(
     private var loadedGroupIdentity = ""
     private var lastLoadedRule: HookRule? = null
     private var sessionPlanPromptHandled = false
-    private var sessionPlanPromptLastShownAtElapsedMillis = Long.MIN_VALUE
     private var sessionPlanRemainingMs = NOT_RUNNING
     private var sessionPlanForegroundStartedAt = NOT_RUNNING
     private var sessionPlanWarningShown = false
@@ -325,12 +326,17 @@ internal class RuntimeLimiter(
     private var sessionPlanPromptRunnable: Runnable? = null
     private var blockingState: BlockingState? = null
     private var blockingOverlayFallback = false
-    private val incidentOccurredAtMillis = mutableMapOf<String, Long>()
+    private val incidentOccurredAtMillis = mutableMapOf<String, LocalCooldownStore.Time>()
     private var perLaunchCycleGeneration = 0L
     private var temporaryParentOverrideActive = false
+    private var skipOpenUsageTipOnResume = false
     private var temporaryParentOverrideExpiresAtElapsedMillis = 0L
     private var parentAuthPending = false
     private var parentOverrideAwaitingTargetResume = false
+    private var pendingActivationIdentity = Long.MIN_VALUE
+    private var controlResumeCapability = ""
+    private var pendingActivationUntil = 0L
+    private var pendingActivationRetry: Runnable? = null
     private var parentAuthToken = ""
     private var parentAuthReason = ""
     private var parentUnlockOffered = false
@@ -417,21 +423,6 @@ internal class RuntimeLimiter(
         previousActivity: Activity?,
         resumedDuringHandoff: Boolean,
     ) {
-        if (
-            sessionPlanPromptHandled &&
-            sessionPlanPromptLastShownAtElapsedMillis != Long.MIN_VALUE &&
-            SystemClock.elapsedRealtime() - sessionPlanPromptLastShownAtElapsedMillis >=
-            SESSION_PLAN_PROMPT_SUPPRESSION_MS
-        ) {
-            sessionPlanPromptHandled = false
-            sessionPlanPromptAttempts = 0
-            diagnostic(
-                activity,
-                level = "DEBUG",
-                event = "SESSION_PLAN_PROMPT_WINDOW_EXPIRED",
-                message = "本次计划提示抑制窗口已结束，允许再次制定计划",
-            )
-        }
         val rule = readRule(activity, reloadFallback = true)
         consumePendingRewardedAd(activity, rule)
         refreshTemporaryParentOverride(activity, rule)
@@ -594,11 +585,38 @@ internal class RuntimeLimiter(
                 },
             )
         }
+        if (!processWasForeground && !resumedDuringHandoff && !parentAuthPending && !parentOverrideAwaitingTargetResume && !skipOpenUsageTipOnResume) {
+            maybeShowOpenUsageTip(activity, rule, if (temporaryParentOverrideActive)
+                temporaryParentOverrideExpiresAtElapsedMillis - SystemClock.elapsedRealtime() else remainingMs)
+        }
+        skipOpenUsageTipOnResume = false
         if (parentControlActive) {
             suspendSessionPlanForParentOverride(activity, "parent_control_active_on_resume")
             return
         }
         if (!exitScheduled) resumeSessionPlan(activity, rule)
+    }
+
+    private fun maybeShowOpenUsageTip(activity: Activity, rule: HookRule, remaining: Long?) {
+        if (!rule.enabled || warningBanner != null) return
+        val claimed = runCatching {
+            activity.contentResolver.call(RuleContract.CONTENT_URI, RuleContract.METHOD_CLAIM_OPEN_USAGE_TIP,
+                packageName, null)?.getBoolean(RuleContract.KEY_OK, false) == true
+        }.getOrDefault(false)
+        if (!claimed) return
+        val label = runCatching { activity.packageManager.getApplicationLabel(activity.applicationInfo).toString() }
+            .getOrDefault(packageName)
+        val message = com.liuml.apptimelimiter.core.OpenUsageTipPolicy.message(label,
+            if (rule.systemUsagePending) null else authoritativeDailyTotalMillis(activity, rule, activeSegmentMillisForToday()), remaining,
+            temporaryParentOverrideActive, isEnglish(activity, rule))
+        if (message.isBlank()) return
+        val banner = runCatching { TopWarningBanner.attach(activity = activity,
+            kind = WarningBannerKind.USAGE_MILESTONE,
+            title = hookText(activity, rule, "使用时间", "Usage time"), message = message,
+            remainingMillis = 1L, maxProgressMillis = 1L, fullScreen = false,
+            themeMode = rule.themeMode, themeColor = rule.themeColor, quote = null) }.getOrNull() ?: return
+        warningBanner = banner
+        mainHandler.postDelayed({ if (warningBanner === banner) dismissBanner(WarningBannerKind.USAGE_MILESTONE) }, 3_000L)
     }
 
     private fun registerActivityDuringPendingExit(activity: Activity) {
@@ -654,7 +672,7 @@ internal class RuntimeLimiter(
         }
         val screenInteractive = activity.getSystemService(PowerManager::class.java)
             ?.isInteractive != false
-        if (!BuildConfig.MODERN_XPOSED_ENABLED || !screenInteractive) {
+        if (!BuildConfig.MODERN_XPOSED_ENABLED) {
             revokeTemporaryParentOverride(
                 activity,
                 if (screenInteractive) "process_background" else "screen_off",
@@ -764,7 +782,7 @@ internal class RuntimeLimiter(
             return
         }
         sessionPlanWaitingForUsage = false
-        if (!sessionPlanPromptHandled) {
+        if (SessionPlanPromptPolicy.shouldShowInitialPrompt(sessionPlanPromptHandled)) {
             scheduleInitialSessionPlanPrompt(activity)
         }
     }
@@ -943,7 +961,6 @@ internal class RuntimeLimiter(
             }
             if (mode == SessionPlanDialogMode.INITIAL) {
                 sessionPlanPromptHandled = true
-                sessionPlanPromptLastShownAtElapsedMillis = SystemClock.elapsedRealtime()
                 sessionPlanPromptAttempts = 0
             }
             diagnostic(
@@ -1152,15 +1169,7 @@ internal class RuntimeLimiter(
         activity: Activity,
         delayMillis: Long = SESSION_PLAN_PROMPT_STABLE_MS,
     ) {
-        if (
-            sessionPlanPromptLastShownAtElapsedMillis != Long.MIN_VALUE &&
-            SystemClock.elapsedRealtime() - sessionPlanPromptLastShownAtElapsedMillis <
-            SESSION_PLAN_PROMPT_SUPPRESSION_MS
-        ) {
-            sessionPlanPromptHandled = true
-            return
-        }
-        if (sessionPlanPromptHandled) return
+        if (!SessionPlanPromptPolicy.shouldShowInitialPrompt(sessionPlanPromptHandled)) return
         scheduleSessionPlanPrompt(
             activity = activity,
             mode = SessionPlanDialogMode.INITIAL,
@@ -2241,6 +2250,7 @@ internal class RuntimeLimiter(
     }
 
     private fun activateParentOverrideAfterTargetResume(activity: Activity) {
+        skipOpenUsageTipOnResume = true
         parentOverrideReturnTimeout?.let(mainHandler::removeCallbacks)
         parentOverrideReturnTimeout = null
         parentOverrideAwaitingTargetResume = false
@@ -2318,13 +2328,22 @@ internal class RuntimeLimiter(
             cancelParentOverrideExpiry()
             return
         }
+        val activationAllowed = resumedActivities.contains(activity) &&
+            !activity.isFinishing && !activity.isDestroyed && activity.hasWindowFocus()
+        if (activationAllowed && controlResumeCapability.isBlank()) {
+            controlResumeCapability = runCatching { activity.contentResolver.call(RuleContract.CONTENT_URI,
+                RuleContract.METHOD_REGISTER_CONTROL_RESUME, packageName, Bundle().apply {
+                    putString(RuleContract.KEY_PROCESS_SESSION_ID, processSessionId)
+                })?.getString(RuleContract.KEY_CONTROL_RESUME_CAPABILITY).orEmpty() }.getOrDefault("")
+        }
         val response = runCatching {
             activity.contentResolver.call(
                 RuleContract.CONTENT_URI,
-                RuleContract.METHOD_HAS_PARENT_OVERRIDE,
+                if (activationAllowed) RuleContract.METHOD_ACTIVATE_PARENT_OVERRIDE else RuleContract.METHOD_HAS_PARENT_OVERRIDE,
                 packageName,
                 Bundle().apply {
                     putString(RuleContract.KEY_PROCESS_SESSION_ID, processSessionId)
+                    putString(RuleContract.KEY_CONTROL_RESUME_CAPABILITY, controlResumeCapability)
                 },
             )
         }.getOrNull()
@@ -2332,6 +2351,39 @@ internal class RuntimeLimiter(
             it.getBoolean(RuleContract.KEY_OK, false) &&
                 it.getBoolean(RuleContract.KEY_PARENT_AUTH_GRANTED, false)
         } == true
+        val pending = response?.getBoolean(RuleContract.KEY_PARENT_OVERRIDE_PENDING, false) == true
+        if (pending && !temporaryParentOverrideActive) {
+            val identity = response?.getLong("parent_pending_created_elapsed_ms", 0L) ?: 0L
+            val now = SystemClock.elapsedRealtime()
+            if (pendingActivationIdentity != identity) {
+                pendingActivationIdentity = identity
+                pendingActivationUntil = now + 2_000L
+            }
+            parentOverrideAwaitingTargetResume = now < pendingActivationUntil
+            pendingActivationRetry?.let(mainHandler::removeCallbacks)
+            if (parentOverrideAwaitingTargetResume) {
+                val retry = Runnable {
+                    pendingActivationRetry = null
+                    if (!resumedActivities.contains(activity) || activity.isFinishing || activity.isDestroyed) return@Runnable
+                    val current = readRule(activity, reloadFallback = true)
+                    if (current.version != rule.version || current.groupVersion != rule.groupVersion ||
+                        current.protectionModeGeneration != rule.protectionModeGeneration) {
+                        parentOverrideAwaitingTargetResume = false
+                    }
+                    refreshTemporaryParentOverride(activity, current)
+                    if (!parentOverrideAwaitingTargetResume) {
+                        if (!temporaryParentOverrideActive) parentUnlockOffered = true
+                        processResumedActivity(activity, true, activity, false)
+                    }
+                }
+                pendingActivationRetry = retry
+                mainHandler.postDelayed(retry, 250L)
+            } else parentUnlockOffered = true
+        } else {
+            parentOverrideAwaitingTargetResume = false
+            pendingActivationRetry?.let(mainHandler::removeCallbacks)
+            pendingActivationRetry = null
+        }
         temporaryParentOverrideExpiresAtElapsedMillis = if (temporaryParentOverrideActive) {
             response?.getLong(
                 RuleContract.KEY_PARENT_OVERRIDE_EXPIRES_AT_ELAPSED_MS,
@@ -2378,6 +2430,7 @@ internal class RuntimeLimiter(
         rule: HookRule,
         decision: ScheduleDecision,
         openedDuringBlockedTime: Boolean,
+        evaluatedSnapshot: RuleDecisionSnapshot? = null,
     ) {
         if (!guardXposedUiMode(activity, rule, "schedule_exit")) return
         if (temporaryParentOverrideActive) refreshTemporaryParentOverride(activity, rule)
@@ -2391,12 +2444,7 @@ internal class RuntimeLimiter(
                 "SCHEDULE",
                 incident,
             ) {
-                forceScheduleExit(
-                    activity,
-                    readRule(activity, true),
-                    decision,
-                    openedDuringBlockedTime,
-                )
+                enforceBlockingConditions(activity, readRule(activity, true), openedDuringBlockedTime, false)
             }
             return
         }
@@ -2405,7 +2453,7 @@ internal class RuntimeLimiter(
             rule.limitEnforcementMode.usesBreakPage() &&
             !blockingOverlayFallback
         ) {
-            if (blockForSchedule(activity, rule, decision, openedDuringBlockedTime)) return
+            if (blockForSchedule(activity, rule, decision, openedDuringBlockedTime, evaluatedSnapshot)) return
             blockingOverlayFallback = true
         }
         exitScheduled = true
@@ -2454,7 +2502,7 @@ internal class RuntimeLimiter(
                 WarningBannerKind.TIME_LIMIT,
                 "QUOTA",
                 incident,
-            ) { forceExit(activity, readRule(activity, true), thresholdStatus(activity, readRule(activity, true))) }
+            ) { enforceBlockingConditions(activity, readRule(activity, true), false, false) }
             return
         }
         if (exitScheduled) return
@@ -2534,6 +2582,7 @@ internal class RuntimeLimiter(
         rule: HookRule,
         remainingMillis: Long,
         statsPersisted: Boolean,
+        evaluatedSnapshot: RuleDecisionSnapshot? = null,
     ) {
         if (!guardXposedUiMode(activity, rule, "cooldown_exit")) return
         if (temporaryParentOverrideActive) refreshTemporaryParentOverride(activity, rule)
@@ -2546,16 +2595,20 @@ internal class RuntimeLimiter(
                 "COOLDOWN",
                 "cooldown:${rule.groupCooldownEndsAtMillis}:$remainingMillis",
             ) {
-                forceCooldownExit(activity, readRule(activity, true), remainingMillis, statsPersisted)
+                enforceBlockingConditions(activity, readRule(activity, true), false, statsPersisted)
             }
             return
         }
         if (exitScheduled) return
+        // A failed local read/commit cannot be delegated to a page that might see no cooldown.
+        if (runCatching { localCooldownRecord(activity, rule) }.isFailure) {
+            blockingOverlayFallback = true
+        }
         if (
             rule.limitEnforcementMode.usesBreakPage() &&
             !blockingOverlayFallback
         ) {
-            if (blockForCooldown(activity, rule, remainingMillis)) return
+            if (blockForCooldown(activity, rule, remainingMillis, evaluatedSnapshot)) return
             blockingOverlayFallback = true
         }
         exitScheduled = true
@@ -2590,6 +2643,7 @@ internal class RuntimeLimiter(
         rule: HookRule,
         decision: ScheduleDecision,
         openedDuringBlockedTime: Boolean,
+        evaluatedSnapshot: RuleDecisionSnapshot? = null,
     ): Boolean {
         val nextAllowed = formatNextTransition(activity, rule, decision)
         val token = "schedule:" + ScheduleBlockPolicy.token(
@@ -2607,6 +2661,7 @@ internal class RuntimeLimiter(
                     token,
                     ruleVersion = rule.version,
                     groupVersion = rule.groupVersion,
+                    reachedKinds = (evaluatedSnapshot ?: thresholdStatus(activity, rule).snapshot).reachedKinds,
                 ),
                 rule,
             )
@@ -2691,12 +2746,14 @@ internal class RuntimeLimiter(
         activity: Activity,
         rule: HookRule,
         remainingMillis: Long,
+        evaluatedSnapshot: RuleDecisionSnapshot? = null,
     ): Boolean {
         val token = "cooldown:${rule.cooldownToken()}"
         val newlyBlocked = blockingState?.token != token
         val reachedKinds = buildSet {
             addAll(blockingState?.reachedKinds.orEmpty())
             addAll(cooldownReachedKinds(activity, rule))
+            addAll((evaluatedSnapshot ?: thresholdStatus(activity, rule).snapshot).reachedKinds)
         }
         val cooldownEndsAtMillis = safeAdd(System.currentTimeMillis(), remainingMillis)
         if (
@@ -2874,26 +2931,25 @@ internal class RuntimeLimiter(
         val thresholdStatus = rule.hasTimedQuota().takeIf { it }?.let {
             thresholdStatus(activity, rule)
         }
-        return when (
-            LimitEnforcementPolicy.evaluate(
-                LimitGateSnapshot(
-                    scheduleBlocked = scheduleDecision?.allowed == false,
-                    cooldownRemainingMillis = cooldownRemaining,
-                    quotaReached = thresholdStatus?.reached == true,
-                ),
-            ).blockingReason
-        ) {
+        val snapshot = (thresholdStatus?.snapshot ?: RuleDecisionSnapshot()).copy(
+            scheduleBlocked = scheduleDecision?.allowed == false,
+            cooldownRemainingMillis = cooldownRemaining,
+            planRemainingMillis = sessionPlanRemainingMillis().takeIf { it != NOT_RUNNING },
+        )
+        // The plan executor retains its exit-only semantics; persistent gates use the same snapshot.
+        return when (snapshot.gate.blockingReason) {
             LimitBlockReason.SCHEDULE -> {
                 forceScheduleExit(
                     activity,
                     rule,
                     checkNotNull(scheduleDecision),
                     openedDuringBlockedTime,
+                    snapshot,
                 )
                 true
             }
             LimitBlockReason.COOLDOWN -> {
-                forceCooldownExit(activity, rule, cooldownRemaining, launchStatsPersisted)
+                forceCooldownExit(activity, rule, cooldownRemaining, launchStatsPersisted, snapshot)
                 true
             }
             LimitBlockReason.QUOTA -> {
@@ -3041,6 +3097,25 @@ internal class RuntimeLimiter(
     }
 
     private fun finishTarget(activity: Activity, message: String, statsPersisted: Boolean) {
+        val runtimeRule = lastLoadedRule
+        val runtime = runtimeRule?.let { current -> runCatching {
+            activity.contentResolver.call(RuleContract.CONTENT_URI, RuleContract.METHOD_ENTER_CONTROL_RESTRICTION,
+                packageName, Bundle().apply {
+                    putString(RuleContract.KEY_PROCESS_SESSION_ID, processSessionId)
+                    putString(RuleContract.KEY_CONTROL_RESUME_CAPABILITY, controlResumeCapability)
+                    putString(RuleContract.KEY_INCIDENT_ID, "exit:$processSessionId")
+                    putLong(RuleContract.KEY_VERSION, current.version)
+                    putLong(RuleContract.KEY_GROUP_VERSION, current.groupVersion)
+                    putLong(RuleContract.KEY_PROTECTION_MODE_GENERATION, current.protectionModeGeneration)
+                })
+        }.getOrNull() }
+        if (runtime?.getString(RuleContract.KEY_MESSAGE) == "parent_allowance_exists") {
+            exitScheduled = false
+            return
+        }
+        if (runtime?.getBoolean(RuleContract.KEY_OK, false) != true) {
+            diagnostic(activity, "WARN", "CONTROL_RUNTIME_FAIL_CLOSED", "restriction uses local safe exit")
+        }
         runCatching {
             // The task can disappear before the system Toast does. Keep this message short and
             // state-based; future-tense countdown copy belongs only in the pre-exit banner.
@@ -3049,6 +3124,10 @@ internal class RuntimeLimiter(
             diagnostic(activity, level = "WARN", event = "EXIT_NOTICE_FAILED", message = it.toString())
         }
         closeActivityUi(activity)
+        runCatching {
+            activity.contentResolver.call(RuleContract.CONTENT_URI, RuleContract.METHOD_FINISH_CONTROL_RESTRICTION,
+                packageName, Bundle().apply { putString(RuleContract.KEY_PROCESS_SESSION_ID, processSessionId) })
+        }.onFailure { diagnostic(activity, "WARN", "CONTROL_RUNTIME_RELEASE_FAILED", it.javaClass.simpleName) }
         if (!isSafeToTerminateProcess(activity)) {
             diagnostic(
                 activity,
@@ -3260,19 +3339,54 @@ internal class RuntimeLimiter(
         )
 
     private fun cooldownRemainingMillis(context: Context, rule: HookRule): Long {
-        val nowMillis = System.currentTimeMillis()
-        val nowElapsedMillis = SystemClock.elapsedRealtime()
-        val localRemaining = SharedCooldownPolicy.remainingMillisDual(
-            localCooldownRecord(context, rule),
-            nowMillis,
-            nowElapsedMillis,
-        )
+        val localRemaining = runCatching {
+            val record = localCooldownRecord(context, rule)
+            SharedCooldownPolicy.remainingMillisDual(
+                record, System.currentTimeMillis(), SystemClock.elapsedRealtime(), CooldownClock.bootCount(context),
+            )
+        }.getOrElse {
+            // Hook callback exceptions may be swallowed by the framework: return a blocking gate.
+            blockingOverlayFallback = true
+            rule.configuredCooldownMillis().coerceAtLeast(1L)
+        }
         val sharedRemaining = if (rule.groupEnabled && rule.groupCooldownEnabled) {
-            (rule.groupCooldownEndsAtMillis - nowMillis).coerceAtLeast(0L)
+            runCatching {
+                groupCooldownRemainingMillis(context, rule)
+            }.getOrElse {
+                blockingOverlayFallback = true
+                rule.groupCooldownMillis.coerceAtLeast(1L)
+            }
         } else {
             0L
         }
         return maxOf(localRemaining, sharedRemaining)
+    }
+
+    /** Target-private recovery only; cross-UID group authority remains the Provider. */
+    private fun groupCooldownRemainingMillis(
+        context: Context,
+        rule: HookRule,
+    ): Long {
+        if (rule.groupCooldownEndsAtMillis <= 0L) return 0L
+        val identity = listOf(
+            rule.groupId, rule.groupVersion.toString(), rule.groupCooldownIncidentId,
+            rule.groupCooldownEndsAtMillis.toString(), rule.groupCooldownMillis.toString(),
+        ).joinToString("") { "${it.length}:$it" }
+        val duration = rule.groupCooldownMillis.coerceAtLeast(0L)
+        val recovered = LocalCooldownStore(context).readGroup(
+            identity,
+            SharedCooldownRecord(
+                startedAtMillis = (rule.groupCooldownEndsAtMillis - duration).coerceAtLeast(0L),
+                endsAtMillis = rule.groupCooldownEndsAtMillis,
+                incidentId = rule.groupCooldownIncidentId,
+                sourcePackage = rule.groupCooldownSourcePackage,
+                endsAtElapsedMillis = rule.groupCooldownEndsAtElapsedMillis,
+                bootCount = rule.groupCooldownBootCount,
+            ),
+        )
+        return SharedCooldownPolicy.remainingMillisDual(
+            recovered, System.currentTimeMillis(), SystemClock.elapsedRealtime(), CooldownClock.bootCount(context),
+        )
     }
 
     private fun claimQuotaIncident(
@@ -3302,28 +3416,36 @@ internal class RuntimeLimiter(
             cooldownEndsAtMillis = 0L,
         )
         val occurredAt = incidentOccurredAtMillis.getOrPut(incidentId) {
-            System.currentTimeMillis()
+            LocalCooldownStore.Time(System.currentTimeMillis(), SystemClock.elapsedRealtime(), CooldownClock.bootCount(context))
         }
         if (status.groupOnlyReached && rule.groupEnabled && rule.groupId.isNotBlank()) {
             val providerClaim = claimGroupQuotaIncident(
                 context = context,
                 rule = rule,
                 incidentId = incidentId,
-                occurredAtMillis = occurredAt,
+                occurredAtMillis = occurredAt.wall,
             )
             if (providerClaim != null) return providerClaim
         }
-        return claimLocalQuotaIncident(
-            context = context,
-            rule = rule,
-            incidentId = incidentId,
-            occurredAtMillis = occurredAt,
-            durationMillis = if (status.groupOnlyReached) {
-                rule.groupCooldownMillis.takeIf { rule.groupCooldownEnabled } ?: 0L
-            } else {
-                rule.cooldownMillis.takeIf { rule.cooldownEnabled } ?: 0L
-            },
-        )
+        return try {
+            claimLocalQuotaIncident(
+                context = context,
+                rule = rule,
+                incidentId = incidentId,
+                occurredAtMillis = occurredAt,
+                durationMillis = if (status.groupOnlyReached) {
+                    rule.groupCooldownMillis.takeIf { rule.groupCooldownEnabled } ?: 0L
+                } else {
+                    rule.cooldownMillis.takeIf { rule.cooldownEnabled } ?: 0L
+                },
+            )
+        } catch (_: Exception) {
+            blockingOverlayFallback = true
+            diagnostic(context, level = "ERROR", event = "COOLDOWN_CLAIM_FAILED",
+                message = "本地冷却认领失败；保持退出，不确认认领成功")
+            QuotaIncidentClaim(incidentId = incidentId, isNewIncident = false,
+                cooldownStarted = false, cooldownStartedAtMillis = 0L, cooldownEndsAtMillis = 0L)
+        }
     }
 
     private fun claimGroupQuotaIncident(
@@ -3379,58 +3501,16 @@ internal class RuntimeLimiter(
         context: Context,
         rule: HookRule,
         incidentId: String,
-        occurredAtMillis: Long,
+        occurredAtMillis: LocalCooldownStore.Time,
         durationMillis: Long,
     ): QuotaIncidentClaim {
-        val prefs = context.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE)
-        val handled = prefs.getString(KEY_HANDLED_QUOTA_INCIDENTS, null)
-            .orEmpty()
-            .lineSequence()
-            .filter(String::isNotBlank)
-            .toList()
-        val nowMillis = System.currentTimeMillis()
-        val nowElapsedMillis = SystemClock.elapsedRealtime()
-        val claim = SharedCooldownPolicy.claim(
-            existingRecord = localCooldownRecord(context, rule),
-            handledIncidentIds = handled,
-            incidentId = incidentId,
-            sourcePackage = packageName,
-            occurredAtMillis = occurredAtMillis,
-            durationMillis = durationMillis,
-            nowMillis = nowMillis,
-            nowElapsedMillis = nowElapsedMillis,
+        val claim = LocalCooldownStore(context).claimWithClock(
+            identity = rule.localCooldownIdentity(),
+            duration = durationMillis,
+            incident = incidentId,
+            source = packageName,
+            occurred = occurredAtMillis,
         )
-        val editor = prefs.edit()
-            .putString(
-                KEY_HANDLED_QUOTA_INCIDENTS,
-                claim.handledIncidentIds.joinToString("\n"),
-            )
-        if (claim.record.endsAtMillis > nowMillis) {
-            editor
-                .putLong(KEY_COOLDOWN_STARTED_AT, claim.record.startedAtMillis)
-                .putLong(KEY_COOLDOWN_ENDS_AT, claim.record.endsAtMillis)
-                .putLong(KEY_COOLDOWN_STARTED_ELAPSED_AT, nowElapsedMillis)
-                .putLong(KEY_COOLDOWN_ENDS_ELAPSED_AT, nowElapsedMillis + durationMillis)
-                .putString(KEY_COOLDOWN_INCIDENT_ID, claim.record.incidentId)
-                .putString(KEY_COOLDOWN_RULE_IDENTITY, rule.localCooldownIdentity())
-        } else {
-            editor
-                .remove(KEY_COOLDOWN_STARTED_AT)
-                .remove(KEY_COOLDOWN_ENDS_AT)
-                .remove(KEY_COOLDOWN_STARTED_ELAPSED_AT)
-                .remove(KEY_COOLDOWN_ENDS_ELAPSED_AT)
-                .remove(KEY_COOLDOWN_INCIDENT_ID)
-                .remove(KEY_COOLDOWN_RULE_IDENTITY)
-        }
-        val persisted = editor.remove(KEY_COOLDOWN_RULE_VERSION).commit()
-        if (!persisted) {
-            diagnostic(
-                context,
-                level = "ERROR",
-                event = "COOLDOWN_PERSIST_FAILED",
-                message = "本地额度事件同步保存失败；incident=$incidentId",
-            )
-        }
         if (claim.cooldownStarted) {
             diagnostic(
                 context,
@@ -3439,7 +3519,7 @@ internal class RuntimeLimiter(
                 } else {
                     "COOLDOWN_STARTED"
                 },
-                message = "incident=$incidentId, duration=${durationMillis / 1000}s",
+                message = "incident=$incidentId, duration=${durationMillis / 1000}s, targetPrivateOnly=${rule.groupEnabled}",
             )
         }
         return QuotaIncidentClaim(
@@ -3451,35 +3531,8 @@ internal class RuntimeLimiter(
         )
     }
 
-    private fun localCooldownRecord(context: Context, rule: HookRule): SharedCooldownRecord {
-        val prefs = context.getSharedPreferences(STATE_PREFS, Context.MODE_PRIVATE)
-        if (
-            prefs.getString(KEY_COOLDOWN_RULE_IDENTITY, null) !=
-            rule.localCooldownIdentity()
-        ) return SharedCooldownRecord()
-        val startedAt = prefs.getLong(KEY_COOLDOWN_STARTED_AT, 0L)
-        val storedEnd = prefs.getLong(KEY_COOLDOWN_ENDS_AT, 0L)
-        val startedElapsed = prefs.getLong(KEY_COOLDOWN_STARTED_ELAPSED_AT, 0L)
-        val endsElapsed = prefs.getLong(KEY_COOLDOWN_ENDS_ELAPSED_AT, 0L)
-        val migratedEnd = if (storedEnd > 0L) {
-            storedEnd
-        } else {
-            val duration = if (rule.groupEnabled) {
-                rule.groupCooldownMillis.takeIf { rule.groupCooldownEnabled } ?: 0L
-            } else {
-                rule.cooldownMillis.takeIf { rule.cooldownEnabled } ?: 0L
-            }
-            if (startedAt > 0L) startedAt + duration else 0L
-        }
-        return SharedCooldownRecord(
-            startedAtMillis = startedAt,
-            endsAtMillis = migratedEnd,
-            incidentId = prefs.getString(KEY_COOLDOWN_INCIDENT_ID, null).orEmpty(),
-            sourcePackage = packageName,
-            startedAtElapsedMillis = startedElapsed,
-            endsAtElapsedMillis = endsElapsed,
-        )
-    }
+    private fun localCooldownRecord(context: Context, rule: HookRule): SharedCooldownRecord =
+        LocalCooldownStore(context).read(rule.localCooldownIdentity(), rule.configuredCooldownMillis())
 
     private fun HookRule.localCooldownIdentity(): String =
         if (groupEnabled) {
@@ -3504,7 +3557,10 @@ internal class RuntimeLimiter(
     private fun cooldownReachedKinds(context: Context, rule: HookRule): Set<QuotaKind> =
         buildSet {
             quotaKindFromIncident(rule.groupCooldownIncidentId)?.let(::add)
-            quotaKindFromIncident(localCooldownRecord(context, rule).incidentId)?.let(::add)
+            // Do not let a storage exception escape the lifecycle Hook before safe exit.
+            runCatching { localCooldownRecord(context, rule) }.onFailure {
+                blockingOverlayFallback = true
+            }.getOrNull()?.incidentId?.let(::quotaKindFromIncident)?.let(::add)
         }
 
     private fun quotaKindFromIncident(incidentId: String): QuotaKind? {
@@ -3773,20 +3829,21 @@ internal class RuntimeLimiter(
             it.isNotEmpty() && it.length <= MAX_STATS_INCIDENT_ID_LENGTH &&
                 it.none { char -> char == '\n' || char == '\r' }
         }
-        if (limitHitIncrement > 0 && normalizedIncidentId != null) {
+        if ((limitHitIncrement > 0 || reminderIncrement > 0) && normalizedIncidentId != null) {
             pendingLimitHitsByIncident.putIfAbsent(
                 normalizedIncidentId,
                 PendingLimitHitEvent(
                     dayToken = eventDayToken,
-                    increment = limitHitIncrement.coerceIn(1, MAX_STATS_COUNTER_INCREMENT),
+                    increment = limitHitIncrement.coerceIn(0, MAX_STATS_COUNTER_INCREMENT),
+                    reminders = reminderIncrement.coerceIn(0, 1),
                 ),
             )
         } else {
             // Retain legacy aggregate events that predate incident IDs. New quota paths always
             // use the durable event queue above, so a Provider retry remains idempotent.
             pending.limitHits = safeAdd(pending.limitHits, limitHitIncrement.coerceAtLeast(0))
+            pending.reminders = safeAdd(pending.reminders, reminderIncrement.coerceAtLeast(0))
         }
-        pending.reminders = safeAdd(pending.reminders, reminderIncrement.coerceAtLeast(0))
         persistStatsOutbox(context)
         val persisted = flushUsageEvents(context)
         if (limitHitIncrement > 0 || reminderIncrement > 0) {
@@ -3879,7 +3936,8 @@ internal class RuntimeLimiter(
                 pendingLimitHitsByIncident[incidentId] = PendingLimitHitEvent(
                     dayToken = day,
                     increment = prefs.getInt("$OUTBOX_LIMIT_INCREMENT.$incidentId", 1)
-                        .coerceIn(1, MAX_STATS_COUNTER_INCREMENT),
+                        .coerceIn(0, MAX_STATS_COUNTER_INCREMENT),
+                    reminders = prefs.getInt("$OUTBOX_EVENT_REMINDERS.$incidentId", 0).coerceIn(0, 1),
                 )
             }
 
@@ -3914,6 +3972,7 @@ internal class RuntimeLimiter(
             editor
                 .putString("$OUTBOX_LIMIT_DAY.$incidentId", event.dayToken)
                 .putInt("$OUTBOX_LIMIT_INCREMENT.$incidentId", event.increment)
+                .putInt("$OUTBOX_EVENT_REMINDERS.$incidentId", event.reminders)
         }
         editor.commit()
     }
@@ -3929,7 +3988,9 @@ internal class RuntimeLimiter(
                     Bundle().apply {
                         putString(RuleContract.KEY_DAY_TOKEN, event.dayToken)
                         putInt(RuleContract.KEY_LIMIT_HIT_INCREMENT, event.increment)
-                        putString(RuleContract.KEY_USAGE_EVENT_ID, "limit:$incidentId")
+                        putInt(RuleContract.KEY_REMINDER_INCREMENT, event.reminders)
+                        putString(RuleContract.KEY_USAGE_EVENT_ID,
+                            com.liuml.apptimelimiter.statistics.StatisticsEventIdentity.transport("limit:$incidentId"))
                         putInt(RuleContract.KEY_HOOK_VERSION_CODE, BuildConfig.VERSION_CODE)
                         putLong(
                             RuleContract.KEY_HOOK_MODE_GENERATION,
@@ -4999,7 +5060,7 @@ internal class RuntimeLimiter(
         }
         val activeMs = activeSegmentMillis()
         val thresholds = buildList {
-            if (rule.dailyEnabled) {
+            if (!rule.groupEnabled && rule.dailyEnabled) {
                 add(
                     ThresholdRemaining(
                         label = hookText(context, rule, "每日累计", "Daily cumulative"),
@@ -5017,7 +5078,7 @@ internal class RuntimeLimiter(
                     ),
                 )
             }
-            if (rule.perLaunchEnabled) {
+            if (!rule.groupEnabled && rule.perLaunchEnabled) {
                 add(
                     ThresholdRemaining(
                         label = hookText(context, rule, "单次打开", "Per launch"),
@@ -5084,11 +5145,17 @@ internal class RuntimeLimiter(
                 hasThreshold = false,
             )
         }
-        val earliestRemaining = UsageMath.earliestRemainingMillis(
-            thresholds.map { it.remainingMillis },
-        ) ?: Long.MAX_VALUE / 2L
+        val remainingByKind = thresholds.associate { it.kind to it.remainingMillis }
+        val snapshot = RuleDecisionSnapshot(
+            appDailyRemainingMillis = remainingByKind[QuotaKind.APP_DAILY],
+            appPerLaunchRemainingMillis = remainingByKind[QuotaKind.APP_PER_LAUNCH],
+            groupDailyRemainingMillis = remainingByKind[QuotaKind.GROUP_DAILY],
+            groupPerLaunchRemainingMillis = remainingByKind[QuotaKind.GROUP_PER_LAUNCH],
+            grouped = rule.groupEnabled,
+        )
+        val earliestRemaining = snapshot.quotaRemainingMillis ?: Long.MAX_VALUE / 2L
         val earliest = thresholds.first { it.remainingMillis == earliestRemaining }
-        val reached = thresholds.filter { it.remainingMillis == 0L }
+        val reached = thresholds.filter { it.kind in snapshot.reachedKinds }
         val reachedLabels = reached.joinToString("、") { it.label }
         return ThresholdStatus(
             remainingMillis = earliest.remainingMillis,
@@ -5096,8 +5163,9 @@ internal class RuntimeLimiter(
             reachedLabels = reachedLabels,
             nextThresholdLabel = earliest.label,
             groupOnlyReached = reached.isNotEmpty() && reached.all(ThresholdRemaining::isGroup),
-            reachedKinds = reached.mapTo(linkedSetOf(), ThresholdRemaining::kind),
+            reachedKinds = snapshot.reachedKinds,
             hasThreshold = true,
+            snapshot = snapshot,
         )
     }
 
@@ -5576,6 +5644,8 @@ internal class RuntimeLimiter(
                 groupCooldownIncidentId = result.getString(
                     RuleContract.KEY_GROUP_COOLDOWN_INCIDENT_ID,
                 ).orEmpty(),
+                groupCooldownEndsAtElapsedMillis = result.getLong("group_cooldown_ends_elapsed_ms", 0L),
+                groupCooldownBootCount = result.getInt("group_cooldown_boot_count", -1),
                 groupCooldownSourcePackage = result.getString(
                     RuleContract.KEY_GROUP_COOLDOWN_SOURCE_PACKAGE,
                 ).orEmpty(),
@@ -5736,6 +5806,8 @@ internal class RuntimeLimiter(
                 groupMeasuredAtElapsedMillis = cachedRule.groupMeasuredAtElapsedMillis,
                 groupCooldownStartedAtMillis = cooldownRule.groupCooldownStartedAtMillis,
                 groupCooldownEndsAtMillis = cooldownRule.groupCooldownEndsAtMillis,
+                groupCooldownEndsAtElapsedMillis = cooldownRule.groupCooldownEndsAtElapsedMillis,
+                groupCooldownBootCount = cooldownRule.groupCooldownBootCount,
                 groupCooldownIncidentId = cooldownRule.groupCooldownIncidentId,
                 groupCooldownSourcePackage = cooldownRule.groupCooldownSourcePackage,
             )
@@ -5919,6 +5991,8 @@ internal class RuntimeLimiter(
                 "${groupPrefix}runtime_cooldown_incident",
                 "",
             ).orEmpty(),
+            groupCooldownEndsAtElapsedMillis = preferences.getLong("${groupPrefix}runtime_cooldown_ends_elapsed_at", 0L),
+            groupCooldownBootCount = preferences.getInt("${groupPrefix}runtime_cooldown_boot_count", -1),
             groupCooldownSourcePackage = preferences.getString(
                 "${groupPrefix}runtime_cooldown_source_package",
                 "",
@@ -6046,6 +6120,8 @@ internal class RuntimeLimiter(
             rule.groupCooldownMillis,
             rule.groupCooldownStartedAtMillis,
             rule.groupCooldownEndsAtMillis,
+            rule.groupCooldownEndsAtElapsedMillis,
+            rule.groupCooldownBootCount,
             rule.groupCooldownIncidentId,
             rule.groupCooldownSourcePackage,
             rule.perLaunchEnabled,
@@ -6111,6 +6187,8 @@ internal class RuntimeLimiter(
                 rule.groupCooldownStartedAtMillis,
             )
             .putLong(CACHE_GROUP_COOLDOWN_ENDS_AT_MS, rule.groupCooldownEndsAtMillis)
+            .putLong("cache_group_cooldown_ends_elapsed_ms", rule.groupCooldownEndsAtElapsedMillis)
+            .putInt("cache_group_cooldown_boot_count", rule.groupCooldownBootCount)
             .putString(CACHE_GROUP_COOLDOWN_INCIDENT_ID, rule.groupCooldownIncidentId)
             .putString(
                 CACHE_GROUP_COOLDOWN_SOURCE_PACKAGE,
@@ -6259,6 +6337,8 @@ internal class RuntimeLimiter(
                 CACHE_GROUP_COOLDOWN_INCIDENT_ID,
                 "",
             ).orEmpty(),
+            groupCooldownEndsAtElapsedMillis = prefs.getLong("cache_group_cooldown_ends_elapsed_ms", 0L),
+            groupCooldownBootCount = prefs.getInt("cache_group_cooldown_boot_count", -1),
             groupCooldownSourcePackage = prefs.getString(
                 CACHE_GROUP_COOLDOWN_SOURCE_PACKAGE,
                 "",
@@ -6478,6 +6558,8 @@ internal class RuntimeLimiter(
         val groupCooldownMillis: Long,
         val groupCooldownStartedAtMillis: Long,
         val groupCooldownEndsAtMillis: Long,
+        val groupCooldownEndsAtElapsedMillis: Long = 0L,
+        val groupCooldownBootCount: Int = -1,
         val groupCooldownIncidentId: String,
         val groupCooldownSourcePackage: String,
         val perLaunchEnabled: Boolean,
@@ -6527,6 +6609,7 @@ internal class RuntimeLimiter(
         val groupOnlyReached: Boolean,
         val reachedKinds: Set<QuotaKind>,
         val hasThreshold: Boolean,
+        val snapshot: RuleDecisionSnapshot = RuleDecisionSnapshot(),
     )
 
     private data class PendingUsageBatch(
@@ -6539,6 +6622,7 @@ internal class RuntimeLimiter(
     private data class PendingLimitHitEvent(
         val dayToken: String,
         val increment: Int,
+        val reminders: Int = 0,
     )
 
     /** Result kept local to the Hook process; provider data remains authoritative. */
@@ -6584,21 +6668,12 @@ internal class RuntimeLimiter(
         const val GROUP_SESSION_HANDOFF_REFRESH_MS = 600L
         const val SESSION_PLAN_PROMPT_STABLE_MS = 1_000L
         const val SESSION_PLAN_PROMPT_RETRY_MS = 1_000L
-        const val SESSION_PLAN_PROMPT_SUPPRESSION_MS = 10 * 60 * 1000L
         const val STATE_PREFS = "__app_time_limiter_state__"
         const val RULE_CACHE_PREFS = "__app_time_limiter_rule_cache__"
         const val STATS_OUTBOX_PREFS = "__app_time_limiter_stats_outbox__"
         const val KEY_DAY = "day"
         const val KEY_VERSION = "rule_version"
         const val KEY_USED_MS = "used_ms"
-        const val KEY_COOLDOWN_STARTED_AT = "cooldown_started_at"
-        const val KEY_COOLDOWN_ENDS_AT = "cooldown_ends_at"
-        const val KEY_COOLDOWN_STARTED_ELAPSED_AT = "cooldown_started_elapsed_at"
-        const val KEY_COOLDOWN_ENDS_ELAPSED_AT = "cooldown_ends_elapsed_at"
-        const val KEY_COOLDOWN_INCIDENT_ID = "cooldown_incident_id"
-        const val KEY_HANDLED_QUOTA_INCIDENTS = "handled_quota_incidents"
-        const val KEY_COOLDOWN_RULE_VERSION = "cooldown_rule_version"
-        const val KEY_COOLDOWN_RULE_IDENTITY = "cooldown_rule_identity"
         const val KEY_SCHEDULE_BLOCK_TOKEN = "schedule_block_token"
         const val CACHE_PRESENT = "present"
         const val CACHE_SIGNATURE = "signature"
@@ -6665,6 +6740,7 @@ internal class RuntimeLimiter(
         const val OUTBOX_LIMIT_INCIDENTS = "limit_incidents"
         const val OUTBOX_LIMIT_DAY = "limit_day"
         const val OUTBOX_LIMIT_INCREMENT = "limit_increment"
+        const val OUTBOX_EVENT_REMINDERS = "event_reminders"
         const val MAX_STATS_INCIDENT_ID_LENGTH = 160
         const val MAX_STATS_COUNTER_INCREMENT = 10
         const val LOGGABLE_SEGMENT_MS = 1_000L

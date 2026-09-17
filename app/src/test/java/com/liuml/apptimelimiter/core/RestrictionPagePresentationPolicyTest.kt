@@ -19,6 +19,44 @@ class RestrictionPagePresentationPolicyTest {
     }
 
     @Test
+    fun `rewarded ad button is disabled for a known quota failure`() {
+        assertFalse(
+            RestrictionPagePresentationPolicy.canRequestRewardedAd(
+                isVisibleForRestriction = true,
+                extensionEnabled = true,
+                requestInFlight = false,
+                eligibilityFailure = "extension_session_limit_reached",
+            ),
+        )
+    }
+
+    @Test
+    fun `rewarded ad button stays available after a retryable load failure`() {
+        assertTrue(
+            RestrictionPagePresentationPolicy.canRequestRewardedAd(
+                isVisibleForRestriction = true,
+                extensionEnabled = true,
+                requestInFlight = false,
+                eligibilityFailure = null,
+            ),
+        )
+    }
+
+    @Test
+    fun `only quota and stale eligibility failures persist on the restriction page`() {
+        assertTrue(
+            RestrictionPagePresentationPolicy.isPersistentRewardedAdEligibilityFailure(
+                "extension_daily_limit_reached",
+            ),
+        )
+        assertFalse(
+            RestrictionPagePresentationPolicy.isPersistentRewardedAdEligibilityFailure(
+                "ad_eligibility_provider_failed",
+            ),
+        )
+    }
+
+    @Test
     fun `same incident reuses the page while a different active incident is rejected`() {
         assertTrue(RestrictionPagePresentationPolicy.mayClaimPage("incident-a", 2_000L, "incident-a", 1_000L))
         assertFalse(RestrictionPagePresentationPolicy.mayClaimPage("incident-a", 2_000L, "incident-b", 1_000L))

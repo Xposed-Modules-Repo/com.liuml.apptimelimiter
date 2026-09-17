@@ -122,6 +122,8 @@ class WebDavRepository(context: Context) {
             connectTimeout = TimeUnit.SECONDS.toMillis(10).toInt()
             readTimeout = TimeUnit.SECONDS.toMillis(20).toInt()
             useCaches = false
+            // Credentials belong only to the explicitly configured endpoint.
+            instanceFollowRedirects = false
             setRequestProperty("User-Agent", "TimeStop/${BuildConfig.VERSION_NAME}")
             val credentials = "${config.username}:${config.password}"
                 .toByteArray(StandardCharsets.UTF_8)

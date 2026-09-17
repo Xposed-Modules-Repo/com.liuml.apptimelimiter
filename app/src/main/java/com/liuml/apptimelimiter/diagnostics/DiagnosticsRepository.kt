@@ -20,7 +20,11 @@ class DiagnosticsRepository(context: Context) {
     private val appContext = context.applicationContext
     private val logFile = File(appContext.filesDir, FILE_NAME)
 
-    fun append(level: String, packageName: String, event: String, message: String) {
+    fun append(level: String, packageName: String, event: String, message: String, incidentId: String? = null) {
+        if (!incidentId.isNullOrBlank()) {
+            // Use explicit correlation only; never infer identities or reasons from free-form logs.
+            recordIncident(packageName, incidentId, event, level)
+        }
         synchronized(FILE_LOCK) {
             runCatching {
                 rotateIfNeeded()
@@ -39,6 +43,27 @@ class DiagnosticsRepository(context: Context) {
                 Log.w(LOG_TAG, "Unable to append diagnostics", it)
             }
         }
+    }
+
+    fun recordIncident(packageName: String, incidentId: String, stage: String, result: String, reason: String = "") {
+        val at = System.currentTimeMillis()
+        val eventKey = java.util.UUID.randomUUID().toString()
+        val generation = TIMELINE_GENERATION.get()
+        runCatching {
+            TIMELINE_WRITER.execute {
+                synchronized(TIMELINE_LOCK) {
+                    if (generation == TIMELINE_GENERATION.get() &&
+                        runCatching { RuleRepository(appContext).getGlobalSettings().diagnosticsEnabled }.getOrDefault(false)) {
+                        DiagnosticTimelineRepository(appContext).record(packageName, incidentId, stage, result, reason, eventKey, at)
+                    }
+                }
+            }
+        }
+    }
+
+    fun timeline(): DiagnosticTimelineRepository {
+        DiagnosticTimelineDrain.drain(appContext)
+        return DiagnosticTimelineRepository(appContext)
     }
 
     fun appendRateLimited(
@@ -68,17 +93,29 @@ class DiagnosticsRepository(context: Context) {
         synchronized(FILE_LOCK) {
             if (logFile.exists()) logFile.writeText("")
         }
+        synchronized(TIMELINE_LOCK) {
+            TIMELINE_GENERATION.incrementAndGet()
+            DiagnosticTimelineDrain.clear(appContext)
+        }
     }
 
-    fun exportForFeedback(): File = synchronized(FILE_LOCK) {
-        val exportDir = File(logFile.parentFile?.parentFile, "cache/feedback").apply { mkdirs() }
-        File(exportDir, "app-time-limiter-diagnostics.txt").also { target ->
-            val contents = if (logFile.exists() && logFile.length() > 0L) {
+    fun exportForFeedback(): File {
+        // Never hold the text-file lock while querying control state/outbox: PIN writes may log.
+        val header = exportHeader()
+        val events = runCatching { timeline().exportText() }.getOrDefault("")
+        // Keep the export under Context.cacheDir so the FileProvider cache-path grants it.
+        val exportDir = File(appContext.cacheDir, "feedback").apply { mkdirs() }
+        val contents = synchronized(FILE_LOCK) {
+            if (logFile.exists() && logFile.length() > 0L) {
                 logFile.readText()
             } else {
                 "暂无诊断日志。请确认已在设置中开启诊断日志，并复现问题。\n"
             }
-            target.writeText(exportHeader() + contents)
+        }
+        return synchronized(EXPORT_LOCK) {
+            File(exportDir, "app-time-limiter-diagnostics.txt").also { target ->
+                target.writeText(header + contents + events)
+            }
         }
     }
 
@@ -197,6 +234,15 @@ class DiagnosticsRepository(context: Context) {
         const val MAX_MESSAGE_LENGTH = 2_048
         const val DEFAULT_DEDUPE_WINDOW_MILLIS = 5_000L
         val FILE_LOCK = Any()
+        val EXPORT_LOCK = Any()
         val EVENT_LIMITER = DiagnosticEventLimiter()
+        val TIMELINE_LOCK = Any()
+        val TIMELINE_GENERATION = java.util.concurrent.atomic.AtomicLong()
+        val TIMELINE_WRITER = java.util.concurrent.ThreadPoolExecutor(
+            0, 1, 30L, java.util.concurrent.TimeUnit.SECONDS,
+            java.util.concurrent.ArrayBlockingQueue(128),
+            java.util.concurrent.ThreadFactory { task -> Thread(task, "TimeStopTimeline").apply { isDaemon = true } },
+            java.util.concurrent.ThreadPoolExecutor.AbortPolicy(),
+        )
     }
 }

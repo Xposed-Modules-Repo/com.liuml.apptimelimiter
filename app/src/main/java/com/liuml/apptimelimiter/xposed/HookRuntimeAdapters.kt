@@ -10,6 +10,8 @@ internal interface RulePreferences {
 
     fun getLong(key: String, defaultValue: Long): Long
 
+    fun getInt(key: String, defaultValue: Int): Int
+
     fun getString(key: String, defaultValue: String?): String?
 
     fun getStringSet(key: String, defaultValue: Set<String>): Set<String>?
@@ -33,6 +35,9 @@ internal class LegacyRulePreferences(
     override fun getLong(key: String, defaultValue: Long): Long =
         preferences.getLong(key, defaultValue)
 
+    override fun getInt(key: String, defaultValue: Int): Int =
+        preferences.getInt(key, defaultValue)
+
     override fun getString(key: String, defaultValue: String?): String? =
         preferences.getString(key, defaultValue)
 
@@ -51,6 +56,9 @@ internal class ModernRulePreferences(
     override fun getLong(key: String, defaultValue: Long): Long =
         preferences.getLong(key, defaultValue)
 
+    override fun getInt(key: String, defaultValue: Int): Int =
+        preferences.getInt(key, defaultValue)
+
     override fun getString(key: String, defaultValue: String?): String? =
         preferences.getString(key, defaultValue)
 
@@ -64,6 +72,8 @@ internal object EmptyRulePreferences : RulePreferences {
     override fun getBoolean(key: String, defaultValue: Boolean): Boolean = defaultValue
 
     override fun getLong(key: String, defaultValue: Long): Long = defaultValue
+
+    override fun getInt(key: String, defaultValue: Int): Int = defaultValue
 
     override fun getString(key: String, defaultValue: String?): String? = defaultValue
 

@@ -18,7 +18,7 @@ object FeedbackSender {
         val subject: String,
         val body: String,
         val attachment: java.io.File,
-        val diagnosticsText: String,
+        val attachmentBytes: Long,
     )
 
     enum class ShareLaunchResult {
@@ -55,7 +55,7 @@ object FeedbackSender {
             subject = subject,
             body = body,
             attachment = attachment,
-            diagnosticsText = attachment.readText(),
+            attachmentBytes = attachment.length(),
         )
     }
 
@@ -76,9 +76,8 @@ object FeedbackSender {
                 clipData = ClipData.newUri(context.contentResolver, "Diagnostic logs", uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            if (context.packageManager.queryIntentActivities(shareIntent, 0).isEmpty()) {
-                return ShareLaunchResult.NO_SHARE_TARGET
-            }
+            // Package visibility can hide valid handlers from queries. Let the system chooser
+            // resolve the intent instead of incorrectly rejecting sharing before it is launched.
             val chooser = Intent.createChooser(shareIntent, "选择分享方式").apply {
                 // ColorOS destroys an alias-launched host task together with a chooser in the
                 // same task. Keep the platform resolver in its own task so it remains visible.
@@ -88,7 +87,11 @@ object FeedbackSender {
             ShareLaunchResult.OPENED
         }.getOrElse { error ->
             diagnosticsRepositorySafeAppend(context, error)
-            ShareLaunchResult.FAILED
+            if (error is android.content.ActivityNotFoundException) {
+                ShareLaunchResult.NO_SHARE_TARGET
+            } else {
+                ShareLaunchResult.FAILED
+            }
         }
     }
 

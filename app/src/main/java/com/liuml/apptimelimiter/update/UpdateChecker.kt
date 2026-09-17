@@ -130,7 +130,7 @@ object UpdateChecker {
                 apkName = apkAsset.getString("name"),
                 apkDownloadUrl = apkAsset.getString("browser_download_url"),
             )
-            if (isVersionNewer(info.version, BuildConfig.VERSION_NAME)) {
+            if (isVersionNewer(info.version, BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE)) {
                 UpdateCheckResult.Available(info)
             } else {
                 UpdateCheckResult.UpToDate(info.version)
@@ -234,7 +234,9 @@ internal fun isTrustedReleaseAssetUrl(value: String): Boolean {
         uri.path.orEmpty().startsWith(OFFICIAL_RELEASE_DOWNLOAD_PREFIX)
 }
 
-internal fun isVersionNewer(candidate: String, current: String): Boolean {
+internal fun isVersionNewer(candidate: String, current: String, currentCode: Int? = null): Boolean {
+    val candidateCode = candidate.substringBefore('-', "").toIntOrNull()
+    if (currentCode != null && candidateCode != null) return candidateCode > currentCode
     val candidateParts = versionParts(candidate)
     val currentParts = versionParts(current)
     val size = maxOf(candidateParts.size, currentParts.size)

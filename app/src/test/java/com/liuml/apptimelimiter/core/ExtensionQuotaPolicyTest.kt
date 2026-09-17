@@ -65,6 +65,24 @@ class ExtensionQuotaPolicyTest {
     }
 
     @Test
+    fun rewardedExtensionIsNotEligibleAfterTheUsageRoundLimitIsReached() {
+        val day = "2026-09-13"
+        var state = ExtensionQuotaState()
+        repeat(3) {
+            val claim = ExtensionQuotaPolicy.claimFree(state, day, "same", 10, 3, 3)
+            assertTrue(claim.allowed)
+            state = claim.nextState
+        }
+
+        val rewarded = ExtensionQuotaPolicy.claimRewarded(state, day, "same", 10, 3, 3)
+
+        assertFalse(rewarded.allowed)
+        assertFalse(rewarded.requiresAd)
+        assertEquals(7, rewarded.remainingCount)
+        assertEquals(0, rewarded.remainingSessionCount)
+    }
+
+    @Test
     fun newDayClearsBothDailyAndFreeCounters() {
         val old = ExtensionQuotaState("old", 10, 3, "session", 3)
         val claim = ExtensionQuotaPolicy.claimFree(old, "new", "new-session", 10, 3, 3)

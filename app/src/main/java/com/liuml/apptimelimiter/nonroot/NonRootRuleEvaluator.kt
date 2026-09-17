@@ -3,6 +3,7 @@ package com.liuml.apptimelimiter.nonroot
 import com.liuml.apptimelimiter.core.LimitBlockReason
 import com.liuml.apptimelimiter.core.QuotaBoundaryPolicy
 import com.liuml.apptimelimiter.core.QuotaKind
+import com.liuml.apptimelimiter.core.RuleDecisionSnapshot
 
 enum class NonRootBlockReason {
     SCHEDULE,
@@ -28,6 +29,7 @@ data class NonRootRuleSnapshot(
     val groupSessionUsedMillis: Long = sessionUsedMillis,
     val planActive: Boolean,
     val planRemainingMillis: Long,
+    val grouped: Boolean = false,
 )
 
 data class NonRootRuleDecision(
@@ -36,6 +38,7 @@ data class NonRootRuleDecision(
     val nextThresholdMillis: Long?,
     val sessionPlanAllowed: Boolean,
     val sessionPlanIsNextThreshold: Boolean,
+    val restrictionSnapshot: RuleDecisionSnapshot = RuleDecisionSnapshot(),
 ) {
     val persistentReason: LimitBlockReason?
         get() = when (blockingReason) {
@@ -48,79 +51,35 @@ data class NonRootRuleDecision(
 
 object NonRootRuleEvaluator {
     fun evaluate(snapshot: NonRootRuleSnapshot): NonRootRuleDecision {
-        val reachedKinds = buildSet {
-            if (
-                snapshot.appDailyEnabled &&
-                reached(snapshot.appDailyLimitMillis, snapshot.appDailyUsedMillis)
-            ) add(QuotaKind.APP_DAILY)
-            if (
-                snapshot.appPerSessionEnabled &&
-                reached(snapshot.appPerSessionLimitMillis, snapshot.sessionUsedMillis)
-            ) add(QuotaKind.APP_PER_LAUNCH)
-            if (
-                snapshot.groupDailyEnabled &&
-                reached(snapshot.groupDailyLimitMillis, snapshot.groupDailyUsedMillis)
-            ) add(QuotaKind.GROUP_DAILY)
-            if (
-                snapshot.groupPerSessionEnabled &&
-                reached(snapshot.groupPerSessionLimitMillis, snapshot.groupSessionUsedMillis)
-            ) add(QuotaKind.GROUP_PER_LAUNCH)
+        val unified = RuleDecisionSnapshot(
+            scheduleBlocked = snapshot.scheduleBlocked,
+            cooldownRemainingMillis = snapshot.cooldownRemainingMillis,
+            appDailyRemainingMillis = remaining(snapshot.appDailyLimitMillis, snapshot.appDailyUsedMillis)
+                .takeIf { snapshot.appDailyEnabled },
+            appPerLaunchRemainingMillis = remaining(snapshot.appPerSessionLimitMillis, snapshot.sessionUsedMillis)
+                .takeIf { snapshot.appPerSessionEnabled },
+            groupDailyRemainingMillis = remaining(snapshot.groupDailyLimitMillis, snapshot.groupDailyUsedMillis)
+                .takeIf { snapshot.groupDailyEnabled },
+            groupPerLaunchRemainingMillis = remaining(snapshot.groupPerSessionLimitMillis, snapshot.groupSessionUsedMillis)
+                .takeIf { snapshot.groupPerSessionEnabled },
+            planRemainingMillis = snapshot.planRemainingMillis.takeIf { snapshot.planActive },
+            grouped = snapshot.grouped,
+        )
+        val blockingReason = when (unified.gate.blockingReason) {
+            LimitBlockReason.SCHEDULE -> NonRootBlockReason.SCHEDULE
+            LimitBlockReason.COOLDOWN -> NonRootBlockReason.COOLDOWN
+            LimitBlockReason.QUOTA -> NonRootBlockReason.QUOTA
+            null -> if (unified.primaryReason != null) NonRootBlockReason.SESSION_PLAN else null
         }
-        val blockingReason = when {
-            snapshot.scheduleBlocked -> NonRootBlockReason.SCHEDULE
-            snapshot.cooldownRemainingMillis > 0L -> NonRootBlockReason.COOLDOWN
-            reachedKinds.isNotEmpty() -> NonRootBlockReason.QUOTA
-            snapshot.planActive && snapshot.planRemainingMillis <= 0L ->
-                NonRootBlockReason.SESSION_PLAN
-            else -> null
-        }
-        val permanentRemaining = if (blockingReason == null) {
-            buildList {
-                if (snapshot.appDailyEnabled) {
-                    add(remaining(snapshot.appDailyLimitMillis, snapshot.appDailyUsedMillis))
-                }
-                if (snapshot.appPerSessionEnabled) {
-                    add(remaining(snapshot.appPerSessionLimitMillis, snapshot.sessionUsedMillis))
-                }
-                if (snapshot.groupDailyEnabled) {
-                    add(remaining(snapshot.groupDailyLimitMillis, snapshot.groupDailyUsedMillis))
-                }
-                if (snapshot.groupPerSessionEnabled) {
-                    add(
-                        remaining(
-                            snapshot.groupPerSessionLimitMillis,
-                            snapshot.groupSessionUsedMillis,
-                        ),
-                    )
-                }
-            }.filter { it > 0L }.minOrNull()
-        } else {
-            null
-        }
-        val sessionPlanIsNextThreshold = blockingReason == null &&
-            snapshot.planActive &&
-            snapshot.planRemainingMillis > 0L &&
-            (
-                permanentRemaining == null ||
-                    snapshot.planRemainingMillis < permanentRemaining
-                )
-        val remaining = listOfNotNull(
-            permanentRemaining,
-            snapshot.planRemainingMillis.takeIf {
-                blockingReason == null && snapshot.planActive && it > 0L
-            },
-        ).minOrNull()
         return NonRootRuleDecision(
             blockingReason = blockingReason,
-            reachedKinds = reachedKinds,
-            nextThresholdMillis = remaining,
+            reachedKinds = unified.reachedKinds,
+            nextThresholdMillis = unified.nextThresholdMillis,
             sessionPlanAllowed = blockingReason == null,
-            sessionPlanIsNextThreshold = sessionPlanIsNextThreshold,
+            sessionPlanIsNextThreshold = unified.planIsNextThreshold,
+            restrictionSnapshot = unified,
         )
     }
-
-    private fun reached(limitMillis: Long, usedMillis: Long): Boolean =
-        remaining(limitMillis, usedMillis) == 0L
 
     private fun remaining(limitMillis: Long, usedMillis: Long): Long =
         QuotaBoundaryPolicy.normalizeRemainingMillis(limitMillis - usedMillis)

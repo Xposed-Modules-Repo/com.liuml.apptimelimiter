@@ -8,6 +8,7 @@ public class XSharedPreferences {
     public void reload() {}
     public boolean getBoolean(String key, boolean defaultValue) { return defaultValue; }
     public long getLong(String key, long defaultValue) { return defaultValue; }
+    public int getInt(String key, int defaultValue) { return defaultValue; }
     public String getString(String key, String defaultValue) { return defaultValue; }
     public Set<String> getStringSet(String key, Set<String> defaultValue) { return defaultValue; }
 }

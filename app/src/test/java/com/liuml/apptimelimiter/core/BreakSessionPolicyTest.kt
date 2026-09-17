@@ -13,18 +13,21 @@ class BreakSessionPolicyTest {
             token = "token-a",
             targetPackage = "app.a",
             nowMillis = 1_000L,
+            nowElapsedMillis = 10_000L,
         )
         val first = BreakSessionPolicy.consume(
             issued,
             "token-a",
             "app.a",
             2_000L,
+            11_000L,
         )
         val second = BreakSessionPolicy.consume(
             first.records,
             "token-a",
             "app.a",
             2_001L,
+            11_001L,
         )
 
         assertTrue(first.accepted)
@@ -39,6 +42,7 @@ class BreakSessionPolicyTest {
             token = "token-a",
             targetPackage = "app.a",
             nowMillis = 1_000L,
+            nowElapsedMillis = 10_000L,
         )
 
         assertFalse(
@@ -47,6 +51,7 @@ class BreakSessionPolicyTest {
                 "token-a",
                 "app.b",
                 2_000L,
+                11_000L,
             ).accepted,
         )
         assertFalse(
@@ -55,6 +60,7 @@ class BreakSessionPolicyTest {
                 "token-a",
                 "app.a",
                 31_000L,
+                40_000L,
             ).accepted,
         )
     }
@@ -68,6 +74,7 @@ class BreakSessionPolicyTest {
                 token = "token-$index",
                 targetPackage = "app.$index",
                 nowMillis = index.toLong(),
+                nowElapsedMillis = index.toLong(),
             )
         }
         val decoded = BreakSessionPolicy.decode(BreakSessionPolicy.encode(records))
@@ -89,5 +96,26 @@ class BreakSessionPolicyTest {
         assertFalse(BreakSessionPolicy.shouldFailClosedAfterRuleReadFailure(1))
         assertFalse(BreakSessionPolicy.shouldFailClosedAfterRuleReadFailure(2))
         assertTrue(BreakSessionPolicy.shouldFailClosedAfterRuleReadFailure(3))
+    }
+
+    @Test
+    fun `clock rollback cannot extend a break token`() {
+        val issued = BreakSessionPolicy.issue(
+            existing = emptyList(),
+            token = "token-a",
+            targetPackage = "app.a",
+            nowMillis = 100_000L,
+            nowElapsedMillis = 10_000L,
+        )
+
+        assertFalse(
+            BreakSessionPolicy.consume(
+                issued,
+                "token-a",
+                "app.a",
+                nowMillis = 1L,
+                nowElapsedMillis = 40_001L,
+            ).accepted,
+        )
     }
 }

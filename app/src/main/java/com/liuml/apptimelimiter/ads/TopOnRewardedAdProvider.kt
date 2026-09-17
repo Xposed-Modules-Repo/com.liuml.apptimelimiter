@@ -22,6 +22,9 @@ class TopOnRewardedAdProvider(
     private val privacyConsentGranted: Boolean = false,
 ) : RewardedAdProvider {
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val appContext = context.applicationContext
+    private var listenerGeneration = 0L
+    private var destroyed = false
     private val showing = AtomicBoolean(false)
     private val isConfigured = appId.isNotBlank() && appKey.isNotBlank() && placementId.isNotBlank()
     private var ad: TURewardVideoAd? = null
@@ -44,14 +47,14 @@ class TopOnRewardedAdProvider(
                 enabled = !testMode,
             ).orEmpty()
             if (initializationFailureReason.isBlank()) {
-                ad = TURewardVideoAd(context.applicationContext, placementId).also { video ->
-                    video.setAdListener(newListener())
-                }
+                createAd()
             }
         }
     }
 
     override fun preload() {
+        if (destroyed) return
+        if (ad == null && privacyConsentGranted && isConfigured && initializationFailureReason.isBlank()) createAd()
         if (testMode || isReady() || !loadInFlight.compareAndSet(false, true)) return
         if (!RewardedAdLoadPolicy.isRetryAllowed(
                 lastLoadFailureAtElapsedMillis,
@@ -131,6 +134,9 @@ class TopOnRewardedAdProvider(
     }
 
     override fun destroy() {
+        destroyed = true
+        listenerGeneration++
+        loadInFlight.set(false)
         mainHandler.removeCallbacksAndMessages(null)
         showing.set(false)
         rewardCallback = null
@@ -141,37 +147,55 @@ class TopOnRewardedAdProvider(
 
     override fun isPrivacyConsentRequired(): Boolean = !privacyConsentGranted
 
-    private fun newListener() = object : TURewardVideoListener {
-        override fun onRewardedVideoAdLoaded() {
+    private fun createAd() {
+        val generation = ++listenerGeneration
+        ad = TURewardVideoAd(appContext, placementId).also { it.setAdListener(newListener(generation)) }
+    }
+
+    private fun dispatch(generation: Long, action: () -> Unit) {
+        mainHandler.post { if (!destroyed && generation == listenerGeneration) action() }
+    }
+
+    private fun clearCallbacks() {
+        rewardCallback = null
+        closeCallback = null
+        failCallback = null
+    }
+
+    private fun newListener(generation: Long) = object : TURewardVideoListener {
+        override fun onRewardedVideoAdLoaded() = dispatch(generation) {
             loadInFlight.set(false)
             loadFailureReason = ""
             lastLoadFailureAtElapsedMillis = Long.MIN_VALUE
         }
-        override fun onRewardedVideoAdFailed(error: AdError) {
+        override fun onRewardedVideoAdFailed(error: AdError) = dispatch(generation) {
             loadInFlight.set(false)
             lastLoadFailureAtElapsedMillis = SystemClock.elapsedRealtime()
             loadFailureReason = "load_failed:${safeErrorSignature(error)}"
             if (showing.get()) finishFailure(loadFailureReason)
+            else {
+                listenerGeneration++
+                ad = null
+            }
         }
         override fun onRewardedVideoAdPlayStart(adInfo: TUAdInfo) = Unit
         override fun onRewardedVideoAdPlayEnd(adInfo: TUAdInfo) = Unit
-        override fun onRewardedVideoAdPlayFailed(error: AdError, adInfo: TUAdInfo) {
+        override fun onRewardedVideoAdPlayFailed(error: AdError, adInfo: TUAdInfo) = dispatch(generation) {
             finishFailure("play_failed:${safeErrorSignature(error)}")
         }
-        override fun onReward(adInfo: TUAdInfo) {
+        override fun onReward(adInfo: TUAdInfo) = dispatch(generation) {
             if (showing.get() && !rewardSent) {
                 rewardSent = true
-                mainHandler.post { rewardCallback?.invoke() }
+                rewardCallback?.invoke()
             }
         }
-        override fun onRewardedVideoAdClosed(adInfo: TUAdInfo) {
+        override fun onRewardedVideoAdClosed(adInfo: TUAdInfo) = dispatch(generation) {
             if (showing.getAndSet(false)) {
-                mainHandler.post {
-                    closeCallback?.invoke()
-                    rewardCallback = null
-                    closeCallback = null
-                    failCallback = null
-                }
+                val callback = closeCallback
+                clearCallbacks()
+                listenerGeneration++
+                ad = null
+                callback?.invoke()
             }
             preload()
         }
@@ -180,32 +204,22 @@ class TopOnRewardedAdProvider(
 
     private fun finishFailure(reason: String) {
         if (showing.getAndSet(false)) {
-            mainHandler.post {
-                failCallback?.invoke(reason)
-                rewardCallback = null
-                closeCallback = null
-                failCallback = null
-            }
+            val callback = failCallback
+            clearCallbacks()
+            listenerGeneration++
+            ad = null
+            loadInFlight.set(false)
+            callback?.invoke(reason)
         }
     }
 
     private fun safeErrorSignature(error: AdError): String {
-        val code = safeErrorField(error, setOf("getCode", "getErrorCode"))
-        val platformCode = safeErrorField(error, setOf("getPlatformCode", "getPlatformErrorCode"))
-        return buildString {
-            append(code.ifBlank { "unknown" })
-            if (platformCode.isNotBlank()) append(":platform_").append(platformCode)
-        }
+        return com.liuml.apptimelimiter.core.AdFailureDiagnosticPolicy.signature(
+            runCatching { error.code }.getOrNull(),
+            runCatching { error.platformCode }.getOrNull(),
+            runCatching { error.fullErrorInfo }.getOrNull(),
+        )
     }
-
-    private fun safeErrorField(error: AdError, names: Set<String>): String = runCatching {
-        error.javaClass.methods
-            .firstOrNull { it.name in names && it.parameterCount == 0 }
-            ?.invoke(error)
-            ?.toString()
-    }.getOrNull().orEmpty()
-        .filter { it.isLetterOrDigit() || it == '_' || it == '-' }
-        .take(32)
 
     private companion object {
         const val TEST_REWARD_DELAY_MS = 1_000L

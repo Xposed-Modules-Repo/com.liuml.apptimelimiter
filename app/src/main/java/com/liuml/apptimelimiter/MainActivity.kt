@@ -34,6 +34,18 @@ import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.runtime.rememberUpdatedState
+import com.liuml.apptimelimiter.statistics.RingUsage
+import com.liuml.apptimelimiter.statistics.StatisticsRingPolicy
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -200,7 +212,6 @@ import com.liuml.apptimelimiter.statistics.CalculatedUsageSnapshot
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
 import com.liuml.apptimelimiter.statistics.UsageSummaryMergePolicy
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
-import com.liuml.apptimelimiter.statistics.StatisticsChartPolicy
 import com.liuml.apptimelimiter.statistics.StatisticsDisplayPolicy
 import com.liuml.apptimelimiter.nonroot.RootExecutor
 import com.liuml.apptimelimiter.statistics.StatisticsDateRangePolicy
@@ -559,6 +570,7 @@ private fun TimeLimiterScreen(
     }
     val portableBackupRepository = remember(context) { PortableBackupRepository(context) }
     var backupPreview by remember { mutableStateOf<PortableBackupPreview?>(null) }
+    var backupPreviewStale by remember { mutableStateOf(false) }
     var backupStatus by remember { mutableStateOf<String?>(null) }
     var showMissingBackupRules by remember { mutableStateOf(false) }
     var pendingMissingBackupRuleDelete by remember { mutableStateOf<String?>(null) }
@@ -597,12 +609,16 @@ private fun TimeLimiterScreen(
             val result = withContext(Dispatchers.IO) {
                 portableBackupRepository.preview(uri)
             }
-            result.onSuccess { backupPreview = it }
+            result.onSuccess { backupPreview = it; backupPreviewStale = false }
                 .onFailure { error ->
+                    val reason = error.message.orEmpty()
+                    val readableReason = com.liuml.apptimelimiter.backup.BackupPreviewText(
+                        AppLocaleController.resolvedLanguage(context, repository.getGlobalSettings().languageMode) == SupportedLanguage.ENGLISH,
+                    ).error(reason)
                     backupStatus = localizedText(
                         context,
-                        "无法读取备份：${error.message.orEmpty()}",
-                        "Could not read backup: ${error.message.orEmpty()}",
+                        "无法读取备份：$readableReason",
+                        "Could not read backup: $readableReason",
                     )
                     Toast.makeText(context, backupStatus.orEmpty(), Toast.LENGTH_LONG).show()
                 }
@@ -713,8 +729,8 @@ private fun TimeLimiterScreen(
     var childPinSaveInProgress by remember { mutableStateOf(false) }
     var pendingChildLockAction by remember { mutableStateOf<String?>(null) }
     var pendingProtectedAction by remember { mutableStateOf<(() -> Unit)?>(null) }
-    val prepareFeedback: () -> Unit = {
-        FeedbackSender.prepare(context, diagnosticsRepository)
+    val prepareFeedback: suspend () -> Unit = {
+        withContext(Dispatchers.IO) { FeedbackSender.prepare(context, diagnosticsRepository) }
             .onSuccess { draft ->
                 feedbackDraft = draft
                 showFeedbackOptions = false
@@ -722,6 +738,7 @@ private fun TimeLimiterScreen(
                 showFeedbackPreview = true
             }
             .onFailure { error ->
+                showFeedbackOptions = false
                 diagnosticsRepository.append(
                     level = "WARN",
                     packageName = context.packageName,
@@ -990,6 +1007,8 @@ private fun TimeLimiterScreen(
     var statisticsError by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(
         statisticsDate,
+        statisticsApps,
+        statisticsPackages,
         usageRevision,
         statsEnabled,
         usageAccessGranted,
@@ -1031,6 +1050,7 @@ private fun TimeLimiterScreen(
                 statisticsTotalMillis = loadedTotal
                 statisticsError = null
             }.onFailure { error ->
+                if (error is kotlinx.coroutines.CancellationException) throw error
                 statisticsError = error.javaClass.simpleName
             }
             statisticsLoading = false
@@ -1428,6 +1448,7 @@ private fun TimeLimiterScreen(
             usageStatsRepository = usageStatsRepository,
             deviceUsageStatsRepository = deviceUsageStatsRepository,
             usageAccessGranted = usageAccessGranted,
+            usageRevision = usageRevision,
             onBack = { showWeeklyReport = false },
         )
         return@TimeLimiterScreen
@@ -2175,13 +2196,22 @@ private fun TimeLimiterScreen(
     }
 
     backupPreview?.let { preview ->
+        val previewConfiguration = LocalConfiguration.current
+        val previewWording = remember(context, currentSettings.languageMode, previewConfiguration) {
+            com.liuml.apptimelimiter.backup.BackupPreviewText(
+                AppLocaleController.resolvedLanguage(context, currentSettings.languageMode) == SupportedLanguage.ENGLISH,
+            )
+        }
         AlertDialog(
             onDismissRequest = { backupPreview = null },
             title = {
                 Text(localizedText(context, "导入配置预览", "Import configuration preview"))
             },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(
+                    modifier = Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     Text(
                         localizedText(
                             context,
@@ -2206,15 +2236,27 @@ private fun TimeLimiterScreen(
                     Text(
                         localizedText(
                             context,
-                            "将替换本机 ${preview.existingRuleCount} 项有效规则和 ${preview.existingGroupCount} 个分组。管控锁和当前保护方式不会改变。",
-                            "This replaces ${preview.existingRuleCount} active rules and ${preview.existingGroupCount} groups. Control Lock and the current protection mode will not change.",
+                            "将替换本机 ${preview.existingRuleCount} 项已保存规则和 ${preview.existingGroupCount} 个分组。管控锁和当前保护方式不会改变。",
+                            "This replaces ${preview.existingRuleCount} saved rules and ${preview.existingGroupCount} groups. Control Lock and the current protection mode will not change.",
                         ),
                         color = MaterialTheme.colorScheme.error,
                     )
+                    com.liuml.apptimelimiter.backup.PortableBackupDiffView(preview, currentSettings.languageMode)
+                    if (backupPreviewStale) {
+                        Text(previewWording.error("stale_preview"), color = MaterialTheme.colorScheme.error)
+                    }
+                    TextButton(onClick = {
+                        screenScope.launch {
+                            val refreshed = withContext(Dispatchers.IO) { portableBackupRepository.preview(preview.backup) }
+                            refreshed.onSuccess { backupPreview = it; backupPreviewStale = false }
+                                .onFailure { Toast.makeText(context, previewWording.text("刷新失败：", "Refresh failed: ") + previewWording.error(it.message.orEmpty()), Toast.LENGTH_LONG).show() }
+                        }
+                    }) { Text(previewWording.text("刷新预览", "Refresh preview")) }
                 }
             },
             confirmButton = {
                 Button(
+                    enabled = !backupPreviewStale,
                     onClick = {
                         backupPreview = null
                         screenScope.launch {
@@ -2232,6 +2274,13 @@ private fun TimeLimiterScreen(
                                     "导入失败：${result.reason}",
                                     "Import failed: ${result.reason}",
                                 )
+                            }
+                            if (result is PortableBackupOperationResult.Failure &&
+                                com.liuml.apptimelimiter.backup.PortableBackupDiffPolicy.isStalePreview(result.reason)
+                            ) {
+                                backupPreview = preview
+                                backupPreviewStale = true
+                                backupStatus = previewWording.error(result.reason)
                             }
                             if (result is PortableBackupOperationResult.Success) {
                                 groups = repository.getGroups()
@@ -2368,15 +2417,8 @@ private fun TimeLimiterScreen(
         )
     }
 
-    if (showFeedbackOptions) {
-        FeedbackOptionsDialog(
-            onDismiss = { showFeedbackOptions = false },
-            onShare = prepareFeedback,
-            onQqGroup = {
-                showFeedbackOptions = false
-                openQqGroup(context)
-            },
-        )
+    LaunchedEffect(showFeedbackOptions) {
+        if (showFeedbackOptions) prepareFeedback()
     }
 
     if (showFeedbackPreview) {
@@ -2389,12 +2431,12 @@ private fun TimeLimiterScreen(
                         FeedbackSender.ShareLaunchResult.OPENED -> Unit
                         FeedbackSender.ShareLaunchResult.NO_SHARE_TARGET -> Toast.makeText(
                             context,
-                            localizedText(context, "未找到可分享的应用，请复制日志后通过任意渠道发送", "No sharing app found. Copy the logs and send them with any app."),
+                            localizedText(context, "未找到支持文件分享的应用，请安装邮件或文件分享应用后重试", "No file-sharing app found. Install an email or file-sharing app and retry."),
                             Toast.LENGTH_LONG,
                         ).show()
                         FeedbackSender.ShareLaunchResult.FAILED -> Toast.makeText(
                             context,
-                            localizedText(context, "系统分享无法打开，日志仍可复制", "Unable to open the system share sheet. The logs can still be copied."),
+                            localizedText(context, "系统分享无法打开，日志文件已保留，请重试", "Unable to open the share sheet. The log file is retained; please retry."),
                             Toast.LENGTH_LONG,
                         ).show()
                     }
@@ -2418,6 +2460,7 @@ private fun TimeLimiterScreen(
     if (showWebDav) {
         WebDavDialog(
             initial = WebDavSettingsRepository(context).load(),
+            languageMode = currentSettings.languageMode,
             onDismiss = { showWebDav = false },
             onSave = { config ->
                 if (!WebDavSettingsRepository(context).save(config)) {
@@ -2449,11 +2492,15 @@ private fun TimeLimiterScreen(
                 }.start()
             },
             onApplyRemote = { backup ->
-                if (repository.replacePortableConfiguration(backup)) {
-                    repository.reconcileRuleAccess()
-                    Toast.makeText(context, "WebDAV 配置已导入", Toast.LENGTH_LONG).show()
-                } else {
-                    Toast.makeText(context, "WebDAV 配置导入失败", Toast.LENGTH_LONG).show()
+                screenScope.launch {
+                    val result = withContext(Dispatchers.IO) { portableBackupRepository.preview(backup) }
+                    result.onSuccess { backupPreview = it; backupPreviewStale = false }
+                        .onFailure {
+                            val wording = com.liuml.apptimelimiter.backup.BackupPreviewText(
+                                AppLocaleController.resolvedLanguage(context, currentSettings.languageMode) == SupportedLanguage.ENGLISH,
+                            )
+                            Toast.makeText(context, wording.text("预览失败：", "Preview failed: ") + wording.error(it.message.orEmpty()), Toast.LENGTH_LONG).show()
+                        }
                 }
             },
         )
@@ -3620,8 +3667,8 @@ private fun UsageStatisticsScreen(
     val visibleSummaries = remember(summaries, systemPackages, showSystemApps) {
         StatisticsDisplayPolicy.filter(summaries, systemPackages, showSystemApps)
     }
-    // Historical usage can outlive the launchable-app snapshot. Keep those packages in the
-    // chart map so a missing InstalledApp object cannot silently remove an icon from its arc.
+    // Historical usage can outlive the launchable-app snapshot; retain package labels for
+    // details. Actual bitmap availability determines whether a package joins Other.
     val chartAppsByPackage = remember(appByPackage, visibleSummaries) {
         buildMap {
             putAll(appByPackage)
@@ -3642,7 +3689,6 @@ private fun UsageStatisticsScreen(
             .thenByDescending { it.durationMillis }
             .thenByDescending { it.lastUsedAtMillis },
     )
-    val segments = remember(visibleSummaries) { StatisticsChartPolicy.segments(visibleSummaries) }
     val chartColors = listOf(
         MaterialTheme.colorScheme.primary,
         MaterialTheme.colorScheme.tertiary,
@@ -3660,7 +3706,7 @@ private fun UsageStatisticsScreen(
     val canGoPrevious = StatisticsDateRangePolicy.canSelect(selectedDate.minusDays(1L), today)
     val canGoNext = StatisticsDateRangePolicy.canSelect(selectedDate.plusDays(1L), today)
     var showDatePicker by remember { mutableStateOf(false) }
-    var selectedChartPackage by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedChartPackage by rememberSaveable(selectedDate, showSystemApps) { mutableStateOf<String?>(null) }
     val selectedChartSummary = visibleSummaries.firstOrNull {
         it.packageName == selectedChartPackage
     }
@@ -3798,7 +3844,8 @@ private fun UsageStatisticsScreen(
                 StatisticsRingOverview(
                     modifier = Modifier.fillMaxWidth(),
                     totalMillis = totalMillis,
-                    segments = segments,
+                    summaries = visibleSummaries,
+                    periodLabel = selectedDate.toString(),
                     appsByPackage = chartAppsByPackage,
                     colors = chartColors,
                     onAppClick = { selectedChartPackage = it },
@@ -3998,6 +4045,7 @@ private fun WeeklyReportScreen(
     usageStatsRepository: UsageStatsRepository,
     deviceUsageStatsRepository: DeviceUsageStatsRepository,
     usageAccessGranted: Boolean,
+    usageRevision: Int,
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -4007,15 +4055,16 @@ private fun WeeklyReportScreen(
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     var report by remember { mutableStateOf<WeeklyReport?>(null) }
-    var selectedWeeklyPackage by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedWeeklyPackage by rememberSaveable(showPrevious, weekStart) { mutableStateOf<String?>(null) }
     val weeklyCache = remember { WeeklyReportCache() }
     val selectedStart = if (showPrevious) weekStart.minusDays(7L) else weekStart
-    val cacheIdentity = remember(selectedStart, packages, usageAccessGranted) {
+    val cacheIdentity = remember(selectedStart, packages, usageAccessGranted, usageRevision) {
         val packageKey = packages.sorted().joinToString(",")
-        "${selectedStart}|${usageAccessGranted}|$packageKey"
+        "${selectedStart}|${usageAccessGranted}|$usageRevision|$packageKey"
     }
-    LaunchedEffect(selectedStart, packages, usageAccessGranted, cacheIdentity) {
-        weeklyCache.get(cacheIdentity)?.let {
+    LaunchedEffect(selectedStart, packages, usageAccessGranted, usageRevision, cacheIdentity) {
+        val cacheMaxAgeMillis = if (selectedStart == weekStart) 30_000L else Long.MAX_VALUE
+        weeklyCache.get(cacheIdentity, System.currentTimeMillis(), cacheMaxAgeMillis)?.let {
             report = it
             loading = false
             error = null
@@ -4059,10 +4108,13 @@ private fun WeeklyReportScreen(
             }
         }
         result.onSuccess {
-            weeklyCache.put(cacheIdentity, it)
+            weeklyCache.put(cacheIdentity, it, System.currentTimeMillis())
             report = it
             error = null
-        }.onFailure { error = it.javaClass.simpleName }
+        }.onFailure {
+            if (it is kotlinx.coroutines.CancellationException) throw it
+            error = it.javaClass.simpleName
+        }
         loading = false
     }
     val current = report
@@ -4215,9 +4267,10 @@ private fun WeeklyReportOverview(
             val delta = report.totalDurationMillis - report.previousWeekTotalDurationMillis
             Text(localizedText(context, "较上一周 ${if (delta >= 0L) "+" else "-"}${formatDashboardDuration(kotlin.math.abs(delta))}", "vs previous week ${if (delta >= 0L) "+" else "-"}${formatDashboardDuration(kotlin.math.abs(delta))}"))
             StatisticsRingOverview(
-                modifier = Modifier.fillMaxWidth().height(260.dp),
+                modifier = Modifier.fillMaxWidth(),
                 totalMillis = report.totalDurationMillis,
-                segments = StatisticsChartPolicy.segments(aggregate),
+                summaries = aggregate,
+                periodLabel = "${report.weekStart} - ${report.weekEnd}",
                 appsByPackage = apps.associateBy(InstalledApp::packageName),
                 colors = listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.secondary, MaterialTheme.colorScheme.tertiary, MaterialTheme.colorScheme.error),
                 onAppClick = onAppClick,
@@ -4316,63 +4369,145 @@ private fun StatisticsMetric(value: String, label: String, modifier: Modifier = 
 private fun StatisticsRingOverview(
     modifier: Modifier,
     totalMillis: Long,
-    segments: List<com.liuml.apptimelimiter.statistics.StatisticsChartSegment>,
+    summaries: List<AppUsageSummary>,
+    periodLabel: String,
     appsByPackage: Map<String, InstalledApp>,
     colors: List<Color>,
     onAppClick: (String) -> Unit,
 ) {
-    BoxWithConstraints(modifier, contentAlignment = Alignment.Center) {
+    val context = LocalContext.current
+    val iconPixels = with(LocalDensity.current) { 36.dp.roundToPx() }
+    val ringEntries = remember(summaries) {
+        StatisticsRingPolicy.normalize(summaries.map { RingUsage(it.packageName, it.durationMillis) })
+    }
+    val packages = remember(ringEntries) { StatisticsRingPolicy.iconCandidates(ringEntries) }
+    val ringSummaries = remember(summaries, ringEntries) {
+        val byPackage = summaries.groupBy { it.packageName }
+        ringEntries.map { entry ->
+            val values = byPackage.getValue(entry.packageName)
+            // Counters are Int; accumulating a List of nonnegative Ints in Long is safe.
+            fun count(selector: (AppUsageSummary) -> Int): Int = values
+                .sumOf { selector(it).coerceAtLeast(0).toLong() }.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            values.first().copy(
+                durationMillis = entry.durationMillis,
+                launchCount = count { it.launchCount },
+                limitHitCount = count { it.limitHitCount },
+                reminderCount = count { it.reminderCount },
+                parentUnlockCount = count { it.parentUnlockCount },
+                extensionCount = count { it.extensionCount },
+            )
+        }
+    }
+    var bitmaps by remember(packages, iconPixels) { mutableStateOf<Map<String, ImageBitmap>>(emptyMap()) }
+    LaunchedEffect(packages, iconPixels) {
+        bitmaps = withContext(Dispatchers.IO) {
+            packages.mapNotNull { packageName ->
+                runCatching {
+                    packageName to context.packageManager.getApplicationIcon(packageName)
+                        .toBitmap(iconPixels, iconPixels).asImageBitmap()
+                }.getOrNull()
+            }.toMap()
+        }
+    }
+    var showOther by remember(periodLabel) { mutableStateOf(false) }
+    val currentOnAppClick by rememberUpdatedState(onAppClick)
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+    BoxWithConstraints(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
         // Keep enough clear space around the ring for icons. The previous radius was larger
         // than the container and used segment midpoints, so short segments collided or clipped.
         val containerSize = minOf(maxWidth, 360.dp).coerceAtLeast(0.dp)
-        val iconSize = 36.dp
-        val ringStroke = 22.dp
+        val iconSize = if (containerSize < 280.dp) 28.dp else 36.dp
+        val ringStroke = if (containerSize < 240.dp) 18.dp else 22.dp
         // Keep the complete bitmap visibly outside the stroke. Different launcher icons have
         // different transparent padding, so a 6dp mathematical gap still looked inconsistent.
-        val iconGap = 16.dp
+        val iconGap = if (containerSize < 280.dp) 8.dp else 16.dp
         val maxSafeChartSize = (containerSize - iconSize * 2f - ringStroke - iconGap * 2f - 8.dp)
-            .coerceAtLeast(100.dp)
+            .coerceAtLeast(0.dp)
         val chartSize = minOf(
             (containerSize - 150.dp).coerceAtLeast(100.dp),
             maxSafeChartSize,
         )
         val baseIconRadius = chartSize / 2 + ringStroke / 2 + iconSize / 2 + iconGap
+        val minimumSeparation = Math.toDegrees(2 * kotlin.math.asin(
+            ((iconSize.value + 8f) / (2f * baseIconRadius.value)).toDouble().coerceIn(0.0, 1.0),
+        ))
+        val sectors = remember(ringEntries, bitmaps, minimumSeparation) {
+            StatisticsRingPolicy.sectors(
+                ringEntries,
+                bitmaps.keys,
+                minimumSeparationDegrees = minimumSeparation,
+            )
+        }
+        val other = sectors.firstOrNull { it.packageName == null }
+        val otherMembers = ringSummaries.filter { it.packageName in (other?.members ?: emptySet()) }
         val trackColor = MaterialTheme.colorScheme.surfaceVariant
+        val otherColor = MaterialTheme.colorScheme.outline
         Box(
-            Modifier.size(containerSize).clip(RoundedCornerShape(0.dp)),
+            Modifier.size(containerSize).semantics {
+                contentDescription = localizedText(context, "应用使用圆环，$periodLabel", "App usage ring, $periodLabel")
+                customActions = sectors.map { sector ->
+                    CustomAccessibilityAction(
+                        label = (sector.packageName?.let { appsByPackage[it]?.label ?: it }
+                            ?: localizedText(context, "其他", "Other")) + " · " + formatDashboardDuration(sector.durationMillis),
+                        action = {
+                            val packageName = sector.packageName
+                            if (packageName == null) showOther = true else currentOnAppClick(packageName)
+                            true
+                        },
+                    )
+                }
+            }.pointerInput(sectors, chartSize, ringStroke) {
+                detectTapGestures { position ->
+                    val hit = StatisticsRingPolicy.hitTest(
+                        sectors,
+                        (position.x - size.width / 2f).toDouble(),
+                        (position.y - size.height / 2f).toDouble(),
+                        chartSize.toPx().toDouble() / 2,
+                        ringStroke.toPx().toDouble(),
+                    )
+                    if (hit != null) {
+                        val packageName = hit.packageName
+                        if (packageName == null) showOther = true else currentOnAppClick(packageName)
+                    }
+                }
+            },
             contentAlignment = Alignment.Center,
         ) {
             Box(Modifier.size(chartSize), contentAlignment = Alignment.Center) {
                 Canvas(Modifier.fillMaxSize()) {
                 val stroke = ringStroke.toPx()
                 drawArc(trackColor, -90f, 360f, false, style = Stroke(stroke))
-                var angle = -90f
-                segments.forEachIndexed { index, segment ->
-                    val sweep = segment.fraction * 360f
-                    drawArc(colors[index % colors.size], angle, (sweep - 2f).coerceAtLeast(1f), false, style = Stroke(stroke))
-                    angle += sweep
+                sectors.forEachIndexed { index, sector ->
+                    drawArc(
+                        if (sector.packageName == null) otherColor else colors[index % colors.size],
+                        sector.startDegrees.toFloat(), sector.sweepDegrees.toFloat(),
+                        false, style = Stroke(stroke),
+                    )
                 }
                 }
                 Text(
                     formatDashboardDuration(totalMillis),
-                    style = MaterialTheme.typography.headlineMedium,
+                    modifier = Modifier.padding(horizontal = ringStroke),
+                    style = if (chartSize < 160.dp) MaterialTheme.typography.titleMedium else MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center,
                 )
             }
-            val iconPlacements = StatisticsChartPolicy.iconPlacements(segments)
-            val displayPlacements = iconPlacements.filter { appsByPackage.containsKey(it.packageName) }
+            val displayPlacements = sectors.filter { it.packageName != null }
             Layout(
                 content = {
                     displayPlacements.forEach { placement ->
-                        val app = appsByPackage.getValue(placement.packageName)
                         Box(
                             Modifier
-                                .size(iconSize)
-                                .clickable { onAppClick(placement.packageName) },
+                                .size(iconSize),
                             contentAlignment = Alignment.Center,
                         ) {
-                            AppIcon(app)
+                            Image(
+                                bitmap = bitmaps.getValue(requireNotNull(placement.packageName)),
+                                contentDescription = null,
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier.fillMaxSize().clip(CircleShape),
+                            )
                         }
                     }
                 },
@@ -4389,14 +4524,49 @@ private fun StatisticsRingOverview(
                 }
                 layout(width, height) {
                     placeables.forEachIndexed { index, placeable ->
-                        val radians = displayPlacements[index].angleDegrees * PI / 180.0
+                        val radians = displayPlacements[index].midpointDegrees * PI / 180.0
                         val x = centerX + (radiusPx * cos(radians)).toInt() - placeable.width / 2
                         val y = centerY + (radiusPx * sin(radians)).toInt() - placeable.height / 2
-                        placeable.placeRelative(x, y)
+                        placeable.place(x, y)
                     }
                 }
             }
         }
+        if (showOther && other != null) {
+            AlertDialog(
+                onDismissRequest = { showOther = false },
+                title = { Text(localizedText(context, "其他", "Other")) },
+                text = {
+                    LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        item {
+                            Text(periodLabel, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(localizedText(context, "${other.members.size} 个应用 · ${formatDashboardDuration(other.durationMillis)}", "${other.members.size} apps · ${formatDashboardDuration(other.durationMillis)}"))
+                            Text(localizedText(context,
+                                "启动 ${otherMembers.sumOf { it.launchCount.toLong() }} 次 · 限制 ${otherMembers.sumOf { it.limitHitCount.toLong() }} 次",
+                                "${otherMembers.sumOf { it.launchCount.toLong() }} launches · ${otherMembers.sumOf { it.limitHitCount.toLong() }} limits"))
+                            Text(localizedText(context,
+                                "提醒 ${otherMembers.sumOf { it.reminderCount.toLong() }} 次 · PIN 解锁 ${otherMembers.sumOf { it.parentUnlockCount.toLong() }} 次",
+                                "${otherMembers.sumOf { it.reminderCount.toLong() }} reminders · ${otherMembers.sumOf { it.parentUnlockCount.toLong() }} PIN unlocks"))
+                        }
+                        items(otherMembers.sortedByDescending { it.durationMillis }, key = { it.packageName }) { member ->
+                            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                Text(appsByPackage[member.packageName]?.label ?: member.packageName, fontWeight = FontWeight.Medium)
+                                Text(member.packageName, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(formatDashboardDuration(member.durationMillis))
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showOther = false }) { Text(localizedText(context, "关闭", "Close")) } },
+            )
+        }
+    }
+        Text(
+            localizedText(context, "点击圆环查看详情 · 灰色为其他", "Tap the ring for details · Gray means Other"),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
     }
 }
 
@@ -5423,6 +5593,7 @@ private fun SettingsDialog(
     var usageMilestoneReminderEnabled by remember {
         mutableStateOf(initialSettings.usageMilestoneReminderEnabled)
     }
+    var openUsageTipEnabled by remember { mutableStateOf(initialSettings.openUsageTipEnabled) }
     var languageMode by remember { mutableStateOf(initialSettings.languageMode) }
     var themeMode by remember { mutableStateOf(initialSettings.themeMode) }
     var themeColor by remember { mutableStateOf(initialSettings.themeColor) }
@@ -5453,6 +5624,30 @@ private fun SettingsDialog(
     }
     var accessibilityEnhancement by remember {
         mutableStateOf(initialSettings.accessibilityForceStopEnhancement)
+    }
+    var rootAuthorizationRequest by remember { mutableIntStateOf(0) }
+    var rootAuthorizationMode by remember { mutableStateOf<ProtectionMode?>(null) }
+    var rootAuthorizationPending by remember { mutableStateOf(false) }
+    var rootAuthorizationMessage by remember { mutableStateOf("") }
+    LaunchedEffect(rootAuthorizationRequest, protectionMode) {
+        if (rootAuthorizationRequest == 0 || rootAuthorizationMode != protectionMode) {
+            rootAuthorizationPending = false
+            return@LaunchedEffect
+        }
+        rootAuthorizationPending = true
+        rootAuthorizationMessage = localizedText(context, "请在 Root 管理器中授权时停…", "Authorize Time Stop in your root manager…")
+        val available = withContext(Dispatchers.IO) { RootExecutor(context).requestAuthorization() }
+        if (!available) {
+            if (protectionMode == ProtectionMode.XPOSED) rootEnhancementEnabled = false
+            else accessibilityEnhancement = ForceStopEnhancement.NONE
+        }
+        rootAuthorizationPending = false
+        rootAuthorizationMessage = if (available) {
+            localizedText(context, "Root 已授权，保存后生效。", "Root authorized. Save to apply.")
+        } else {
+            localizedText(context, "未获得 Root 或授权超时，已关闭 Root 增强，继续使用原有管控。", "Root denied, unavailable or timed out. Enhancement disabled; normal protection remains active.")
+        }
+        rootAuthorizationRequest = 0
     }
     var extensionEnabled by remember { mutableStateOf(initialSettings.extensionEnabled) }
     var extensionMinutes by remember {
@@ -5853,24 +6048,13 @@ private fun SettingsDialog(
                                 }
                                 Switch(
                                     checked = rootEnhancementEnabled,
+                                    enabled = !rootAuthorizationPending,
                                     onCheckedChange = { enabled ->
                                         rootEnhancementEnabled = enabled
                                         if (enabled) {
-                                            Thread {
-                                                val available = RootExecutor(context).isAvailable()
-                                                Handler(Looper.getMainLooper()).post {
-                                                    Toast.makeText(
-                                                        context,
-                                                        if (available) "Root 已授权，保存后可用于强停目标应用。"
-                                                        else "未获得 Root，仍会使用原有退出逻辑。",
-                                                        Toast.LENGTH_SHORT,
-                                                    ).show()
-                                                }
-                                            }.apply {
-                                                isDaemon = true
-                                                name = "TimeStop-RootAvailability"
-                                                start()
-                                            }
+                                            rootAuthorizationMode = protectionMode
+                                            rootAuthorizationPending = true
+                                            rootAuthorizationRequest++
                                         }
                                     },
                                 )
@@ -5898,19 +6082,13 @@ private fun SettingsDialog(
                                     ForceStopEnhancement.entries.forEach { enhancement ->
                                         FilterChip(
                                             selected = accessibilityEnhancement == enhancement,
+                                            enabled = !rootAuthorizationPending,
                                             onClick = {
                                                 accessibilityEnhancement = enhancement
                                                 if (enhancement == ForceStopEnhancement.ROOT) {
-                                                    Thread {
-                                                        val available = RootExecutor(context).isAvailable()
-                                                        Handler(Looper.getMainLooper()).post {
-                                                            Toast.makeText(
-                                                                context,
-                                                                if (available) "Root 已授权，保存后可用于普通保护强停。" else "未获得 Root，到限将回退独立限制页。",
-                                                                Toast.LENGTH_SHORT,
-                                                            ).show()
-                                                        }
-                                                    }.apply { isDaemon = true; start() }
+                                                    rootAuthorizationMode = protectionMode
+                                                    rootAuthorizationPending = true
+                                                    rootAuthorizationRequest++
                                                 }
                                             },
                                             label = {
@@ -5927,6 +6105,9 @@ private fun SettingsDialog(
                                 }
                             }
                         }
+                    }
+                    if (rootAuthorizationMessage.isNotBlank() && rootAuthorizationMode == protectionMode) {
+                        item { Text(rootAuthorizationMessage, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     }
                     if (showNonRootRequirements) {
                     item {
@@ -6446,6 +6627,16 @@ private fun SettingsDialog(
                             horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
                             Column(Modifier.weight(1f)) {
+                                Text(localizedText(context, "开屏使用时间提示", "Usage tip on app entry"), fontWeight = FontWeight.Medium)
+                                Text(localizedText(context, "进入管控应用时短暂显示今日使用与剩余时间。", "Briefly show today's usage and remaining time on entry."), style = MaterialTheme.typography.bodySmall)
+                            }
+                            Switch(checked = openUsageTipEnabled, onCheckedChange = { openUsageTipEnabled = it })
+                        }
+                    }
+                    item {
+                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween) {
+                            Column(Modifier.weight(1f)) {
                                 Text(localizedText(context, "使用时长提醒", "Usage duration reminder"), fontWeight = FontWeight.Medium)
                                 Text(
                                     localizedText(
@@ -6621,7 +6812,7 @@ private fun SettingsDialog(
                         Column(Modifier.weight(1f)) {
                             Text("诊断日志", fontWeight = FontWeight.Medium)
                             Text(
-                                "记录管控引擎、包名、时间戳和限制事件；仅在你主动反馈时导出",
+                                localizedText(context, "记录包名、时间、管控阶段及结果；事件时间线保留 7 天、最多 10,000 条，仅主动反馈时导出，不记录 PIN 或授权令牌。", "Stores package names, times, control stages and outcomes. Timeline retains up to 10,000 records for 7 days, exported only when you share feedback. PINs and authorization tokens are excluded."),
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
@@ -6889,7 +7080,7 @@ private fun SettingsDialog(
                 item {
                     SettingsEntry(
                         title = "反馈问题",
-                        description = "通过邮件发送设备信息和诊断日志",
+                        description = "分享诊断日志文件，邮件自动填入收件人和问题说明",
                         action = "反馈 ›",
                         onClick = onFeedback,
                     )
@@ -6922,6 +7113,7 @@ private fun SettingsDialog(
                             fullScreenExitWarningEnabled = fullScreenWarningEnabled,
                             exitWarningVibrationEnabled = vibrationEnabled,
                             usageMilestoneReminderEnabled = usageMilestoneReminderEnabled,
+                            openUsageTipEnabled = openUsageTipEnabled,
                             languageMode = languageMode,
                             themeMode = themeMode,
                             themeColor = themeColor,
@@ -6949,7 +7141,7 @@ private fun SettingsDialog(
                         ),
                     )
                 },
-                enabled = (!warningEnabled || !extensionEnabled || parsedMinutes != null) &&
+                enabled = !rootAuthorizationPending && (!warningEnabled || !extensionEnabled || parsedMinutes != null) &&
                     (!warningEnabled || !extensionEnabled ||
                         (parsedExtensionDailyLimit != null &&
                             parsedExtensionSessionLimit != null)),
@@ -7131,86 +7323,35 @@ private fun UpdateResultDialog(
 }
 
 @Composable
-private fun FeedbackOptionsDialog(
-    onDismiss: () -> Unit,
-    onShare: () -> Unit,
-    onQqGroup: () -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("反馈问题") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(
-                    "请选择反馈方式。邮件反馈会附带设备型号、包名、时间戳和诊断日志，仅在你主动发送时离开设备；QQ群适合交流和参与内测。",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                OutlinedButton(
-                    onClick = onShare,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("分享诊断日志")
-                }
-                OutlinedButton(
-                    onClick = onQqGroup,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("QQ群反馈")
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("取消") }
-        },
-    )
-}
-
-@Composable
 private fun FeedbackPreviewDialog(
     draft: FeedbackSender.Draft,
     onDismiss: () -> Unit,
     onShare: () -> Unit,
 ) {
     val context = LocalContext.current
-    val copyText: (String, String) -> Unit = { label, value ->
-        context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
-            ClipData.newPlainText(label, value),
-        )
-        Toast.makeText(
-            context,
-            localizedText(context, "已复制，可粘贴到 QQ、邮件或其他反馈渠道", "Copied. Paste it into QQ, email, or another feedback channel."),
-            Toast.LENGTH_LONG,
-        ).show()
-    }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("诊断日志已准备") },
+        title = { Text(localizedText(context, "诊断日志文件已准备", "Diagnostic file ready")) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "日志已在时停内生成。点击分享诊断日志会打开系统分享面板，可选择 QQ、微信、邮件或其他应用；复制功能保留为兜底。",
+                    localizedText(context,
+                        "通过系统分享面板发送日志文件。选择邮件时将预填收件人 ${FeedbackSender.EMAIL}、主题和问题说明，请补充复现步骤后自行发送。",
+                        "Share the log file using the system share sheet. Email receives ${FeedbackSender.EMAIL}, a subject and an issue template. Add reproduction steps and send when ready."),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    "文件：${draft.attachment.name}（${draft.diagnosticsText.length} 字符）",
+                    "${draft.attachment.name} (${draft.attachmentBytes} bytes)",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Button(
                     onClick = onShare,
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("分享诊断日志") }
-                OutlinedButton(
-                    onClick = { copyText("Time Stop diagnostics", draft.diagnosticsText) },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("复制完整诊断日志") }
-                OutlinedButton(
-                    onClick = { copyText("Time Stop feedback", draft.body) },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("复制反馈邮件内容") }
+                ) { Text(localizedText(context, "分享日志文件", "Share log file")) }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+        confirmButton = { TextButton(onClick = onDismiss) { Text(localizedText(context, "关闭", "Close")) } },
     )
 }
 
@@ -7242,8 +7383,8 @@ private fun DonationPromptDialog(
                 Text(
                     localizedText(
                         context,
-                        "时停坚持无广告、无后台常驻，并持续适配新的 Android 与 LSPosed 版本。",
-                        "Time Stop stays ad-free, avoids a persistent background service, and keeps adapting to new Android and LSPosed versions.",
+                        "时停仅提供用户主动触发的激励广告，并持续适配新的 Android 与 LSPosed 版本。",
+                        "Time Stop only offers user-initiated rewarded ads and keeps adapting to new Android and LSPosed versions.",
                     ),
                 )
                 Text(
@@ -7283,12 +7424,20 @@ private fun DonationPromptDialog(
 @OptIn(ExperimentalLayoutApi::class)
 private fun WebDavDialog(
     initial: SavedWebDavConfig,
+    languageMode: AppLanguageMode,
     onDismiss: () -> Unit,
     onSave: (SavedWebDavConfig) -> Unit,
     onSync: (SavedWebDavConfig) -> Unit,
     onDownload: (SavedWebDavConfig, (Result<PortableBackupV1>) -> Unit) -> Unit,
     onApplyRemote: (PortableBackupV1) -> Unit,
 ) {
+    val context = LocalContext.current
+    val configuration = LocalConfiguration.current
+    val wording = remember(context, languageMode, configuration) {
+        com.liuml.apptimelimiter.backup.BackupPreviewText(
+            AppLocaleController.resolvedLanguage(context, languageMode) == SupportedLanguage.ENGLISH,
+        )
+    }
     var endpoint by remember { mutableStateOf(initial.endpoint) }
     var username by remember { mutableStateOf(initial.username) }
     var password by remember { mutableStateOf(initial.password) }
@@ -7311,12 +7460,15 @@ private fun WebDavDialog(
                     Text("打开时自动同步", Modifier.weight(1f))
                     Switch(checked = autoSync, onCheckedChange = { autoSync = it })
                 }
+                remoteError?.let { message ->
+                    Text(wording.text("下载失败：", "Download failed: ") + wording.error(message), color = MaterialTheme.colorScheme.error)
+                }
             }
         },
         confirmButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 TextButton(onClick = { onDownload(config) { result ->
-                    result.onSuccess { remoteBackup = it }.onFailure { remoteError = it.message }
+                    result.onSuccess { remoteBackup = it; remoteError = null }.onFailure { remoteError = it.message.orEmpty() }
                 } }) { Text("下载") }
                 TextButton(onClick = { onSync(config) }) { Text("上传") }
                 Button(onClick = { onSave(config); onDismiss() }) { Text("保存") }
@@ -7327,19 +7479,18 @@ private fun WebDavDialog(
     remoteBackup?.let { backup ->
         AlertDialog(
             onDismissRequest = { remoteBackup = null },
-            title = { Text("发现云端配置") },
-            text = { Text("创建于 ${backup.createdAtMillis}，包含 ${backup.rules.size} 项规则和 ${backup.groups.size} 个分组。确认后将替换本机便携配置。") },
+            title = { Text(wording.text("发现云端配置", "Cloud configuration found")) },
+            text = { Text(wording.text(
+                "包含 ${backup.rules.size} 项规则和 ${backup.groups.size} 个分组。下一步查看差异，确认后整体替换本机便携配置。",
+                "Contains ${backup.rules.size} rules and ${backup.groups.size} groups. Review the differences next, then confirm to replace the local portable configuration.",
+            )) },
             confirmButton = {
                 Button(onClick = { onApplyRemote(backup); remoteBackup = null; onDismiss() }) {
-                    Text("使用云端配置")
+                    Text(wording.text("预览差异", "Preview differences"))
                 }
             },
-            dismissButton = { TextButton(onClick = { remoteBackup = null }) { Text("取消") } },
+            dismissButton = { TextButton(onClick = { remoteBackup = null }) { Text(wording.text("取消", "Cancel")) } },
         )
-    }
-    remoteError?.let { message ->
-        LaunchedEffect(message) { }
-        Text("下载失败：$message", color = MaterialTheme.colorScheme.error)
     }
 }
 
@@ -7690,40 +7841,13 @@ private fun DiagnosticLogDialog(
     onClear: (() -> Unit) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var logs by remember { mutableStateOf(repository.readLatest()) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("诊断日志（${logs.size}）") },
-        text = {
-            if (logs.isEmpty()) {
-                Text("暂无日志。请打开一次已配置的目标应用；若仍为空，请检查当前保护方式的权限与配置。")
-            } else {
-                LazyColumn(
-                    modifier = Modifier.fillMaxWidth().heightIn(max = 480.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    items(logs) { line ->
-                        Text(line.replace('\t', '\n'), style = MaterialTheme.typography.bodySmall)
-                        HorizontalDivider()
-                    }
-                }
-            }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
-        dismissButton = {
-            Row {
-                TextButton(onClick = onFeedback) { Text("反馈") }
-                TextButton(onClick = { logs = repository.readLatest() }) { Text("刷新") }
-                TextButton(
-                    onClick = {
-                        onClear {
-                            repository.clear()
-                            logs = emptyList()
-                        }
-                    },
-                ) { Text("清空") }
-            }
-        },
+    val context = LocalContext.current
+    com.liuml.apptimelimiter.diagnostics.DiagnosticTimelineDialog(
+        repository = repository,
+        english = localizedText(context, "zh", "en") == "en",
+        onFeedback = onFeedback,
+        onClear = onClear,
+        onDismiss = onDismiss,
     )
 }
 

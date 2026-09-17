@@ -1,6 +1,7 @@
 package com.liuml.apptimelimiter.statistics
 
 import android.content.Context
+import android.content.SharedPreferences
 import com.liuml.apptimelimiter.core.UsageMilestonePolicy
 import java.time.LocalDate
 
@@ -24,11 +25,64 @@ class UsageStatsRepository(context: Context) {
         Context.MODE_PRIVATE,
     )
 
+    // SharedPreferences changes its in-memory map even when commit fails. Never acknowledge
+    // that speculative state, including through a newly constructed repository in this process.
+    private fun SharedPreferences.Editor.durableCommit(): Boolean {
+        if (prefs in FAILED_STORES) return false
+        val success = runCatching { commit() }.getOrDefault(false)
+        if (!success) FAILED_STORES.add(prefs)
+        return success
+    }
+
+    private fun prepareLedger(): Boolean {
+        if (prefs in FAILED_STORES) return false
+        val today = LocalDate.now()
+        val floor = StatisticsLedgerPolicy.floor(prefs.getLong(KEY_FLOOR, Long.MIN_VALUE), today)
+        val editor = prefs.edit()
+        var changed = false
+        if (!prefs.getBoolean(KEY_LEDGER_READY, false)) {
+            editor.putBoolean(KEY_LEDGER_READY, true)
+            changed = true
+        }
+        // Keep the old bounded set as an immutable compatibility shard. Missing/evicted IDs
+        // cannot be distinguished from genuinely new requests: accept them and deduplicate
+        // subsequent retries in the durable ledger. Never freeze an entire upgrade day.
+        if (prefs.contains(KEY_LEGACY_THROUGH)) {
+            editor.remove(KEY_LEGACY_THROUGH) // Also repair an already-initialized draft store.
+            changed = true
+        }
+        if (prefs.contains("processed_events") && !prefs.contains(KEY_LEGACY_LAST_DAY)) {
+            editor.putLong(KEY_LEGACY_LAST_DAY, today.plusDays(1).toEpochDay())
+            changed = true
+        }
+        if (prefs.contains(KEY_LEGACY_LAST_DAY) && floor > prefs.getLong(KEY_LEGACY_LAST_DAY, Long.MAX_VALUE)) {
+            editor.remove("processed_events").remove(KEY_LEGACY_LAST_DAY)
+            changed = true
+        }
+        if (floor != prefs.getLong(KEY_FLOOR, Long.MIN_VALUE)) {
+            editor.putLong(KEY_FLOOR, floor)
+            prefs.all.keys.filter { it.startsWith(EVENTS_PREFIX) || it.startsWith(RESERVATIONS_PREFIX) }
+                .forEach { key ->
+                    val epoch = key.substringAfterLast('.').toLongOrNull()
+                    if (epoch != null && epoch < floor) editor.remove(key)
+                }
+            changed = true
+        }
+        return !changed || editor.durableCommit()
+    }
+
+    private fun acceptsNew(day: String): Boolean = StatisticsLedgerPolicy.accepts(
+        LocalDate.parse(day), LocalDate.now(), prefs.getLong(KEY_FLOOR, Long.MIN_VALUE),
+    )
+
+    private fun eventsKey(day: String) = EVENTS_PREFIX + LocalDate.parse(day).toEpochDay()
+    private fun reservationsKey(day: String) = RESERVATIONS_PREFIX + LocalDate.parse(day).toEpochDay()
+
     init {
         recoverPendingWrite()
     }
 
-    internal fun exportMigrationSnapshot(): Map<String, *> = prefs.all
+    internal fun exportMigrationSnapshot(): Map<String, *> = rawMigrationStorageSnapshot()
         .filterKeys { key ->
             !key.startsWith("heartbeat.") &&
                 !key.startsWith("hook_version.") &&
@@ -36,9 +90,13 @@ class UsageStatsRepository(context: Context) {
         }
         .toMap()
 
-    internal fun rawMigrationStorageSnapshot(): Map<String, *> = prefs.all.toMap()
+    internal fun rawMigrationStorageSnapshot(): Map<String, *> = synchronized(LOCK) {
+        check(recoverPendingWrite()) { "Statistics storage is unavailable" }
+        prefs.all.toMap()
+    }
 
-    internal fun importMigrationSnapshot(values: Map<String, *>): Boolean {
+    internal fun importMigrationSnapshot(values: Map<String, *>): Boolean = synchronized(LOCK) {
+        if (prefs in FAILED_STORES) return@synchronized false
         val editor = prefs.edit().clear()
         values.forEach { (key, value) ->
             when (value) {
@@ -50,7 +108,7 @@ class UsageStatsRepository(context: Context) {
                 is Set<*> -> editor.putStringSet(key, value.filterIsInstance<String>().toSet())
             }
         }
-        return editor.commit()
+        editor.durableCommit()
     }
 
     fun record(
@@ -65,11 +123,21 @@ class UsageStatsRepository(context: Context) {
         reminderIncrement: Int = 0,
         parentUnlockIncrement: Int = 0,
         extensionIncrement: Int = 0,
+        requireNewEvent: Boolean = false,
     ): Boolean {
-        if (packageName.isBlank()) return false
+        if (packageName.isBlank() || packageName.length > 255) return false
         val day = normalizedUsageDayToken(dayToken) ?: return false
+        if (eventId != null && !StatisticsEventIdentity.isValid(eventId)) return false
         return synchronized(LOCK) {
+            if (!recoverPendingWrite()) return@synchronized false
             val normalizedEventId = eventId?.trim()?.takeIf { it.isNotEmpty() && it.length <= 160 }
+            if (normalizedEventId != null && isProcessed(day, packageName, normalizedEventId)) {
+                return@synchronized !requireNewEvent
+            }
+            if (!acceptsNew(day)) return@synchronized false
+            if (normalizedEventId != null && !StatisticsLedgerPolicy.canInsert(
+                    prefs.getStringSet(eventsKey(day), emptySet()).orEmpty().size, false,
+                    StatisticsLedgerPolicy.MAX_EVENTS_PER_DAY)) return@synchronized false
             // Stage the complete provider request first. If this process is killed after the
             // stage commit, the next provider instance replays it before serving new requests.
             if (!stagePendingWrite(day, packageName, durationMillis, launchIncrement, limitHitIncrement,
@@ -106,12 +174,16 @@ class UsageStatsRepository(context: Context) {
         extensionIncrement: Int = 0,
         clearPending: Boolean,
     ): Boolean {
-            val processedEventsKey = "processed_events"
+            val processedEventsKey = eventsKey(day)
             val processedEvents = prefs.getStringSet(processedEventsKey, emptySet()).orEmpty().toMutableSet()
-            if (normalizedEventId != null && normalizedEventId in processedEvents) {
-                if (clearPending) prefs.edit().putBoolean(KEY_PENDING, false).commit()
-                return true
+            if (normalizedEventId != null && isProcessed(day, packageName, normalizedEventId)) {
+                return !clearPending || prefs.edit().putBoolean(KEY_PENDING, false).durableCommit()
             }
+            if (!acceptsNew(day)) {
+                // An expired pending increment must never be replayed.
+                return clearPending && prefs.edit().putBoolean(KEY_PENDING, false).durableCommit()
+            }
+            if (normalizedEventId != null && processedEvents.size >= StatisticsLedgerPolicy.MAX_EVENTS_PER_DAY) return false
             val prefix = "$day.$packageName."
             // ContentProvider calls can cold-start this process for a single short write.
             // Commit synchronously so Android cannot kill the process before apply() flushes it.
@@ -160,14 +232,11 @@ class UsageStatsRepository(context: Context) {
                     )
             }
             if (normalizedEventId != null) {
-                processedEvents += normalizedEventId
-                while (processedEvents.size > MAX_PROCESSED_EVENTS) {
-                    processedEvents.remove(processedEvents.first())
-                }
+                processedEvents += StatisticsLedgerPolicy.identity(day, packageName, normalizedEventId)
                 editor.putStringSet(processedEventsKey, processedEvents)
             }
             if (clearPending) editor.putBoolean(KEY_PENDING, false)
-            return editor.commit()
+            return editor.durableCommit()
     }
 
     private fun stagePendingWrite(
@@ -195,15 +264,30 @@ class UsageStatsRepository(context: Context) {
         .putInt(KEY_PENDING_HOOK_VERSION, hookVersionCode.coerceAtLeast(0))
         .putLong(KEY_PENDING_MODE_GENERATION, hookModeGeneration.coerceAtLeast(0L))
         .putString(KEY_PENDING_EVENT_ID, eventId)
-        .commit()
+        .durableCommit()
 
-    private fun recoverPendingWrite() = synchronized(LOCK) {
-        if (!prefs.getBoolean(KEY_PENDING, false)) return@synchronized
+    private fun isProcessed(day: String, packageName: String, eventId: String): Boolean {
+        val processed = if (LocalDate.parse(day).toEpochDay() <= prefs.getLong(KEY_LEGACY_LAST_DAY, Long.MIN_VALUE))
+            prefs.getStringSet("processed_events", emptySet()).orEmpty() else emptySet()
+        // Recognize legacy unscoped records during upgrade without creating any new ones.
+        return eventId in processed || StatisticsEventIdentity.scoped(day, packageName, eventId) in processed ||
+            StatisticsLedgerPolicy.identity(day, packageName, eventId) in
+            prefs.getStringSet(eventsKey(day), emptySet()).orEmpty()
+    }
+
+    private fun legacyReservation(packageName: String, eventId: String): String? {
+        val key = "milestone_reservation.$packageName"
+        return prefs.getString("$key.owner", null)
+            .takeIf { prefs.getString("$key.event", null) == eventId }
+    }
+
+    private fun recoverPendingWrite(): Boolean = synchronized(LOCK) {
+        if (!prepareLedger()) return@synchronized false
+        if (!prefs.getBoolean(KEY_PENDING, false)) return@synchronized true
         val packageName = prefs.getString(KEY_PENDING_PACKAGE, null).orEmpty()
         val day = normalizedUsageDayToken(prefs.getString(KEY_PENDING_DAY, null))
         if (packageName.isBlank() || day == null) {
-            prefs.edit().putBoolean(KEY_PENDING, false).commit()
-            return@synchronized
+            return@synchronized prefs.edit().putBoolean(KEY_PENDING, false).durableCommit()
         }
         applyRecord(
             packageName = packageName,
@@ -225,9 +309,10 @@ class UsageStatsRepository(context: Context) {
         return summaryForDay(packageName, LocalDate.now())
     }
 
-    fun summaryForDay(packageName: String, date: LocalDate): AppUsageSummary {
+    fun summaryForDay(packageName: String, date: LocalDate): AppUsageSummary = synchronized(LOCK) {
+        check(recoverPendingWrite()) { "Statistics storage is unavailable" }
         val prefix = "$date.$packageName."
-        return AppUsageSummary(
+        AppUsageSummary(
             packageName = packageName,
             durationMillis = prefs.getLong("${prefix}duration_ms", 0L).coerceAtLeast(0L),
             launchCount = prefs.getInt("${prefix}launches", 0).coerceAtLeast(0),
@@ -261,22 +346,63 @@ class UsageStatsRepository(context: Context) {
     fun recordReminderEvent(packageName: String, day: LocalDate, eventId: String): Boolean =
         record(packageName, 0L, 0, 0, 0, dayToken = day.toString(), eventId = "reminder:$eventId", reminderIncrement = 1)
 
-    /** Atomically claims a visible half-hour reminder and records it for statistics. */
+    /** At-most-once display attempt: durable reservation survives death, timeout and reboot.
+     * Only an explicit confirm counts a display. Cancel leaves a tombstone too: a caller
+     * cannot prove that nothing reached the screen before dying or losing its response.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    fun reserveUsageMilestone(packageName: String, day: LocalDate, index: Int,
+        owner: String, phase: String, nowElapsed: Long): Boolean = synchronized(LOCK) {
+        if (packageName.isBlank() || packageName.length > 255 ||
+            !UsageMilestonePolicy.isValidMilestoneIndex(index) || owner.isBlank() || owner.length > 160 ||
+            !recoverPendingWrite()) return@synchronized false
+        val eventId = UsageMilestonePolicy.eventId(packageName, day.toString(), index)
+        val key = reservationsKey(day.toString())
+        val reservations = prefs.getStringSet(key, emptySet()).orEmpty().toMutableSet()
+        val identity = StatisticsLedgerPolicy.identity(day.toString(), packageName, eventId)
+        val reservation = "$identity:${StatisticsLedgerPolicy.digest(owner)}"
+        when (phase) {
+            "reserve" -> {
+                if (!acceptsNew(day.toString())) return@synchronized false
+                if (isProcessed(day.toString(), packageName, eventId)) return@synchronized false
+                if (legacyReservation(packageName, eventId) != null) return@synchronized false
+                if (reservations.any { it.startsWith("$identity:") } ||
+                    reservations.size >= StatisticsLedgerPolicy.MAX_RESERVATIONS_PER_DAY) return@synchronized false
+                reservations.add(reservation)
+                prefs.edit().putStringSet(key, reservations).durableCommit()
+            }
+            "confirm", "cancel" -> {
+                if (reservation !in reservations && legacyReservation(packageName, eventId) != owner) return@synchronized false
+                if (phase == "cancel") return@synchronized true
+                record(packageName, 0, 0, 0, 0,
+                    dayToken = day.toString(), eventId = eventId, reminderIncrement = 1)
+            }
+            else -> false
+        }
+    }
+
     fun claimUsageMilestoneReminder(
         packageName: String,
         day: LocalDate,
         milestoneIndex: Int,
-    ): Boolean {
-        if (!UsageMilestonePolicy.isValidMilestoneIndex(milestoneIndex)) return false
-        return record(
+    ): Boolean = synchronized(LOCK) {
+        if (!UsageMilestonePolicy.isValidMilestoneIndex(milestoneIndex) || !recoverPendingWrite()) return@synchronized false
+        val eventId = UsageMilestonePolicy.eventId(packageName, day.toString(), milestoneIndex)
+        val identity = StatisticsLedgerPolicy.identity(day.toString(), packageName, eventId)
+        if (legacyReservation(packageName, eventId) != null) return@synchronized false
+        // Older callers must not bypass a new caller's unconfirmed reservation.
+        if (prefs.getStringSet(reservationsKey(day.toString()), emptySet()).orEmpty()
+                .any { it.startsWith("$identity:") }) return@synchronized false
+        record(
             packageName = packageName,
             durationMillis = 0L,
             launchIncrement = 0,
             limitHitIncrement = 0,
             hookVersionCode = 0,
             dayToken = day.toString(),
-            eventId = UsageMilestonePolicy.eventId(packageName, day.toString(), milestoneIndex),
+            eventId = eventId,
             reminderIncrement = 1,
+            requireNewEvent = true,
         )
     }
 
@@ -309,6 +435,7 @@ class UsageStatsRepository(context: Context) {
     ): Boolean {
         if (packageName.isBlank() || hookVersionCode <= 0) return false
         return synchronized(LOCK) {
+            if (!recoverPendingWrite()) return@synchronized false
             prefs.edit()
                 .putLong("heartbeat.$packageName", System.currentTimeMillis())
                 .putInt("hook_version.$packageName", hookVersionCode)
@@ -316,13 +443,13 @@ class UsageStatsRepository(context: Context) {
                     "hook_mode_generation.$packageName",
                     hookModeGeneration.coerceAtLeast(0L),
                 )
-                .commit()
+                .durableCommit()
         }
     }
 
     fun clearAll() {
         synchronized(LOCK) {
-            prefs.edit().clear().commit()
+            check(prefs.edit().clear().durableCommit()) { "Statistics clear failed" }
         }
     }
 
@@ -330,7 +457,15 @@ class UsageStatsRepository(context: Context) {
 
     private companion object {
         const val PREFS_NAME = "usage_statistics"
-        const val MAX_PROCESSED_EVENTS = 128
+        const val EVENTS_PREFIX = "event_ledger."
+        const val RESERVATIONS_PREFIX = "reminder_ledger."
+        const val KEY_LEDGER_READY = "event_ledger_ready"
+        const val KEY_FLOOR = "event_ledger_floor"
+        const val KEY_LEGACY_THROUGH = "event_ledger_legacy_through"
+        const val KEY_LEGACY_LAST_DAY = "event_ledger_legacy_last_day"
+        val FAILED_STORES = java.util.Collections.newSetFromMap(
+            java.util.IdentityHashMap<SharedPreferences, Boolean>(),
+        )
         val LOCK = Any()
         const val KEY_PENDING = "provider_outbox_pending"
         const val KEY_PENDING_DAY = "provider_outbox_day"

@@ -53,22 +53,28 @@ class PortableBackupRepository(context: Context) {
     }
 
     fun preview(uri: Uri): Result<PortableBackupPreview> = runCatching {
-        val text = readBounded(uri)
-        val backup = PortableBackupCodec.decode(text)
+        preview(PortableBackupCodec.decode(readBounded(uri))).getOrThrow()
+    }
+
+    fun preview(backup: PortableBackupV1): Result<PortableBackupPreview> = runCatching {
         when (val validation = PortableBackupPolicy.validate(backup, appContext.packageName)) {
             is PortableBackupValidationResult.Invalid -> error(validation.reason)
             is PortableBackupValidationResult.Valid -> Unit
         }
+        val target = PortableBackupPolicy.normalize(backup)
         val installed = InstalledAppsRepository(appContext).loadLaunchableApps()
             .mapTo(mutableSetOf()) { it.packageName }
-        val packages = (backup.rules.map { it.packageName } +
-            backup.groups.flatMap { it.packageNames }).toSet()
+        val packages = (target.rules.map { it.packageName } +
+            target.groups.flatMap { it.packageNames }).toSet()
+        val current = currentConfiguration()
         PortableBackupPreview(
-            backup = backup,
+            backup = target,
             installedRuleCount = packages.count(installed::contains),
             missingRulePackages = packages - installed,
-            existingRuleCount = rules.configuredPackages().size,
-            existingGroupCount = rules.getGroups().size,
+            existingRuleCount = current.rules.size,
+            existingGroupCount = current.groups.size,
+            currentFingerprint = PortableBackupDiffPolicy.fingerprint(current),
+            diff = PortableBackupDiffPolicy.compare(current, target),
         )
     }
 
@@ -82,15 +88,9 @@ class PortableBackupRepository(context: Context) {
             is PortableBackupValidationResult.Invalid -> error(validation.reason)
             is PortableBackupValidationResult.Valid -> Unit
         }
-        writeRollback(
-            PortableBackupCodec.encode(
-                rules.exportPortableBackup(
-                    sourceVersionName = BuildConfig.VERSION_NAME,
-                    sourceVersionCode = BuildConfig.VERSION_CODE,
-                ),
-            ),
-        )
-        check(rules.replacePortableConfiguration(preview.backup)) {
+        check(rules.compareAndReplacePortableConfiguration(preview.backup, preview.currentFingerprint) { current ->
+            writeRollback(PortableBackupCodec.encode(current))
+        }) {
             "replace_configuration_failed"
         }
         rules.reconcileRuleAccess()
@@ -116,6 +116,12 @@ class PortableBackupRepository(context: Context) {
             .mapTo(mutableSetOf()) { it.packageName }
         return rules.configuredPackages() - installed
     }
+
+    private fun currentConfiguration() = rules.exportPortableBackup(
+        sourceVersionName = BuildConfig.VERSION_NAME,
+        sourceVersionCode = BuildConfig.VERSION_CODE,
+        includeInactiveRules = true,
+    )
 
     private fun readBounded(uri: Uri): String {
         val input = appContext.contentResolver.openInputStream(uri) ?: error("open_input_failed")

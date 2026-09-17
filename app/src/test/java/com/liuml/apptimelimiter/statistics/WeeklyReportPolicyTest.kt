@@ -7,6 +7,25 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WeeklyReportPolicyTest {
+    @Test fun emptyMetricsHaveNoFakeRankingAndTiesAreStable() {
+        val day = WeeklyReportDay(LocalDate.of(2026, 9, 7), listOf(
+            AppUsageSummary("b", 10L, 0, 0, 0L),
+            AppUsageSummary("a", 10L, 0, 0, 0L),
+        ), 20L)
+        assertTrue(WeeklyReportPolicy.top(listOf(day)) { _, app -> app.launchCount.toLong() }.isEmpty())
+        assertEquals(listOf("a", "b"), WeeklyReportPolicy.top(listOf(day)) { _, app -> app.durationMillis }.map { it.packageName })
+    }
+
+    @Test fun corruptedLargeCountersNeverOverflowToNegative() {
+        val day = WeeklyReportDay(LocalDate.of(2026, 9, 7), listOf(
+            AppUsageSummary("a", Long.MAX_VALUE, Int.MAX_VALUE, 0, 0L),
+            AppUsageSummary("b", Long.MAX_VALUE, Int.MAX_VALUE, 0, 0L),
+        ), Long.MAX_VALUE)
+        assertEquals(Int.MAX_VALUE, day.launchCount)
+        assertEquals(Int.MAX_VALUE, WeeklyReport(day.date, listOf(day, day)).launchCount)
+        assertEquals(172_800_000L, WeeklyReport(day.date, listOf(day, day)).totalDurationMillis)
+        assertEquals(Long.MAX_VALUE, WeeklyReportPolicy.top(listOf(day, day)) { _, app -> app.durationMillis }.first().value)
+    }
 
     @Test
     fun insightsUseWeeklyAggregateWithoutInventingUsage() {

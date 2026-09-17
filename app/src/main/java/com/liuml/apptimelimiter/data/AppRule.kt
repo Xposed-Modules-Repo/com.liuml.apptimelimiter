@@ -130,6 +130,7 @@ data class GlobalSettings(
     val fullScreenExitWarningEnabled: Boolean = false,
     val exitWarningVibrationEnabled: Boolean = false,
     val usageMilestoneReminderEnabled: Boolean = false,
+    val openUsageTipEnabled: Boolean = true,
     val languageMode: AppLanguageMode = AppLanguageMode.SYSTEM,
     val themeMode: AppThemeMode = AppThemeMode.SYSTEM,
     val themeColor: AppThemeColor = AppThemeColor.GREEN,

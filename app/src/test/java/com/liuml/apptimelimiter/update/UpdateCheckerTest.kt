@@ -5,6 +5,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class UpdateCheckerTest {
+    @Test fun `release code detects same name patch and rejects downgrade`() {
+        assertTrue(isVersionNewer("63-0.11.23", "0.11.23", 62))
+        assertFalse(isVersionNewer("62-0.11.23", "0.11.23", 62))
+        assertFalse(isVersionNewer("61-0.12.0", "0.11.23", 62))
+        assertTrue(isVersionNewer("v0.12.0", "0.11.23", 62))
+    }
     @Test
     fun `newer semantic version is detected`() {
         assertTrue(isVersionNewer("v0.5.0", "0.4.1"))

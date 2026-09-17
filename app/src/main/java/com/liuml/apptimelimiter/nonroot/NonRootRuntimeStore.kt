@@ -6,6 +6,7 @@ import android.os.SystemClock
 import com.liuml.apptimelimiter.core.SharedCooldownClaim
 import com.liuml.apptimelimiter.core.SharedCooldownPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownRecord
+import com.liuml.apptimelimiter.core.CooldownClock
 import java.time.LocalDate
 
 class NonRootRuntimeStore(context: Context) {
@@ -165,17 +166,28 @@ class NonRootRuntimeStore(context: Context) {
             .commit()
     }
 
-    fun getAppCooldown(packageName: String): SharedCooldownRecord {
-        if (packageName.isBlank()) return SharedCooldownRecord()
+    fun getAppCooldown(packageName: String): SharedCooldownRecord = synchronized(COOLDOWN_LOCK) {
+        CooldownClock.requireOwner(appContext, prefs)
+        if (packageName.isBlank()) return@synchronized SharedCooldownRecord()
         val prefix = cooldownPrefix(packageName)
-        return SharedCooldownRecord(
+        val stored = SharedCooldownRecord(
             startedAtMillis = prefs.getLong("${prefix}started_at", 0L),
             endsAtMillis = prefs.getLong("${prefix}ends_at", 0L),
             incidentId = prefs.getString("${prefix}incident_id", null).orEmpty(),
             sourcePackage = packageName,
             startedAtElapsedMillis = prefs.getLong("${prefix}started_elapsed_at", 0L),
             endsAtElapsedMillis = prefs.getLong("${prefix}ends_elapsed_at", 0L),
+            bootCount = prefs.getInt("${prefix}boot_count", -1),
         )
+        val record = SharedCooldownPolicy.rebase(stored, System.currentTimeMillis(),
+            SystemClock.elapsedRealtime(), CooldownClock.bootCount(appContext))
+        if (record.copy(validatedBootCount = -1) != stored) {
+            CooldownClock.commit(prefs, prefs.edit()
+                .putLong("${prefix}started_elapsed_at", record.startedAtElapsedMillis)
+                .putLong("${prefix}ends_elapsed_at", record.endsAtElapsedMillis)
+                .putInt("${prefix}boot_count", record.bootCount))
+        }
+        record
     }
 
     fun consumeExpiredAppCooldown(
@@ -189,19 +201,21 @@ class NonRootRuntimeStore(context: Context) {
                 record,
                 nowMillis,
                 SystemClock.elapsedRealtime(),
+                CooldownClock.bootCount(appContext),
             ) > 0L
         ) {
             return@synchronized null
         }
         val prefix = cooldownPrefix(packageName)
-        val persisted = prefs.edit()
+        val editor = prefs.edit()
             .remove("${prefix}started_at")
             .remove("${prefix}ends_at")
             .remove("${prefix}incident_id")
             .remove("${prefix}started_elapsed_at")
             .remove("${prefix}ends_elapsed_at")
-            .commit()
-        if (persisted) record else null
+            .remove("${prefix}boot_count")
+        CooldownClock.commit(prefs, editor)
+        record
     }
 
     fun claimAppCooldown(
@@ -212,6 +226,8 @@ class NonRootRuntimeStore(context: Context) {
         nowMillis: Long = System.currentTimeMillis(),
         nowElapsedMillis: Long = SystemClock.elapsedRealtime(),
     ): SharedCooldownClaim = synchronized(COOLDOWN_LOCK) {
+        val cooldownBoot = CooldownClock.bootCount(appContext)
+        check(durationMillis <= 0L || cooldownBoot >= 0) { "Cooldown boot identity unavailable" }
         val prefix = cooldownPrefix(packageName)
         val handled = prefs.getString("${prefix}handled", null)
             .orEmpty()
@@ -227,16 +243,18 @@ class NonRootRuntimeStore(context: Context) {
             durationMillis = durationMillis,
             nowMillis = nowMillis,
             nowElapsedMillis = nowElapsedMillis,
+            nowBootCount = cooldownBoot,
         )
         val editor = prefs.edit()
             .putString("${prefix}handled", claim.handledIncidentIds.joinToString("\n"))
-        if (claim.record.endsAtMillis > nowMillis) {
+        if (claim.record.endsAtMillis > 0L) {
             editor
                 .putLong("${prefix}started_at", claim.record.startedAtMillis)
                 .putLong("${prefix}ends_at", claim.record.endsAtMillis)
                 .putString("${prefix}incident_id", claim.record.incidentId)
-                .putLong("${prefix}started_elapsed_at", nowElapsedMillis)
-                .putLong("${prefix}ends_elapsed_at", nowElapsedMillis + (claim.record.endsAtMillis - nowMillis).coerceAtLeast(0L))
+                .putLong("${prefix}started_elapsed_at", claim.record.startedAtElapsedMillis)
+                .putLong("${prefix}ends_elapsed_at", claim.record.endsAtElapsedMillis)
+                .putInt("${prefix}boot_count", claim.record.bootCount)
         } else {
             editor
                 .remove("${prefix}started_at")
@@ -244,8 +262,9 @@ class NonRootRuntimeStore(context: Context) {
                 .remove("${prefix}incident_id")
                 .remove("${prefix}started_elapsed_at")
                 .remove("${prefix}ends_elapsed_at")
+                .remove("${prefix}boot_count")
         }
-        check(editor.commit()) { "Failed to persist non-root cooldown" }
+        CooldownClock.commit(prefs, editor)
         claim
     }
 

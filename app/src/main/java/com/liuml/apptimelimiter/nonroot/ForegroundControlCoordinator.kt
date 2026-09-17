@@ -101,6 +101,7 @@ class ForegroundControlCoordinator(
     private var uiState = NonRootUiExecutionState.IDLE
     private var pendingBreakPageAttempt: BreakPageAttempt? = null
     private var interactive = true
+    private var openTipPendingPackage: String? = null
     private var destroyed = false
     init {
         runtimeStore.recoverInterruptedSessions(SystemClock.elapsedRealtime()).forEach {
@@ -336,6 +337,7 @@ class ForegroundControlCoordinator(
             transitionUiState(NonRootUiExecutionState.IDLE, packageName, "foreground_changed")
         }
         foregroundPackage = packageName
+        openTipPendingPackage = packageName.takeIf { previous != appContext.packageName }
         foregroundDetectedAtMillis = observedAtMillis
         val acceptedForegroundGeneration = foregroundGeneration.incrementAndGet()
         foregroundExecutionSnapshot = ForegroundExecutionSnapshot(
@@ -773,7 +775,7 @@ class ForegroundControlCoordinator(
     private fun pauseSession(
         packageName: String,
         nowElapsed: Long,
-        preserveTimedParentOverride: Boolean = false,
+        preserveTimedParentOverride: Boolean = true,
     ) {
         if (!preserveTimedParentOverride && activeParentOverridePackages.remove(packageName)) {
             val sessionId = sessions[packageName]?.sessionId
@@ -1113,12 +1115,14 @@ class ForegroundControlCoordinator(
         runtimeStore.consumeExpiredAppCooldown(packageName, nowMillis)
         group?.let { repository.consumeExpiredGroupCooldown(it.id, nowMillis) }
         val nowElapsedForCooldown = SystemClock.elapsedRealtime()
+        val cooldownBootCount = com.liuml.apptimelimiter.core.CooldownClock.bootCount(appContext)
         val appCooldownEnd = if (personal && rule.cooldownEnabled) {
             val record = runtimeStore.getAppCooldown(packageName)
             nowMillis + SharedCooldownPolicy.remainingMillisDual(
                 record,
                 nowMillis,
                 nowElapsedForCooldown,
+                cooldownBootCount,
             )
         } else {
             0L
@@ -1130,6 +1134,7 @@ class ForegroundControlCoordinator(
                     record,
                     nowMillis,
                     nowElapsedForCooldown,
+                    cooldownBootCount,
                 )
             }
             ?: 0L
@@ -1155,6 +1160,7 @@ class ForegroundControlCoordinator(
             groupSessionUsedMillis = (groupSessionUsed - sessionExtension).coerceAtLeast(0L),
             planActive = session.planActive,
             planRemainingMillis = NonRootSessionPolicy.planRemainingMillis(session, nowElapsed),
+            grouped = group != null,
         )
         return EvaluationResult(
             packageName = packageName,
@@ -1263,16 +1269,24 @@ class ForegroundControlCoordinator(
                 "planHandled=${result.session.planPromptHandled}",
         )
         val parentOverride = if (
-            result.decision.blockingReason != null &&
             result.settings.childLockEnabled
         ) {
             getParentOverride(result.packageName, result.session.sessionId)
         } else {
             ParentOverrideStatus.NONE
         }
+        if (parentOverride.pending) {
+            scheduleEvaluation(result.packageName, 250L)
+            return
+        }
+        if (parentOverride.pendingExpired) {
+            fallbackToHome(result.packageName, result.settings, "parent_activation_timeout")
+            return
+        }
         if (parentOverride.granted) {
             activeParentOverridePackages += result.packageName
             clearActiveRestriction(result.packageName, "parent_override")
+            maybeShowOpenUsageTip(result, parentOverride.remainingMillis)
             log(
                 result.packageName,
                 "TEMPORARY_OVERRIDE_ACTIVATED",
@@ -1310,6 +1324,7 @@ class ForegroundControlCoordinator(
                     showPlanPrompt(result)
                     return
                 }
+                maybeShowOpenUsageTip(result)
                 scheduleNext(result)
             }
 
@@ -1645,6 +1660,24 @@ class ForegroundControlCoordinator(
         }
     }
 
+    private fun maybeShowOpenUsageTip(result: EvaluationResult, pinRemaining: Long? = null) {
+        if (openTipPendingPackage != result.packageName || !interactive ||
+            foregroundPackage != result.packageName || overlay.isShowing) return
+        openTipPendingPackage = null
+        if (!result.settings.openUsageTipEnabled || (!result.rule.enabled && result.group?.enabled != true)) return
+        val label = runCatching {
+            appContext.packageManager.getApplicationLabel(appContext.packageManager.getApplicationInfo(result.packageName, 0)).toString()
+        }.getOrDefault(result.packageName)
+        val message = com.liuml.apptimelimiter.core.OpenUsageTipPolicy.message(label,
+            result.appReminderUsedMillis, pinRemaining ?: result.decision.nextThresholdMillis,
+            pinRemaining != null, isEnglish(result.settings))
+        val claimed = runCatching {
+            appContext.contentResolver.call(RuleContract.CONTENT_URI, RuleContract.METHOD_CLAIM_OPEN_USAGE_TIP,
+                result.packageName, null)?.getBoolean(RuleContract.KEY_OK, false) == true
+        }.getOrDefault(false)
+        if (claimed) overlay.showUsageTip(result.packageName, message, isEnglish(result.settings))
+    }
+
     private fun maybeShowUsageMilestoneReminder(result: EvaluationResult) {
         if (!result.settings.usageMilestoneReminderEnabled ||
             (!result.rule.enabled && result.group?.enabled != true)
@@ -1654,12 +1687,9 @@ class ForegroundControlCoordinator(
         }
         val milestone = UsageMilestonePolicy.reachedIndex(result.appReminderUsedMillis)
         if (milestone <= 0 || !usageMilestoneNotifier.canPost()) return
-        if (!usageMilestoneNotifier.show(result.packageName, result.appReminderUsedMillis, isEnglish(result.settings))) {
-            log(result.packageName, "USAGE_MILESTONE_NOTIFICATION_FAILED", "milestone=$milestone", "WARN")
-            return
-        }
         val day = LocalDate.now()
-        val claimed = runCatching {
+        val owner = java.util.UUID.randomUUID().toString()
+        fun updateClaim(phase: String): Boolean = runCatching {
             appContext.contentResolver.call(
                 RuleContract.CONTENT_URI,
                 RuleContract.METHOD_CLAIM_USAGE_MILESTONE_REMINDER,
@@ -1667,12 +1697,19 @@ class ForegroundControlCoordinator(
                 android.os.Bundle().apply {
                     putString(RuleContract.KEY_DAY_TOKEN, day.toString())
                     putInt(RuleContract.KEY_USAGE_MILESTONE_INDEX, milestone)
+                    putString("milestone_phase", phase)
+                    putString("milestone_owner", owner)
                 },
             )?.getBoolean(RuleContract.KEY_OK, false) == true
         }.getOrDefault(false)
-        if (!claimed) {
-            usageMilestoneNotifier.cancel(result.packageName)
+        if (!updateClaim("reserve")) return
+        if (!usageMilestoneNotifier.show(result.packageName, result.appReminderUsedMillis, isEnglish(result.settings))) {
+            updateClaim("cancel")
+            log(result.packageName, "USAGE_MILESTONE_NOTIFICATION_FAILED", "milestone=$milestone", "WARN")
             return
+        }
+        if (!updateClaim("confirm")) {
+            log(result.packageName, "USAGE_MILESTONE_CONFIRM_FAILED", "milestone=$milestone", "WARN")
         }
         log(result.packageName, "USAGE_MILESTONE_NOTIFICATION_SHOWN", "milestone=$milestone")
     }
@@ -1855,7 +1892,19 @@ class ForegroundControlCoordinator(
             "NON_ROOT_LIMIT_TRIGGERED",
             "reason=$reason, incident=$incidentId, new=$newIncident, cooldownEnd=$cooldownEnd",
         )
+        val recordShizukuFallback: (String) -> Unit = { outcome ->
+            if (result.settings.accessibilityForceStopEnhancement ==
+                com.liuml.apptimelimiter.data.ForceStopEnhancement.SHIZUKU && incidentId.isNotBlank()) {
+                diagnostics.recordIncident(packageName, incidentId, "SHIZUKU_FALLBACK", outcome)
+            }
+        }
         val finishAction: (Boolean) -> Unit = { targetForceStopped ->
+            if (targetForceStopped || reason == NonRootBlockReason.SESSION_PLAN) {
+                runCatching { appContext.contentResolver.call(RuleContract.CONTENT_URI,
+                    RuleContract.METHOD_FINISH_CONTROL_RESTRICTION, packageName, Bundle().apply {
+                        putString(RuleContract.KEY_PROCESS_SESSION_ID, result.session.sessionId)
+                    }) }
+            }
             if (reason == NonRootBlockReason.SESSION_PLAN) {
                 if (foregroundPackage == packageName) {
                     fallbackToHome(
@@ -1890,6 +1939,7 @@ class ForegroundControlCoordinator(
                                     "target still reported foreground after force-stop",
                                     "WARN",
                                 )
+                                recordShizukuFallback("HOME_REQUESTED")
                                 fallbackToHome(
                                     packageName = packageName,
                                     settings = result.settings,
@@ -1915,8 +1965,11 @@ class ForegroundControlCoordinator(
                             incidentId = incidentId.ifBlank {
                                 "nonroot:${packageName}:${result.session.sessionId}"
                             },
-                        )
+                        ).also { shown ->
+                            recordShizukuFallback(if (shown) "BREAK_PAGE_REQUESTED" else "BREAK_PAGE_FAILED")
+                        }
                     ) {
+                        recordShizukuFallback("HOME_REQUESTED")
                         fallbackToHome(
                             packageName = packageName,
                             settings = result.settings,
@@ -1926,7 +1979,7 @@ class ForegroundControlCoordinator(
                 }
             }
         }
-        val executeRestriction = {
+        val executeRestriction = execute@ {
         val restrictionRequest = RestrictionRequest(
             packageName = packageName,
             groupId = result.group?.id.orEmpty(),
@@ -1943,6 +1996,22 @@ class ForegroundControlCoordinator(
             allowPin = result.settings.childLockEnabled,
             allowAd = reason == NonRootBlockReason.QUOTA,
         )
+        if (!isRestrictionRequestCurrent(restrictionRequest)) return@execute
+        val runtime = runCatching {
+            appContext.contentResolver.call(RuleContract.CONTENT_URI, RuleContract.METHOD_ENTER_CONTROL_RESTRICTION,
+                packageName, Bundle().apply {
+                    putString(RuleContract.KEY_PROCESS_SESSION_ID, restrictionRequest.sessionId)
+                    putString(RuleContract.KEY_INCIDENT_ID, restrictionRequest.incidentId)
+                    putLong(RuleContract.KEY_VERSION, restrictionRequest.ruleVersion)
+                    putLong(RuleContract.KEY_GROUP_VERSION, restrictionRequest.groupVersion)
+                    putLong(RuleContract.KEY_PROTECTION_MODE_GENERATION, restrictionRequest.modeGeneration)
+                })
+        }.getOrNull()
+        if (runtime?.getString(RuleContract.KEY_MESSAGE) == "parent_allowance_exists") return@execute
+        if (runtime?.getBoolean(RuleContract.KEY_OK, false) != true) {
+            fallbackToHome(packageName, result.settings, "runtime_authority_failed")
+            return@execute
+        }
         if (
             result.settings.accessibilityForceStopEnhancement ==
                 com.liuml.apptimelimiter.data.ForceStopEnhancement.SHIZUKU &&
@@ -1967,6 +2036,8 @@ class ForegroundControlCoordinator(
                         "falling back to restriction page",
                     "ERROR",
                 )
+                diagnostics.recordIncident(packageName, restrictionRequest.incidentId,
+                    "SHIZUKU_FORCE_STOP_RESULT", "TIMEOUT")
                 finishAction(false)
             }
             handler.postDelayed(timeout, SHIZUKU_EXECUTION_TIMEOUT_MILLIS)
@@ -1989,6 +2060,8 @@ class ForegroundControlCoordinator(
                         "SHIZUKU_FORCE_STOP",
                         "result=$execution",
                     )
+                    diagnostics.recordIncident(packageName, restrictionRequest.incidentId,
+                        "SHIZUKU_FORCE_STOP_RESULT", execution.name)
                     finishAction(execution == ShizukuExecutionResult.SUCCESS)
                 }
             }
@@ -1998,7 +2071,16 @@ class ForegroundControlCoordinator(
                 com.liuml.apptimelimiter.data.ForceStopEnhancement.ROOT
         ) {
             log(packageName, "ROOT_AUTH_REQUESTED", "first execution is user initiated")
-            executor.execute {
+            executor.execute rootTask@ {
+                val latest = repository.getGlobalSettings()
+                if (latest.protectionMode != result.settings.protectionMode ||
+                    latest.protectionModeGeneration != restrictionRequest.modeGeneration ||
+                    repository.getRule(packageName).version != restrictionRequest.ruleVersion ||
+                    (repository.groupForPackage(packageName)?.version ?: 0L) != restrictionRequest.groupVersion ||
+                    com.liuml.apptimelimiter.security.ParentAuthStore.hasAllowance(
+                        com.liuml.apptimelimiter.core.TemporaryOverrideIdentity(packageName, restrictionRequest.sessionId,
+                            restrictionRequest.ruleVersion, restrictionRequest.groupVersion, restrictionRequest.modeGeneration),
+                        SystemClock.elapsedRealtime())) return@rootTask
                 val rootResult = rootExecutor.execute(restrictionRequest)
                 handler.post {
                     if (destroyed) return@post
@@ -2044,6 +2126,10 @@ class ForegroundControlCoordinator(
         val settings = repository.getGlobalSettings()
         val currentRule = repository.getRule(request.packageName)
         val currentGroup = repository.groupForPackage(request.packageName)
+        if (settings.childLockEnabled && com.liuml.apptimelimiter.security.ParentAuthStore.hasAllowance(
+                com.liuml.apptimelimiter.core.TemporaryOverrideIdentity(request.packageName, request.sessionId,
+                    currentRule.version, currentGroup?.version ?: 0L, settings.protectionModeGeneration),
+                SystemClock.elapsedRealtime())) return false
         val currentSession = sessions[request.packageName]
             ?: runtimeStore.loadSession(request.packageName)
         val requestedToken = ControlSessionToken(
@@ -2240,11 +2326,18 @@ class ForegroundControlCoordinator(
         handler.post(poll)
     }
 
+    private var pendingActivationKey = ""
+    private var pendingActivationUntil = 0L
+
     private fun getParentOverride(packageName: String, sessionId: String): ParentOverrideStatus {
+        if (interactive && foregroundPackage == packageName) {
+            com.liuml.apptimelimiter.security.ControlResumeEvidence.reportAccessibilityForeground(packageName, sessionId, SystemClock.elapsedRealtime())
+        }
         val response = runCatching {
             appContext.contentResolver.call(
                 RuleContract.CONTENT_URI,
-                RuleContract.METHOD_HAS_PARENT_OVERRIDE,
+                if (interactive && foregroundPackage == packageName)
+                    RuleContract.METHOD_ACTIVATE_PARENT_OVERRIDE else RuleContract.METHOD_HAS_PARENT_OVERRIDE,
                 packageName,
                 Bundle().apply {
                     putString(RuleContract.KEY_PROCESS_SESSION_ID, sessionId)
@@ -2253,7 +2346,18 @@ class ForegroundControlCoordinator(
         }.getOrNull() ?: return ParentOverrideStatus.NONE
         val granted = response.getBoolean(RuleContract.KEY_OK, false) &&
             response.getBoolean(RuleContract.KEY_PARENT_AUTH_GRANTED, false)
-        if (!granted) return ParentOverrideStatus.NONE
+        if (!granted) {
+            if (response.getBoolean(RuleContract.KEY_PARENT_OVERRIDE_PENDING, false)) {
+                val key = "$packageName|$sessionId|${response.getLong("parent_pending_created_elapsed_ms", 0L)}"
+                if (key != pendingActivationKey) {
+                    pendingActivationKey = key
+                    pendingActivationUntil = SystemClock.elapsedRealtime() + 2_000L
+                }
+                if (SystemClock.elapsedRealtime() < pendingActivationUntil) return ParentOverrideStatus(false, 0L, 0L, pending = true)
+                return ParentOverrideStatus(false, 0L, 0L, pendingExpired = true)
+            }
+            return ParentOverrideStatus.NONE
+        }
         return ParentOverrideStatus(
             granted = true,
             expiresAtElapsedMillis = response.getLong(
@@ -2284,6 +2388,8 @@ class ForegroundControlCoordinator(
         val granted: Boolean,
         val expiresAtElapsedMillis: Long,
         val remainingMillis: Long,
+        val pending: Boolean = false,
+        val pendingExpired: Boolean = false,
     ) {
         companion object {
             val NONE = ParentOverrideStatus(false, 0L, 0L)

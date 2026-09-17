@@ -14,6 +14,9 @@ data class SharedCooldownRecord(
     val sourcePackage: String = "",
     val startedAtElapsedMillis: Long = 0L,
     val endsAtElapsedMillis: Long = 0L,
+    val bootCount: Int = -1,
+    // In-memory proof supplied by the boot-validating read boundary; never deserialize this.
+    val validatedBootCount: Int = -1,
 )
 
 enum class SharedCooldownClaimStatus {
@@ -69,6 +72,7 @@ object SharedCooldownPolicy {
         durationMillis: Long,
         nowMillis: Long,
         nowElapsedMillis: Long = 0L,
+        nowBootCount: Int = -1,
     ): SharedCooldownClaim {
         val handled = handledIncidentIds
             .asSequence()
@@ -92,7 +96,7 @@ object SharedCooldownPolicy {
                 handled,
             )
         }
-        val activeRemaining = remainingMillisDual(existingRecord, nowMillis, nowElapsedMillis)
+        val activeRemaining = remainingMillisDual(existingRecord, nowMillis, nowElapsedMillis, nowBootCount)
         if (activeRemaining > 0L) {
             return SharedCooldownClaim(
                 SharedCooldownClaimStatus.ABSORBED_BY_ACTIVE,
@@ -111,9 +115,11 @@ object SharedCooldownPolicy {
                 endsAtMillis = safeEnd,
                 incidentId = incidentId,
                 sourcePackage = sourcePackage,
+                bootCount = nowBootCount,
+                validatedBootCount = nowBootCount,
                 startedAtElapsedMillis = nowElapsedMillis,
                 endsAtElapsedMillis = if (nowElapsedMillis > 0L) {
-                    nowElapsedMillis + durationMillis
+                    safeAdd(nowElapsedMillis, safeEnd - nowMillis)
                 } else {
                     0L
                 },
@@ -140,20 +146,38 @@ object SharedCooldownPolicy {
         record: SharedCooldownRecord,
         nowWallMillis: Long,
         nowElapsedMillis: Long,
+        nowBootCount: Int = record.validatedBootCount,
     ): Long {
-        val wallRemaining = (record.endsAtMillis - nowWallMillis).coerceAtLeast(0L)
+        val duration = (record.endsAtMillis - record.startedAtMillis.coerceAtLeast(0L)).coerceAtLeast(0L)
+        val wallRemaining = (record.endsAtMillis - nowWallMillis.coerceAtLeast(0L)).coerceIn(0L, duration)
+        // An unavailable boot identity must never validate an old monotonic timestamp.
+        if (nowBootCount < 0 && record.endsAtMillis > 0L) return duration
         val elapsedRemaining = if (
-            record.startedAtElapsedMillis > 0L &&
-            record.endsAtElapsedMillis > record.startedAtElapsedMillis &&
+            record.bootCount >= 0 && record.bootCount == nowBootCount &&
+            record.startedAtElapsedMillis >= 0L &&
+            record.endsAtElapsedMillis >= record.startedAtElapsedMillis &&
             nowElapsedMillis >= record.startedAtElapsedMillis
         ) {
             (record.endsAtElapsedMillis - nowElapsedMillis).coerceAtLeast(0L)
         } else {
             wallRemaining
         }
-        // A manually advanced wall clock must not extend a cooldown; a manually moved-back
-        // clock must not make it longer than the monotonic deadline either.
-        return minOf(wallRemaining, elapsedRemaining)
+        // Wall-clock changes cannot shorten or extend a valid monotonic deadline.
+        return elapsedRemaining
+    }
+
+    /** Persist the returned value before exposing it to callers. Wall fields retain incident time. */
+    fun rebase(record: SharedCooldownRecord, nowWallMillis: Long, nowElapsedMillis: Long,
+        nowBootCount: Int): SharedCooldownRecord {
+        if (record.endsAtMillis <= 0L) return record
+        check(nowBootCount >= 0) { "Cooldown boot identity unavailable" }
+        if (record.bootCount == nowBootCount && record.startedAtElapsedMillis >= 0L &&
+            record.endsAtElapsedMillis >= record.startedAtElapsedMillis &&
+            nowElapsedMillis >= record.startedAtElapsedMillis) return record.copy(validatedBootCount = nowBootCount)
+        val remaining = remainingMillisDual(record, nowWallMillis, nowElapsedMillis, nowBootCount)
+        return record.copy(startedAtElapsedMillis = nowElapsedMillis,
+            endsAtElapsedMillis = safeAdd(nowElapsedMillis, remaining), bootCount = nowBootCount,
+            validatedBootCount = nowBootCount)
     }
 
     fun wallAndElapsedAreConsistent(

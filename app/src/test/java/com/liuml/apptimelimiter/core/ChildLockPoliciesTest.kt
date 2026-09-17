@@ -115,7 +115,7 @@ class ChildLockPoliciesTest {
                 2_000L,
             ),
         )
-        assertFalse(TemporaryParentOverridePolicy.isValid(granted, identity, false, 2_000L))
+        assertTrue(TemporaryParentOverridePolicy.isValid(granted, identity, false, 2_000L))
         assertFalse(TemporaryParentOverridePolicy.isValid(granted, identity, true, 61_000L))
     }
 

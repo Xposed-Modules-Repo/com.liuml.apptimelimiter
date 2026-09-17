@@ -1,5 +1,7 @@
 # Time Stop (Android)
 
+Restriction details can be expanded to show the main reason and other active limits, distinguishing app/group daily and session quotas, schedules, and cooldowns. Session plans still end with an exit and never start cooldowns. Expected availability considers all known release conditions; unknown session resets or usage data do not produce a promised time. Rules are checked again before access resumes.
+
 Precision app-time control for Android power users who want policy, telemetry, and enforcement in the same loop.
 
 Current development build: `0.11.22 (61)` Modern. Legacy migration builds are retained only for existing users completing the two-stage upgrade.
@@ -26,7 +28,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | --- | --- |
 | Independent app rules | Each app keeps its own enabled state, daily quota, per-launch quota, schedule windows, warning style, and cooldown behavior. The launcher-app list refreshes after package changes or returning to Time Stop and also supports pull-to-refresh. |
 | App groups and shared rules | Enable shared daily, continuous per-launch, weekly schedule, and cooldown rules for a group. Switching directly between members keeps one per-launch balance; leaving the group for the configured rest starts a new cycle. |
-| Control Lock and parent override | Optionally protects rule-changing settings with a private 4–8 digit PIN for family or personal use. PIN derivation runs off the UI thread, repeated submissions are suppressed, and an active lockout shows a live countdown instead of freezing or closing the manager. At a hard limit, a parent can temporarily allow only the current app session. |
+| Control Lock and parent override | Optionally protects rule-changing settings with a private 4–8 digit PIN for family or personal use. PIN derivation runs off the UI thread, repeated submissions are suppressed, and an active lockout shows a live countdown instead of freezing or closing the manager. At a hard limit, a parent can temporarily allow the target app until a fixed deadline, including app re-entry. |
 | Non-root basic protection | Uses content-blind accessibility foreground events and Android usage access. An opt-in enhanced compatibility mode adds package-only content-change events for ROMs that miss normal window events; it still retrieves no nodes, text, or input and adds no foreground service or continuous polling. |
 | Global protection mode | Select exactly one controller for all targets: LSPosed or Basic protection. Controllers never take over automatically. |
 | Optional force-stop enhancement | Basic protection can select the restriction page, Root, or Shizuku as one mutually exclusive limit action. Root and Shizuku only force-stop validated configured third-party targets; unavailable or failed actions fall back to the restriction page. |
@@ -41,7 +43,8 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Foreground-only accounting | Counts only the `onResume` to `onPause` phase. Background residency does not burn the quota. |
 | Warning UI | LSPosed Hook targets can show a five-second top or full-screen warning matching the selected global color, optionally vibrate once, and offer exit or a 1-60 minute extension. Pure non-root mode hides these Hook-only settings; its session plan offers exit or replan five seconds before expiry. |
 | Enforcement mode | Settings expose only actions supported by each engine. LSPosed force-exit closes the task and terminates the current Hook process; separate background processes may survive, while package-wide force-stop requires Standard protection + Shizuku. LSPosed also offers a themed standalone break page with an exit-to-Home action. Non-root basic protection offers the same styled restriction page or Shizuku force-stop, with automatic page fallback if Shizuku is unavailable or fails. |
-| Parent temporary override | With Control Lock enabled, each PIN verification selects 1-60 minutes and defaults to 5 minutes without remembering the previous choice. In the Modern build, switching to another app and returning keeps the override until its fixed deadline; expiry, screen-off, target-process end, or a rule/mode change still invalidates it. |
+| PIN allowance | Choose 1–60 minutes (default 5). The first successful PIN allowance each day is free across all apps; later allowances require PIN verification and a voluntarily watched rewarded ad. Time starts once the target resumes. Modern allowances survive screen-off, app re-entry and target/manager process recreation, without restriction or planning prompts before the fixed deadline. Reboot, relevant rule/mode changes, disabling Control Lock or expiry invalidate them. Ad failure or no reward keeps restrictions in place. |
+| Usage tip on app entry | Enabled by default for managed apps. Briefly shows today's usage and available time, or remaining PIN allowance. Independently switchable from half-hour reminders, without new permissions. |
 | Language | Supports system-default, Simplified Chinese, and English UI; Hook warnings use the same preference. |
 | Appearance | Offers health green, calm blue, and focus purple across all in-app and target-side surfaces, each with follow-system, light, and dark modes. Plan prompts, full-screen warnings, and restriction pages can also show built-in or custom time-reflection lines. |
 | Delay action | Lets the user add 1-60 minutes for normal time limits while keeping schedule blocks strict. |
@@ -72,6 +75,8 @@ toponLiveTestAds=false
 Set `toponLiveTestAds=true` only after registering the device as a TopOn test device. If any required local value is absent, real ad display safely fails and no temporary extension is granted.
 
 ## Architecture
+
+Enabling Root enhancement requests authorization from Time Stop, with a 30-second wait. Failure disables the selection and keeps basic protection active. Failed ads do not consume extensions; source errors are distinguished from explicit no-fill responses.
 
 ```mermaid
 flowchart LR
@@ -173,6 +178,8 @@ Time Stop is licensed as GPL-3.0-only. The current release includes the propriet
 
 ## Diagnostics
 
+Feedback shares a diagnostic log file through the system share sheet. Email apps receive the project support address, subject, issue template and attachment; review and send the message yourself. The feedback flow does not offer QQ-group feedback or copying logs as text.
+
 Open **Diagnostic Logs** from the home screen and check:
 
 - `RULE_SAVED`: the manager saved the rule.
@@ -249,3 +256,16 @@ Time Stop is free software licensed under GPL-3.0-only. You may use, study, modi
 redistribute it under the terms of the GNU General Public License version 3 only. See
 [LICENSE](LICENSE) for the complete terms. Third-party components remain under their respective
 licenses.
+# Reliability fixes — 2026-09-17
+
+The first daily free PIN allowance is reserved until the target resumes. An unused reservation expires after two minutes without spending it. Ad load timeouts allow a fresh request; stale callbacks cannot grant rewards. Normal-mode usage reminders deduplicate before display. Update checks recognize higher version codes with the same version name. Live ad availability still depends on ad-source fill.
+
+Daily statistics and weekly reports open details by tapping ring segments; outer app icons are decorative labels. Small shares, unavailable icons and icons omitted to avoid collisions are combined into gray Other. Its details list the aggregate and members without removing their time from the total.
+
+Statistics retain daily event identities across the retry window; identities already evicted by older versions cannot be recovered. Half-hour reminders reserve a node durably and count only confirmed displays. A process death between display and confirmation can cause a missed reminder or undercount, but the same node is not repeatedly displayed.
+
+Cooldown records distinguish the current boot from restart recovery. They use the monotonic clock within a boot and bounded wall-clock recovery followed by a persisted monotonic deadline after restart. Root force-stop verifies the current user's process table and falls back if termination cannot be confirmed.
+
+Diagnostics can be viewed as per-incident timelines or the original text log. Timelines stay on the device and contain package names, timestamps, control stages and outcomes, with hashed incident identifiers. PINs, authorization tokens and ad credentials are excluded. Retention is seven days and at most 10,000 records. Critical state events are staged in the control transaction and archived on demand when viewing or exporting diagnostics, without a background service. Old text logs are not guessed into complete event chains; missing diagnostics do not prove that an action did not occur. Feedback files include available structured events and are shared only by the user.
+
+Backup restore still replaces the whole portable configuration. Preview additions, modifications and deletions to rules, groups and settings before confirming. A configuration change after preview requires a fresh preview. The rollback snapshot, comparison and replacement share one write lock. PINs and runtime allowances are not part of portable backups.

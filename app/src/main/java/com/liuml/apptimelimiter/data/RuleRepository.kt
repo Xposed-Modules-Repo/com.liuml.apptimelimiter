@@ -6,12 +6,14 @@ import android.content.Intent
 import android.content.SharedPreferences
 import com.liuml.apptimelimiter.BuildConfig
 import com.liuml.apptimelimiter.backup.PortableBackupPolicy
+import com.liuml.apptimelimiter.backup.PortableBackupDiffPolicy
 import com.liuml.apptimelimiter.backup.PortableBackupV1
 import com.liuml.apptimelimiter.backup.PortableBackupValidationResult
 import com.liuml.apptimelimiter.backup.PortableGlobalSettings
 import com.liuml.apptimelimiter.core.SharedCooldownClaim
 import com.liuml.apptimelimiter.core.SharedCooldownPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownRecord
+import com.liuml.apptimelimiter.core.CooldownClock
 import com.liuml.apptimelimiter.core.SharedGroupSessionAction
 import com.liuml.apptimelimiter.core.SharedGroupSessionPolicy
 import com.liuml.apptimelimiter.core.SharedGroupSessionRecord
@@ -59,7 +61,11 @@ class RuleRepository(context: Context) {
         migrateLegacyExtensionDefaults()
     }
 
-    private fun migrateLegacyExtensionDefaults() {
+    private fun migrateLegacyExtensionDefaults() = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        migrateLegacyExtensionDefaultsLocked()
+    }
+
+    private fun migrateLegacyExtensionDefaultsLocked() {
         val hasSessionLimit = prefs.contains(KEY_EXTENSION_SESSION_LIMIT)
         val hasFreeDailyLimit = prefs.contains(KEY_EXTENSION_FREE_DAILY_LIMIT)
         val legacyDailyLimit = prefs.getLong(KEY_EXTENSION_DAILY_LIMIT, 3L).toInt()
@@ -252,7 +258,11 @@ class RuleRepository(context: Context) {
         )
     }
 
-    fun save(rule: AppRule): Boolean {
+    fun save(rule: AppRule): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        saveLocked(rule)
+    }
+
+    private fun saveLocked(rule: AppRule): Boolean {
         if (
             !PackageNamePolicy.isValid(rule.packageName) ||
             rule.packageName == appContext.packageName
@@ -434,6 +444,40 @@ class RuleRepository(context: Context) {
         }
     }
 
+    /** Checks whether a rewarded extension can be granted without consuming its quota. */
+    fun previewRewardedExtension(
+        packageName: String,
+        dayToken: String,
+        sessionId: String,
+    ): ExtensionQuotaDecision {
+        val settings = getGlobalSettings()
+        if (!settings.extensionEnabled) {
+            return ExtensionQuotaDecision(false, false, ExtensionQuotaState(), 0, 0, 0)
+        }
+        val group = groupForPackage(packageName)
+        val identity = group?.let { "group:${it.id}" } ?: "package:$packageName"
+        val safeSession = sessionId.take(160)
+        if (safeSession.isBlank()) throw IllegalArgumentException("missing_extension_session")
+        val globalPrefix = "runtime.extension.global.daily."
+        val sessionPrefix = "runtime.extension.$identity.session."
+        synchronized(STORAGE_LIFECYCLE_LOCK) {
+            return ExtensionQuotaPolicy.claimRewarded(
+                state = ExtensionQuotaState(
+                    dayToken = prefs.getString(globalPrefix + "day", "").orEmpty(),
+                    dailyUsedCount = prefs.getInt(globalPrefix + "count", 0),
+                    freeUsedCount = prefs.getInt(globalPrefix + "free_count", 0),
+                    sessionId = prefs.getString(sessionPrefix + "id", "").orEmpty(),
+                    sessionUsedCount = prefs.getInt(sessionPrefix + "count", 0),
+                ),
+                dayToken = dayToken.take(32),
+                sessionId = safeSession,
+                dailyLimit = settings.extensionDailyLimit,
+                sessionLimit = settings.extensionSessionLimit,
+                freeDailyLimit = settings.extensionFreeDailyLimit,
+            )
+        }
+    }
+
     private fun recordExtensionStatistic(
         packageName: String,
         dayToken: String,
@@ -462,7 +506,7 @@ class RuleRepository(context: Context) {
         }
 
     /** The first successful parent temporary unlock each local day does not request an ad. */
-    fun claimParentUnlockAdRequired(dayToken: String): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
+    fun isParentUnlockAdRequired(dayToken: String): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
         val day = dayToken.take(32)
         if (day.isBlank()) return@synchronized false
         val prefix = "runtime.parent_auth.daily."
@@ -471,25 +515,46 @@ class RuleRepository(context: Context) {
         } else {
             0
         }
-        if (!prefs.edit()
-                .putString(prefix + "day", day)
-                .putInt(prefix + "count", used + 1)
-                .commit()
-        ) return@synchronized false
         used >= 1
+    }
+
+    /** Counts only a successfully persisted temporary override; cancelled ad flows remain retryable. */
+    fun recordSuccessfulParentUnlock(dayToken: String): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        val day = dayToken.take(32)
+        if (day.isBlank()) return@synchronized false
+        val prefix = "runtime.parent_auth.daily."
+        val used = if (prefs.getString(prefix + "day", "") == day) {
+            prefs.getInt(prefix + "count", 0).coerceAtLeast(0)
+        } else {
+            0
+        }
+        prefs.edit()
+            .putString(prefix + "day", day)
+            .putInt(prefix + "count", (used + 1).coerceAtMost(Int.MAX_VALUE))
+            .commit()
     }
 
     fun exportPortableBackup(
         sourceVersionName: String,
         sourceVersionCode: Int,
         createdAtMillis: Long = System.currentTimeMillis(),
+        includeInactiveRules: Boolean = false,
+    ): PortableBackupV1 = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        exportPortableBackupLocked(sourceVersionName, sourceVersionCode, createdAtMillis, includeInactiveRules)
+    }
+
+    private fun exportPortableBackupLocked(
+        sourceVersionName: String,
+        sourceVersionCode: Int,
+        createdAtMillis: Long,
+        includeInactiveRules: Boolean,
     ): PortableBackupV1 {
         val portableRules = knownPackages()
             .asSequence()
             .filter(PackageNamePolicy::isValid)
             .filterNot { it == appContext.packageName }
             .map(::getRule)
-            .filter(AppRule::hasPersonalConfiguration)
+            .filter { includeInactiveRules || it.hasPersonalConfiguration() }
             .sortedBy(AppRule::packageName)
             .toList()
         val settings = getGlobalSettings()
@@ -504,6 +569,7 @@ class RuleRepository(context: Context) {
                 fullScreenExitWarningEnabled = settings.fullScreenExitWarningEnabled,
                 exitWarningVibrationEnabled = settings.exitWarningVibrationEnabled,
                 usageMilestoneReminderEnabled = settings.usageMilestoneReminderEnabled,
+                openUsageTipEnabled = settings.openUsageTipEnabled,
                 languageMode = settings.languageMode,
                 themeMode = settings.themeMode,
                 themeColor = settings.themeColor,
@@ -523,7 +589,11 @@ class RuleRepository(context: Context) {
     }
 
     /** Removes one retained app configuration, including membership in an imported group. */
-    fun deletePortableConfiguration(packageName: String): Boolean {
+    fun deletePortableConfiguration(packageName: String): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        deletePortableConfigurationLocked(packageName)
+    }
+
+    private fun deletePortableConfigurationLocked(packageName: String): Boolean {
         if (!PackageNamePolicy.isValid(packageName) || packageName == appContext.packageName) {
             return false
         }
@@ -583,6 +653,30 @@ class RuleRepository(context: Context) {
             packages.forEach(::grantRuleAccess)
             return true
         }
+    }
+
+    /**
+     * All portable writers (including bootstrap, migration and deletes) use the same process-wide
+     * lock. The manifest keeps the authority and its writers in the manager process. Never move
+     * the rollback callback outside this lock: it must persist exactly the compared snapshot.
+     * A stale preview or a failed rollback write must leave the configuration untouched.
+     */
+    fun compareAndReplacePortableConfiguration(
+        backup: PortableBackupV1,
+        expectedFingerprint: String,
+        persistRollback: (PortableBackupV1) -> Unit,
+    ): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        val normalized = PortableBackupPolicy.normalize(backup)
+        if (PortableBackupPolicy.validate(normalized, appContext.packageName) !is PortableBackupValidationResult.Valid) {
+            return@synchronized false
+        }
+        val current = exportPortableBackupLocked(
+            BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE, System.currentTimeMillis(),
+            includeInactiveRules = true,
+        )
+        PortableBackupDiffPolicy.requireCurrent(expectedFingerprint, current)
+        persistRollback(current)
+        replacePortableConfiguration(normalized)
     }
 
     fun isLegacyMigrationAuthorityConfirmed(): Boolean {
@@ -693,7 +787,11 @@ class RuleRepository(context: Context) {
     fun newGroupId(): String = UUID.randomUUID().toString()
 
     /** Returns false when membership conflicts with another group or persistence fails. */
-    fun saveGroup(group: AppGroup): Boolean {
+    fun saveGroup(group: AppGroup): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        saveGroupLocked(group)
+    }
+
+    private fun saveGroupLocked(group: AppGroup): Boolean {
         val groupId = group.id.trim()
         if (groupId.isBlank() || groupId.length > MAX_GROUP_ID_LENGTH ||
             groupId.any { !it.isLetterOrDigit() && it != '-' && it != '_' }
@@ -795,10 +893,11 @@ class RuleRepository(context: Context) {
         return persisted
     }
 
-    fun getGroupCooldownRecord(groupId: String): SharedCooldownRecord {
-        if (groupId.isBlank()) return SharedCooldownRecord()
+    fun getGroupCooldownRecord(groupId: String): SharedCooldownRecord = synchronized(GROUP_COOLDOWN_LOCK) {
+        CooldownClock.requireOwner(appContext, prefs)
+        if (groupId.isBlank()) return@synchronized SharedCooldownRecord()
         val prefix = groupPrefix(groupId)
-        return SharedCooldownRecord(
+        val stored = SharedCooldownRecord(
             startedAtMillis = prefs.getLong("${prefix}runtime_cooldown_started_at", 0L),
             endsAtMillis = prefs.getLong("${prefix}runtime_cooldown_ends_at", 0L),
             incidentId = prefs.getString("${prefix}runtime_cooldown_incident", null).orEmpty(),
@@ -808,7 +907,18 @@ class RuleRepository(context: Context) {
             ).orEmpty(),
             startedAtElapsedMillis = prefs.getLong("${prefix}runtime_cooldown_started_elapsed_at", 0L),
             endsAtElapsedMillis = prefs.getLong("${prefix}runtime_cooldown_ends_elapsed_at", 0L),
+            bootCount = prefs.getInt("${prefix}runtime_cooldown_boot_count", -1),
         )
+        val record = SharedCooldownPolicy.rebase(stored, System.currentTimeMillis(),
+            SystemClock.elapsedRealtime(), CooldownClock.bootCount(appContext))
+        if (record.copy(validatedBootCount = -1) != stored) {
+            CooldownClock.commit(prefs, prefs.edit()
+                .putLong("${prefix}runtime_cooldown_started_elapsed_at", record.startedAtElapsedMillis)
+                .putLong("${prefix}runtime_cooldown_ends_elapsed_at", record.endsAtElapsedMillis)
+                .putInt("${prefix}runtime_cooldown_boot_count", record.bootCount))
+            makePreferencesReadable()
+        }
+        record
     }
 
     /**
@@ -826,13 +936,14 @@ class RuleRepository(context: Context) {
                 record,
                 nowMillis,
                 SystemClock.elapsedRealtime(),
+                CooldownClock.bootCount(appContext),
             ) > 0L
         ) {
             return@synchronized null
         }
         val editor = prefs.edit()
         removeGroupCooldownRuntime(editor, groupPrefix(groupId))
-        if (!editor.commit()) return@synchronized null
+        CooldownClock.commit(prefs, editor)
         makePreferencesReadable()
         record
     }
@@ -846,6 +957,8 @@ class RuleRepository(context: Context) {
         nowMillis: Long = System.currentTimeMillis(),
         nowElapsedMillis: Long = SystemClock.elapsedRealtime(),
     ): SharedCooldownClaim = synchronized(GROUP_COOLDOWN_LOCK) {
+        val cooldownBoot = CooldownClock.bootCount(appContext)
+        check(durationMillis <= 0L || cooldownBoot >= 0) { "Cooldown boot identity unavailable" }
         val prefix = groupPrefix(groupId)
         val handledKey = "${prefix}runtime_cooldown_handled_incidents"
         val handled = prefs.getString(handledKey, null)
@@ -862,6 +975,7 @@ class RuleRepository(context: Context) {
             durationMillis = durationMillis,
             nowMillis = nowMillis,
             nowElapsedMillis = nowElapsedMillis,
+            nowBootCount = cooldownBoot,
         )
         val editor = prefs.edit()
             .putString(handledKey, claim.handledIncidentIds.joinToString("\n"))
@@ -872,8 +986,9 @@ class RuleRepository(context: Context) {
                     claim.record.startedAtMillis,
                 )
                 .putLong("${prefix}runtime_cooldown_ends_at", claim.record.endsAtMillis)
-                .putLong("${prefix}runtime_cooldown_started_elapsed_at", nowElapsedMillis)
-                .putLong("${prefix}runtime_cooldown_ends_elapsed_at", nowElapsedMillis + (claim.record.endsAtMillis - nowMillis).coerceAtLeast(0L))
+                .putLong("${prefix}runtime_cooldown_started_elapsed_at", claim.record.startedAtElapsedMillis)
+                .putLong("${prefix}runtime_cooldown_ends_elapsed_at", claim.record.endsAtElapsedMillis)
+                .putInt("${prefix}runtime_cooldown_boot_count", claim.record.bootCount)
                 .putString("${prefix}runtime_cooldown_incident", claim.record.incidentId)
                 .putString(
                     "${prefix}runtime_cooldown_source_package",
@@ -882,7 +997,7 @@ class RuleRepository(context: Context) {
         } else {
             removeGroupCooldownRuntime(editor, prefix)
         }
-        check(editor.commit()) { "Failed to persist group cooldown state" }
+        CooldownClock.commit(prefs, editor)
         makePreferencesReadable()
         claim
     }
@@ -962,7 +1077,11 @@ class RuleRepository(context: Context) {
         update
     }
 
-    fun deleteGroup(groupId: String): Boolean {
+    fun deleteGroup(groupId: String): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        deleteGroupLocked(groupId)
+    }
+
+    private fun deleteGroupLocked(groupId: String): Boolean {
         val existing = getGroup(groupId) ?: return true
         val prefix = groupPrefix(groupId)
         val groupIds = prefs.getStringSet(KEY_GROUP_IDS, emptySet()).orEmpty().toMutableSet()
@@ -1019,6 +1138,7 @@ class RuleRepository(context: Context) {
             KEY_USAGE_MILESTONE_REMINDER_ENABLED,
             false,
         ),
+        openUsageTipEnabled = prefs.getBoolean("global.open_usage_tip_enabled", true),
         languageMode = prefs.getString(KEY_LANGUAGE_MODE, AppLanguageMode.SYSTEM.name)
             ?.let { runCatching { AppLanguageMode.valueOf(it) }.getOrNull() }
             ?: AppLanguageMode.SYSTEM,
@@ -1078,7 +1198,11 @@ class RuleRepository(context: Context) {
         )
     }
 
-    fun saveGlobalSettings(settings: GlobalSettings): Boolean {
+    fun saveGlobalSettings(settings: GlobalSettings): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        saveGlobalSettingsLocked(settings)
+    }
+
+    private fun saveGlobalSettingsLocked(settings: GlobalSettings): Boolean {
         val previousMode = readProtectionMode()
         val previousGeneration = prefs.getLong(
             KEY_PROTECTION_MODE_GENERATION,
@@ -1106,6 +1230,7 @@ class RuleRepository(context: Context) {
                 settings.usageMilestoneReminderEnabled,
             )
             .putString(KEY_LANGUAGE_MODE, settings.languageMode.name)
+            .putBoolean("global.open_usage_tip_enabled", settings.openUsageTipEnabled)
             .putString(KEY_THEME_MODE, settings.themeMode.name)
             .putString(KEY_THEME_COLOR, settings.themeColor.name)
             .putBoolean(KEY_TIME_QUOTES_ENABLED, settings.timeQuotesEnabled)
@@ -1260,6 +1385,7 @@ class RuleRepository(context: Context) {
                 KEY_USAGE_MILESTONE_REMINDER_ENABLED,
                 portable.usageMilestoneReminderEnabled,
             )
+            .putBoolean("global.open_usage_tip_enabled", portable.openUsageTipEnabled)
             .putString(KEY_LANGUAGE_MODE, portable.languageMode.name)
             .putString(KEY_THEME_MODE, portable.themeMode.name)
             .putString(KEY_THEME_COLOR, portable.themeColor.name)
@@ -1403,6 +1529,7 @@ class RuleRepository(context: Context) {
             .remove("${prefix}runtime_cooldown_source_package")
             .remove("${prefix}runtime_cooldown_started_elapsed_at")
             .remove("${prefix}runtime_cooldown_ends_elapsed_at")
+            .remove("${prefix}runtime_cooldown_boot_count")
     }
 
     private fun removeGroupSessionRuntime(

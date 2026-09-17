@@ -7,6 +7,8 @@ enum class ControlRuntimeState {
     EVALUATING,
     LIMIT_CLAIMED,
     WAITING_PARENT_AUTH,
+    WAITING_AD,
+    OVERRIDE_PENDING,
     OVERRIDE_ACTIVE,
     EXECUTING_RESTRICTION,
     RESTRICTION_VISIBLE,
@@ -58,12 +60,19 @@ object ControlRuntimeStatePolicy {
         ControlRuntimeState.LIMIT_CLAIMED -> to == ControlRuntimeState.WAITING_PARENT_AUTH ||
             to == ControlRuntimeState.EXECUTING_RESTRICTION || to == ControlRuntimeState.CANCELLED
         ControlRuntimeState.WAITING_PARENT_AUTH -> to == ControlRuntimeState.OVERRIDE_ACTIVE ||
+            to == ControlRuntimeState.WAITING_AD || to == ControlRuntimeState.OVERRIDE_PENDING ||
+            to == ControlRuntimeState.EXECUTING_RESTRICTION || to == ControlRuntimeState.CANCELLED
+        ControlRuntimeState.WAITING_AD -> to == ControlRuntimeState.OVERRIDE_PENDING ||
+            to == ControlRuntimeState.EXECUTING_RESTRICTION || to == ControlRuntimeState.CANCELLED
+        ControlRuntimeState.OVERRIDE_PENDING -> to == ControlRuntimeState.OVERRIDE_ACTIVE ||
             to == ControlRuntimeState.EXECUTING_RESTRICTION || to == ControlRuntimeState.CANCELLED
         ControlRuntimeState.OVERRIDE_ACTIVE -> to == ControlRuntimeState.COOLDOWN_ACTIVE ||
             to == ControlRuntimeState.EXECUTING_RESTRICTION || to == ControlRuntimeState.CANCELLED
         ControlRuntimeState.EXECUTING_RESTRICTION -> to == ControlRuntimeState.RESTRICTION_VISIBLE ||
             to == ControlRuntimeState.CANCELLED
         ControlRuntimeState.RESTRICTION_VISIBLE -> to == ControlRuntimeState.WAITING_PARENT_AUTH ||
+            to == ControlRuntimeState.WAITING_AD ||
+            to == ControlRuntimeState.EXECUTING_RESTRICTION ||
             to == ControlRuntimeState.COOLDOWN_ACTIVE || to == ControlRuntimeState.CANCELLED
         ControlRuntimeState.COOLDOWN_ACTIVE -> to == ControlRuntimeState.EVALUATING || to == ControlRuntimeState.CANCELLED
         ControlRuntimeState.CANCELLED -> false

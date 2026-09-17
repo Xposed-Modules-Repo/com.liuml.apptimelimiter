@@ -18,8 +18,8 @@ android {
         applicationId = "com.liuml.apptimelimiter"
         minSdk = 27
         targetSdk = 35
-        versionCode = 61
-        versionName = "0.11.22"
+        versionCode = 62
+        versionName = "0.11.23"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         val topOnAppId = providers.gradleProperty("toponAppId").orElse("").get()
@@ -49,8 +49,8 @@ android {
         }
         create("modern") {
             dimension = "distribution"
-            versionCode = 61
-            versionName = "0.11.22"
+            versionCode = 62
+            versionName = "0.11.23"
             buildConfigField("boolean", "MODERN_XPOSED_ENABLED", "true")
             buildConfigField("boolean", "LEGACY_MIGRATION_EXPORT_ENABLED", "false")
         }

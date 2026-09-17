@@ -41,6 +41,28 @@ class NonRootSessionPlanOverlay(
         get() = isShowing ||
             SystemClock.elapsedRealtime() <= ignoreOwnWindowEventsUntilElapsedMillis
 
+    fun showUsageTip(packageName: String, message: String, english: Boolean): Boolean {
+        if (isShowing || message.isBlank()) return false
+        val settings = RuleRepository(service).getGlobalSettings()
+        val ui = OverlayUi(service, english, TargetUiPalette.resolve(service, settings.themeMode, settings.themeColor))
+        val view = TextView(service).apply {
+            text = message
+            textSize = 14f
+            setTextColor(ui.colors.onPrimaryContainer)
+            setPadding(ui.dp(16), ui.dp(12), ui.dp(16), ui.dp(12))
+            background = ui.rounded(ui.colors.primaryContainer, 16)
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        }
+        return attach(packageName, "USAGE_TIP", view, WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            PixelFormat.TRANSLUCENT,
+        ).apply { gravity = Gravity.TOP; y = ui.dp(32) }, onShown = {
+            view.postDelayed({ if (attachedView === view) dismiss("usage_tip_expired") }, 3_000L)
+        })
+    }
+
     fun showPlan(
         packageName: String,
         english: Boolean,
