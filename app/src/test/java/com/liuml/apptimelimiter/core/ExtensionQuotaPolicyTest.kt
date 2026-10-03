@@ -14,7 +14,7 @@ class ExtensionQuotaPolicyTest {
     }
 
     @Test
-    fun firstThreeDailyExtensionsAreFreeAndFourthRequiresAnAd() {
+    fun allDailyExtensionsAreFreeAndLegacyRewardsAreRejected() {
         val day = "2026-09-13"
         var state = ExtensionQuotaState()
         repeat(3) {
@@ -23,19 +23,19 @@ class ExtensionQuotaPolicyTest {
             state = claim.nextState
         }
         val fourth = ExtensionQuotaPolicy.claimFree(state, day, "session-3", 10, 3, 3)
-        assertFalse(fourth.allowed)
-        assertTrue(fourth.requiresAd)
-        assertEquals(7, fourth.remainingCount)
+        assertTrue(fourth.allowed)
+        assertFalse(fourth.requiresAd)
+        assertEquals(6, fourth.remainingCount)
 
         val rewarded = ExtensionQuotaPolicy.claimRewarded(fourth.nextState, day, "session-3", 10, 3, 3)
-        assertTrue(rewarded.allowed)
+        assertFalse(rewarded.allowed)
         assertEquals(6, rewarded.remainingCount)
     }
 
     @Test
-    fun `free extension quota remains fixed at three`() {
-        assertEquals(3, ExtensionQuotaPolicy.normalizeFreeDailyLimit(0, 10))
-        assertEquals(3, ExtensionQuotaPolicy.normalizeFreeDailyLimit(50, 10))
+    fun `legacy free quota cannot restrict free extensions`() {
+        assertEquals(10, ExtensionQuotaPolicy.normalizeFreeDailyLimit(0, 10))
+        assertEquals(10, ExtensionQuotaPolicy.normalizeFreeDailyLimit(50, 10))
         assertEquals(2, ExtensionQuotaPolicy.normalizeFreeDailyLimit(0, 2))
     }
 
@@ -88,6 +88,6 @@ class ExtensionQuotaPolicyTest {
         val claim = ExtensionQuotaPolicy.claimFree(old, "new", "new-session", 10, 3, 3)
         assertTrue(claim.allowed)
         assertEquals(9, claim.remainingCount)
-        assertEquals(2, claim.remainingFreeCount)
+        assertEquals(9, claim.remainingFreeCount)
     }
 }

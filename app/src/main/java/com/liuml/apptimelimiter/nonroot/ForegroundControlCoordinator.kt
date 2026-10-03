@@ -26,7 +26,6 @@ import com.liuml.apptimelimiter.core.ScheduleConstraint
 import com.liuml.apptimelimiter.core.ScheduleEvaluator
 import com.liuml.apptimelimiter.core.UsageReportingPolicy
 import com.liuml.apptimelimiter.core.UsageMilestonePolicy
-import com.liuml.apptimelimiter.core.RewardedAdPolicy
 import com.liuml.apptimelimiter.core.SharedCooldownPolicy
 import com.liuml.apptimelimiter.core.RestrictionExecutionResult
 import com.liuml.apptimelimiter.core.RestrictionRequest
@@ -42,7 +41,6 @@ import com.liuml.apptimelimiter.ipc.RuleContract
 import com.liuml.apptimelimiter.security.ChildLockRepository
 import com.liuml.apptimelimiter.statistics.DeviceUsageStatsRepository
 import com.liuml.apptimelimiter.statistics.UsageStatsRepository
-import com.liuml.apptimelimiter.ads.RewardedAdStateRepository
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.ZonedDateTime
@@ -79,13 +77,11 @@ class ForegroundControlCoordinator(
         mutableMapOf<String, SharedGroupSessionRecord>(),
     )
     private val groupSessionLocks = mutableMapOf<String, Any>()
-    private val pendingAdSessionResets = mutableMapOf<String, Runnable>()
     private val planPromptAttempts = mutableMapOf<String, Int>()
     private val recordedLimitIncidents = linkedSetOf<String>()
     private val lastSignalElapsedMillis = mutableMapOf<String, Long>()
     private val compatibilityRetryAfterElapsedMillis = mutableMapOf<String, Long>()
     private val activeParentOverridePackages = mutableSetOf<String>()
-    private val rewardedExtensionMillis = mutableMapOf<String, Long>()
     private var parentAuthTargetPackage: String? = null
     private var parentAuthTargetSessionId: String? = null
     private var lastRuntimeWarningToken = ""
@@ -320,7 +316,6 @@ class ForegroundControlCoordinator(
             )
             restoreInterruptedPlanPrompt(previous, "foreground_changed_to_$kind")
         }
-        cancelPendingAdSessionReset(packageName, repository.groupForPackage(packageName))
         cancelPendingActionForForeground(packageName, kind, "foreground_changed")
         overlay.dismiss("foreground_changed:$previous->$packageName")
         if (
@@ -809,42 +804,10 @@ class ForegroundControlCoordinator(
                 segment,
             )
         }
-        scheduleAdSessionReset(packageName, group, paused.graceEndsAtElapsedMillis, paused.sessionId)
         persistSession(paused, "background")
         recordForegroundDuration(packageName, segment, segmentDayToken)
     }
 
-    private fun adSessionResetKey(packageName: String, group: AppGroup?): String =
-        if (group != null) "group:${group.id}" else "package:$packageName"
-
-    private fun cancelPendingAdSessionReset(packageName: String, group: AppGroup?) {
-        val key = adSessionResetKey(packageName, group)
-        pendingAdSessionResets.remove(key)?.let(handler::removeCallbacks)
-    }
-
-    private fun scheduleAdSessionReset(
-        packageName: String,
-        group: AppGroup?,
-        resetAtElapsedMillis: Long,
-        sessionId: String,
-    ) {
-        val key = adSessionResetKey(packageName, group)
-        pendingAdSessionResets.remove(key)?.let(handler::removeCallbacks)
-        val delay = (resetAtElapsedMillis - SystemClock.elapsedRealtime()).coerceAtLeast(1L)
-        val callback = Runnable {
-            pendingAdSessionResets.remove(key)
-            val current = sessions[packageName] ?: runtimeStore.loadSession(packageName)
-            if (current?.sessionId != sessionId || current.foregroundStartedAtElapsedMillis > 0L) return@Runnable
-            if (group != null && groupPerLaunchSessions[group.id]?.activeOwnerId?.isNotBlank() == true) {
-                return@Runnable
-            }
-            val identity = if (group != null) "group:${group.id}" else "package:$packageName"
-            RewardedAdStateRepository(appContext).resetSession("$identity:session:$sessionId")
-            log(packageName, "REWARDED_AD_SESSION_RESET", "scope=$identity, session=${sessionId.take(40)}")
-        }
-        pendingAdSessionResets[key] = callback
-        handler.postDelayed(callback, delay)
-    }
 
     private fun stopNonRootForSelectedMode(packageName: String) {
         generation.incrementAndGet()
@@ -1065,11 +1028,7 @@ class ForegroundControlCoordinator(
             moduleSummaries[packageName]?.durationMillis ?: 0L,
             activeSegment,
         )
-        // A rewarded extension is granted to the current foreground session. Keeping it only
-        // under app/group identity would make an already-consumed reward reduce usage again in a
-        // later session. The daily quota remains shared by group in the private repository.
-        val dailyExtensionKey = rewardedExtensionKey(packageName, group, session.sessionId)
-        val sessionExtension = rewardedExtensionMillis[dailyExtensionKey] ?: 0L
+        val sessionExtension = repository.grantedExtensionMillis(packageName, session.sessionId)
         val appReminderUsed = maxOf(
             systemSummaries[packageName]?.durationMillis ?: 0L,
             appModuleUsed,
@@ -1180,45 +1139,6 @@ class ForegroundControlCoordinator(
         )
     }
 
-    private fun consumePendingRewardedAd(result: EvaluationResult): Boolean {
-        val response = runCatching {
-            appContext.contentResolver.call(
-                RuleContract.CONTENT_URI,
-                RuleContract.METHOD_CONSUME_REWARDED_AD,
-                result.packageName,
-                Bundle().apply {
-                    putString(RuleContract.KEY_AD_SESSION_ID, result.session.sessionId)
-                },
-            )
-        }.getOrNull()?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) } ?: return false
-        val reward = response.getLong(RuleContract.KEY_AD_REWARD_MILLIS, 0L)
-            .coerceIn(0L, RewardedAdPolicy.MAX_REWARD_MILLIS)
-        if (reward <= 0L) return false
-        val key = rewardedExtensionKey(
-            result.packageName,
-            result.group,
-            result.session.sessionId,
-        )
-        rewardedExtensionMillis[key] = ((rewardedExtensionMillis[key] ?: 0L) + reward)
-            .coerceAtMost(RewardedAdPolicy.MAX_REWARD_MILLIS)
-        log(
-            result.packageName,
-            "REWARDED_AD_REWARD_APPLIED",
-            "reward=${reward / 1000}s, scope=$key, session=${result.session.sessionId.take(40)}",
-        )
-        return true
-    }
-
-    private fun rewardedExtensionKey(
-        packageName: String,
-        group: AppGroup?,
-        sessionId: String,
-    ): String = buildString {
-        append(if (group != null) "group:${group.id}" else "package:$packageName")
-        append(":session:")
-        append(sessionId.take(160))
-    }
-
     private fun applyEvaluation(result: EvaluationResult) {
         val settings = repository.getGlobalSettings()
         if (!settings.protectionMode.usesNonRoot) {
@@ -1240,10 +1160,6 @@ class ForegroundControlCoordinator(
             clearPersistedSession(result.packageName, "rule_removed")
             clearActiveRestriction(result.packageName, "rule_removed")
             overlay.dismiss()
-            return
-        }
-        if (consumePendingRewardedAd(result)) {
-            scheduleEvaluation(result.packageName, 0L)
             return
         }
         if (

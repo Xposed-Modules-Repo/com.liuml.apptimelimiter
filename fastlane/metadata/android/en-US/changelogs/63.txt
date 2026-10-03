@@ -1,0 +1,5 @@
+Removed advertising SDKs; ordinary extensions are now free within daily/session limits.
+Added a shared daily PIN allowance limit: default 3, configurable 0–50.
+Refreshed interface, icons, two-level settings, keyboard and system-bar handling.
+Added per-app Root force-stop actions for outdated or failed Hooks.
+Improved restriction reasons, extension availability, statistics and weekly-report navigation.

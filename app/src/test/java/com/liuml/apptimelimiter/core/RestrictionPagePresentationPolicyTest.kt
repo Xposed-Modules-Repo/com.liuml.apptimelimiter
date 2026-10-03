@@ -6,54 +6,10 @@ import org.junit.Test
 
 class RestrictionPagePresentationPolicyTest {
     @Test
-    fun `temporary access is hidden when neither PIN nor ad is available`() {
+    fun `temporary access is hidden when neither PIN nor extension is available`() {
         assertFalse(RestrictionPagePresentationPolicy.showTemporaryAccess(false, false))
         assertTrue(RestrictionPagePresentationPolicy.showTemporaryAccess(true, false))
         assertTrue(RestrictionPagePresentationPolicy.showTemporaryAccess(false, true))
-    }
-
-    @Test
-    fun `consented ad request does not need a second confirmation`() {
-        assertTrue(RestrictionPagePresentationPolicy.shouldRequestAdImmediately(true))
-        assertFalse(RestrictionPagePresentationPolicy.shouldRequestAdImmediately(false))
-    }
-
-    @Test
-    fun `rewarded ad button is disabled for a known quota failure`() {
-        assertFalse(
-            RestrictionPagePresentationPolicy.canRequestRewardedAd(
-                isVisibleForRestriction = true,
-                extensionEnabled = true,
-                requestInFlight = false,
-                eligibilityFailure = "extension_session_limit_reached",
-            ),
-        )
-    }
-
-    @Test
-    fun `rewarded ad button stays available after a retryable load failure`() {
-        assertTrue(
-            RestrictionPagePresentationPolicy.canRequestRewardedAd(
-                isVisibleForRestriction = true,
-                extensionEnabled = true,
-                requestInFlight = false,
-                eligibilityFailure = null,
-            ),
-        )
-    }
-
-    @Test
-    fun `only quota and stale eligibility failures persist on the restriction page`() {
-        assertTrue(
-            RestrictionPagePresentationPolicy.isPersistentRewardedAdEligibilityFailure(
-                "extension_daily_limit_reached",
-            ),
-        )
-        assertFalse(
-            RestrictionPagePresentationPolicy.isPersistentRewardedAdEligibilityFailure(
-                "ad_eligibility_provider_failed",
-            ),
-        )
     }
 
     @Test

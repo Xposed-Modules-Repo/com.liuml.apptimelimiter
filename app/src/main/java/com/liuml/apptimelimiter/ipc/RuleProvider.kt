@@ -142,6 +142,8 @@ class RuleProvider : ContentProvider() {
                 }
             }
             denied("provider_exception")
+        }.also {
+            context?.let { ctx -> runCatching { ManagerControlDatabase.get(ctx).drainPinStatistics(ctx) } }
         }
     }
 
@@ -548,7 +550,7 @@ class RuleProvider : ContentProvider() {
                 }
                 val dayToken = extras?.getString(RuleContract.KEY_DAY_TOKEN).orEmpty()
                 val sessionId = extras?.getString(RuleContract.KEY_EXTENSION_SESSION_ID).orEmpty()
-                if (dayToken.isBlank() || dayToken.length > 32 || dayToken.any { it == '\n' || it == '\r' } ||
+                if (dayToken != LocalDate.now().toString() || dayToken.length > 32 || dayToken.any { it == '\n' || it == '\r' } ||
                     sessionId.isBlank() || sessionId.length > 160 || sessionId.any { it == '\n' || it == '\r' }) {
                     return denied("invalid_day_token")
                 }
@@ -571,220 +573,46 @@ class RuleProvider : ContentProvider() {
                 }
             }
 
-            RuleContract.METHOD_CHECK_REWARDED_AD_ELIGIBILITY -> {
-                val packageName = arg.orEmpty()
-                if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
-                if (Binder.getCallingUid() != Process.myUid()) return denied("manager_only")
-                if (!isConfiguredPackage(ruleRepository, packageName)) return denied("rule_not_configured")
-                val request = extras ?: return denied("missing_ad_request")
-                val tx = request.getString(RuleContract.KEY_AD_TRANSACTION_ID).orEmpty()
-                val session = request.getString(RuleContract.KEY_AD_SESSION_ID).orEmpty()
-                if (tx.isBlank() || tx.length > 100 || session.isBlank() || session.length > 160) {
-                    return denied("invalid_ad_identity")
-                }
-                val rule = ruleRepository.getRule(packageName)
-                val currentGroupVersion = ruleRepository.groupForPackage(packageName)?.version ?: 0L
-                val ruleVersion = request.getLong(RuleContract.KEY_AD_RULE_VERSION, Long.MIN_VALUE)
-                val groupVersion = request.getLong(RuleContract.KEY_AD_GROUP_VERSION, Long.MIN_VALUE)
-                val modeGeneration = request.getLong(RuleContract.KEY_AD_MODE_GENERATION, Long.MIN_VALUE)
-                if (rule.version != ruleVersion ||
-                    currentGroupVersion != groupVersion ||
-                    ruleRepository.getGlobalSettings().protectionModeGeneration != modeGeneration
-                ) return denied("stale_ad_request")
-                if (!ruleRepository.getGlobalSettings().extensionEnabled) return denied("extension_disabled")
-                val settings = ruleRepository.getGlobalSettings()
-                val configuredRewardMillis = settings.extensionSeconds
-                    .coerceIn(RuleRepository.MIN_LIMIT_SECONDS, RuleRepository.MAX_LIMIT_SECONDS) * 1_000L
-                val groupId = ruleRepository.groupForPackage(packageName)?.id.orEmpty()
-                val dailyIdentity = if (groupId.isBlank()) "package:$packageName" else "group:$groupId"
-                val sessionIdentity = "$dailyIdentity:session:$session"
-                val extensionDecision = runCatching {
-                    ruleRepository.previewRewardedExtension(packageName, LocalDate.now().toString(), session)
-                }.getOrNull() ?: return denied("rewarded_extension_quota_unavailable")
-                if (!extensionDecision.allowed) {
-                    val reason = if (extensionDecision.remainingCount <= 0) {
-                        "extension_daily_limit_reached"
-                    } else {
-                        "extension_session_limit_reached"
+            "request_free_extension", "get_free_extension" -> {
+                val pkg = arg.orEmpty()
+                val own = Binder.getCallingUid() == Process.myUid()
+                if (!PackageNamePolicy.isValid(pkg) || (!own && !isCallerAllowed(pkg))) return denied("caller_mismatch")
+                if (!isConfiguredPackage(ruleRepository, pkg)) return denied("rule_not_configured")
+                val session = extras?.getString(RuleContract.KEY_PROCESS_SESSION_ID).orEmpty()
+                if (session.isBlank() || session.length > 160) return denied("invalid_session")
+                if (method == "request_free_extension") {
+                    if (!own) return denied("manager_only")
+                    val id = runtimeToken(ruleRepository, pkg, session)
+                    val record = controlRuntime.read(id, SystemClock.elapsedRealtime())
+                    if (record == null || record.state != ControlRuntimeState.RESTRICTION_VISIBLE ||
+                        record.incident != extras?.getString(RuleContract.KEY_INCIDENT_ID)) return denied("stale_session")
+                    val rule = ruleRepository.getRule(pkg)
+                    val group = ruleRepository.groupForPackage(pkg)?.takeIf { it.enabled }
+                    val constraints = buildList {
+                        if (group == null && rule.enabled && rule.scheduleEnabled) add(com.liuml.apptimelimiter.core.ScheduleConstraint(rule.scheduleMode, rule.scheduleWindows))
+                        if (group?.scheduleEnabled == true) add(com.liuml.apptimelimiter.core.ScheduleConstraint(group.scheduleMode, group.scheduleWindows))
                     }
-                    return Bundle().apply {
-                        putBoolean(RuleContract.KEY_OK, false)
-                        putString(RuleContract.KEY_MESSAGE, reason)
-                        putInt(RuleContract.KEY_EXTENSION_REMAINING_COUNT, extensionDecision.remainingCount)
-                    }
-                }
-                val adDecision = runCatching {
-                    com.liuml.apptimelimiter.ads.RewardedAdStateRepository(appContext).previewClaim(
-                        dailyIdentity = dailyIdentity,
-                        sessionIdentity = sessionIdentity,
-                        dayToken = LocalDate.now().toString(),
-                        configuredExtensionMillis = configuredRewardMillis,
-                        ruleRemainingMillis = configuredRewardMillis,
-                        transactionId = tx,
-                    )
-                }.getOrNull() ?: return denied("rewarded_ad_quota_unavailable")
-                if (!adDecision.allowed) {
-                    return Bundle().apply {
-                        putBoolean(RuleContract.KEY_OK, false)
-                        putString(RuleContract.KEY_MESSAGE, "rewarded_ad_quota_reached")
-                        putInt(RuleContract.KEY_AD_DAILY_REMAINING_COUNT, adDecision.remainingDailyCount)
-                        putLong(RuleContract.KEY_AD_DAILY_REMAINING_MILLIS, adDecision.remainingDailyMillis)
-                    }
+                    if (!com.liuml.apptimelimiter.core.ScheduleEvaluator.evaluateAll(constraints, java.time.ZonedDateTime.now()).allowed)
+                        return denied("schedule_blocked")
+                    // A delay does not erase a cooling-off period, unlike an authenticated PIN allowance.
+                    if (ruleRepository.extensionRequiresCooldown(pkg)) return denied("cooldown_required")
+                    val request = extras?.getString("extension_request_id").orEmpty()
+                    if (request.isBlank() || request.length > 100) return denied("invalid_request")
+                    val claim = ruleRepository.claimExtension(pkg, LocalDate.now().toString(), session, request)
+                    if (!claim.allowed) return denied("extension_limit_reached")
                 }
                 Bundle().apply {
                     putBoolean(RuleContract.KEY_OK, true)
-                    putLong(RuleContract.KEY_AD_REWARD_MILLIS, adDecision.rewardMillis)
-                    putInt(RuleContract.KEY_EXTENSION_REMAINING_COUNT, extensionDecision.remainingCount)
-                    putInt(RuleContract.KEY_AD_DAILY_REMAINING_COUNT, adDecision.remainingDailyCount)
-                    putLong(RuleContract.KEY_AD_DAILY_REMAINING_MILLIS, adDecision.remainingDailyMillis)
+                    putLong("extension_total_millis", ruleRepository.grantedExtensionMillis(pkg, session))
                 }
             }
 
-            RuleContract.METHOD_CLAIM_REWARDED_AD -> {
-                val packageName = arg.orEmpty()
-                if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
-                if (Binder.getCallingUid() != Process.myUid()) return denied("manager_only")
-                if (!isConfiguredPackage(ruleRepository, packageName)) return denied("rule_not_configured")
-                val request = extras ?: return denied("missing_ad_request")
-                val tx = request.getString(RuleContract.KEY_AD_TRANSACTION_ID).orEmpty()
-                val session = request.getString(RuleContract.KEY_AD_SESSION_ID).orEmpty()
-                if (tx.isBlank() || tx.length > 100 || session.isBlank() || session.length > 160) {
-                    return denied("invalid_ad_identity")
-                }
-                val rule = ruleRepository.getRule(packageName)
-                val currentGroupVersion = ruleRepository.groupForPackage(packageName)?.version ?: 0L
-                val ruleVersion = request.getLong(RuleContract.KEY_AD_RULE_VERSION, Long.MIN_VALUE)
-                val groupVersion = request.getLong(RuleContract.KEY_AD_GROUP_VERSION, Long.MIN_VALUE)
-                val modeGeneration = request.getLong(RuleContract.KEY_AD_MODE_GENERATION, Long.MIN_VALUE)
-                if (rule.version != ruleVersion ||
-                    currentGroupVersion != groupVersion ||
-                    ruleRepository.getGlobalSettings().protectionModeGeneration != modeGeneration
-                ) return denied("stale_ad_request")
-                if (!ruleRepository.getGlobalSettings().extensionEnabled) {
-                    return denied("extension_disabled")
-                }
-                val controlIdentity = runtimeToken(ruleRepository, packageName, session)
-                val controlIncident = request.getString(RuleContract.KEY_INCIDENT_ID).orEmpty()
-                if (!controlRuntime.transition(controlIdentity, controlIncident, ControlRuntimeState.OVERRIDE_PENDING,
-                        SystemClock.elapsedRealtime())) return denied("stale_ad_control_event")
-                val configuredRewardMillis = ruleRepository.getGlobalSettings().extensionSeconds
-                    .coerceIn(
-                        RuleRepository.MIN_LIMIT_SECONDS,
-                        RuleRepository.MAX_LIMIT_SECONDS,
-                    ) * 1_000L
-                val groupId = ruleRepository.groupForPackage(packageName)?.id.orEmpty()
-                val dailyIdentity = if (groupId.isBlank()) "package:$packageName" else "group:$groupId"
-                val sessionIdentity = "$dailyIdentity:session:$session"
-                val decision = runCatching {
-                    com.liuml.apptimelimiter.ads.RewardedAdStateRepository(appContext).claim(
-                        dailyIdentity = dailyIdentity,
-                        sessionIdentity = sessionIdentity,
-                        dayToken = LocalDate.now().toString(),
-                        configuredExtensionMillis = configuredRewardMillis,
-                        ruleRemainingMillis = configuredRewardMillis,
-                        transactionId = tx,
-                    )
-                }.getOrNull() ?: return denied("ad_state_persist_failed")
-                if (!decision.allowed) return Bundle().apply {
-                    putBoolean(RuleContract.KEY_OK, false)
-                    putInt(RuleContract.KEY_AD_DAILY_REMAINING_COUNT, decision.remainingDailyCount)
-                    putLong(RuleContract.KEY_AD_DAILY_REMAINING_MILLIS, decision.remainingDailyMillis)
-                }
-                if (!putRewardedAdPending(packageName, session, tx, decision.rewardMillis,
-                        rule.version, currentGroupVersion, modeGeneration)) {
-                    com.liuml.apptimelimiter.ads.RewardedAdStateRepository(appContext).rollbackClaim(
-                        dailyIdentity = dailyIdentity,
-                        sessionIdentity = sessionIdentity,
-                        transactionId = tx,
-                        rewardMillis = decision.rewardMillis,
-                    )
-                    return denied("ad_pending_persist_failed")
-                }
-                val extensionDecision = runCatching {
-                    ruleRepository.claimRewardedExtension(
-                        packageName = packageName,
-                        dayToken = LocalDate.now().toString(),
-                        sessionId = session,
-                    )
-                }.getOrNull()
-                if (extensionDecision?.allowed != true) {
-                    removeRewardedAdPending(packageName, session, tx)
-                    com.liuml.apptimelimiter.ads.RewardedAdStateRepository(appContext).rollbackClaim(
-                        dailyIdentity, sessionIdentity, tx, decision.rewardMillis,
-                    )
-                    if (extensionDecision == null) return denied("rewarded_extension_quota_persist_failed")
-                    return Bundle().apply {
-                        putBoolean(RuleContract.KEY_OK, false)
-                        putInt(RuleContract.KEY_EXTENSION_REMAINING_COUNT, extensionDecision.remainingCount)
-                    }
-                }
-                Bundle().apply {
-                    putBoolean(RuleContract.KEY_OK, true)
-                    putLong(RuleContract.KEY_AD_REWARD_MILLIS, decision.rewardMillis)
-                    putInt(RuleContract.KEY_AD_DAILY_REMAINING_COUNT, decision.remainingDailyCount)
-                    putLong(RuleContract.KEY_AD_DAILY_REMAINING_MILLIS, decision.remainingDailyMillis)
-                }
-            }
-
-            RuleContract.METHOD_CONSUME_REWARDED_AD -> {
-                val packageName = arg.orEmpty()
-                if (!PackageNamePolicy.isValid(packageName) || !isCallerAllowed(packageName)) return denied("caller_mismatch")
-                val request = extras ?: return denied("missing_ad_consume_request")
-                val session = request.getString(RuleContract.KEY_AD_SESSION_ID).orEmpty()
-                val tx = request.getString(RuleContract.KEY_AD_TRANSACTION_ID).orEmpty()
-                if (session.isBlank()) return denied("invalid_ad_consume_identity")
-                synchronized(rewardedAdPendingLock) {
-                    val pending = readRewardedAdPending(packageName, session, tx)
-                        ?: return Bundle().apply { putBoolean(RuleContract.KEY_OK, false) }
-                    val rule = ruleRepository.getRule(packageName)
-                    if (rule.version != pending.ruleVersion ||
-                        (ruleRepository.groupForPackage(packageName)?.version ?: 0L) != pending.groupVersion ||
-                        ruleRepository.getGlobalSettings().protectionModeGeneration != pending.modeGeneration) {
-                        return denied("stale_ad_reward")
-                    }
-                    val runtimeIdentity = runtimeToken(ruleRepository, packageName, session)
-                    val runtime = controlRuntime.read(runtimeIdentity, SystemClock.elapsedRealtime())
-                        ?: return denied("stale_ad_control_session")
-                    if (!controlRuntime.transition(runtimeIdentity, runtime.incident, ControlRuntimeState.OVERRIDE_ACTIVE,
-                            SystemClock.elapsedRealtime())) return denied("ad_runtime_activation_failed")
-                    if (!removeRewardedAdPending(packageName, session, pending.transactionId)) {
-                        return denied("ad_reward_consume_failed")
-                    }
-                    return Bundle().apply {
-                        putBoolean(RuleContract.KEY_OK, true)
-                        putLong(RuleContract.KEY_AD_REWARD_MILLIS, pending.rewardMillis)
-                        putString(RuleContract.KEY_AD_TRANSACTION_ID, pending.transactionId)
-                    }
-                }
-            }
-
-            RuleContract.METHOD_RESET_REWARDED_AD_SESSION -> {
-                val packageName = arg.orEmpty()
-                if (!PackageNamePolicy.isValid(packageName)) return denied("invalid_package")
-                if (!isCallerAllowed(packageName)) return denied("caller_mismatch")
-                if (!isConfiguredPackage(ruleRepository, packageName)) return denied("rule_not_configured")
-                val session = extras?.getString(RuleContract.KEY_AD_SESSION_ID).orEmpty()
-                if (session.isBlank() || session.length > 160 || session.any { it == '\n' || it == '\r' }) {
-                    return denied("invalid_ad_session")
-                }
-                val groupId = ruleRepository.groupForPackage(packageName)?.id.orEmpty()
-                val dailyIdentity = if (groupId.isBlank()) "package:$packageName" else "group:$groupId"
-                val reset = runCatching {
-                    com.liuml.apptimelimiter.ads.RewardedAdStateRepository(appContext).resetSession(
-                        "$dailyIdentity:session:$session",
-                    )
-                }.isSuccess
-                if (!reset) return denied("ad_session_reset_failed")
-                if (ruleRepository.getGlobalSettings().diagnosticsEnabled) {
-                    DiagnosticsRepository(appContext).append(
-                        level = "INFO",
-                        packageName = packageName,
-                        event = "REWARDED_AD_SESSION_RESET",
-                        message = "identity=${dailyIdentity.take(80)}",
-                    )
-                }
-                Bundle().apply { putBoolean(RuleContract.KEY_OK, true) }
-            }
+            RuleContract.METHOD_CHECK_REWARDED_AD_ELIGIBILITY,
+            RuleContract.METHOD_CLAIM_REWARDED_AD,
+            RuleContract.METHOD_CONSUME_REWARDED_AD,
+            RuleContract.METHOD_RESET_REWARDED_AD_SESSION,
+            RuleContract.METHOD_MARK_PARENT_AUTH_VERIFIED_FOR_AD,
+            RuleContract.METHOD_MARK_PARENT_AUTH_AD_REWARDED -> denied("ads_disabled")
 
             RuleContract.METHOD_SYNC_GROUP_PER_LAUNCH_SESSION -> {
                 val packageName = arg.orEmpty()
@@ -1214,12 +1042,11 @@ class RuleProvider : ContentProvider() {
                                             ControlRuntimeState.OVERRIDE_PENDING, SystemClock.elapsedRealtime()))
                             } == true
                     },
-                    enforceDailyAd = true,
                     deferActivation = true,
                 )
-                    ?: return denied(if (granted && ParentAuthStore.needsAdForCompletion(token,
+                    ?: return denied(if (granted && ParentAuthStore.quotaExhausted(
                         System.currentTimeMillis(), SystemClock.elapsedRealtime()))
-                        "parent_ad_required" else "parent_auth_completion_failed")
+                        "parent_daily_limit_reached" else "parent_auth_completion_failed")
                 if (!granted && !controlRuntime.transition(
                         runtimeToken(ruleRepository, completed.challenge.identity.packageName,
                             completed.challenge.identity.processSessionId), completed.challenge.incidentId,
@@ -1251,33 +1078,6 @@ class RuleProvider : ContentProvider() {
                             parentOverride.expiresAtElapsedMillis,
                         )
                     }
-                }
-            }
-
-            RuleContract.METHOD_MARK_PARENT_AUTH_VERIFIED_FOR_AD -> {
-                if (Binder.getCallingUid() != Process.myUid()) return denied()
-                val token = extras?.getString(RuleContract.KEY_PARENT_AUTH_TOKEN)
-                    .orEmpty().take(MAX_BREAK_SESSION_TOKEN_LENGTH)
-                val verified = ParentAuthStore.markVerifiedWaitingForAd(token, System.currentTimeMillis())
-                    ?: return denied("parent_auth_verification_expired")
-                if (!controlRuntime.transition(runtimeToken(ruleRepository, verified.identity.packageName,
-                        verified.identity.processSessionId), verified.incidentId, ControlRuntimeState.WAITING_AD,
-                        SystemClock.elapsedRealtime())) return denied("runtime_ad_transition_failed")
-                Bundle().apply {
-                    putBoolean(RuleContract.KEY_OK, true)
-                    putString(RuleContract.KEY_PARENT_AUTH_STATUS, verified.status.name)
-                }
-            }
-
-            RuleContract.METHOD_MARK_PARENT_AUTH_AD_REWARDED -> {
-                if (Binder.getCallingUid() != Process.myUid()) return denied()
-                val token = extras?.getString(RuleContract.KEY_PARENT_AUTH_TOKEN)
-                    .orEmpty().take(MAX_BREAK_SESSION_TOKEN_LENGTH)
-                val rewarded = ParentAuthStore.markAdRewarded(token, System.currentTimeMillis())
-                    ?: return denied("parent_auth_ad_reward_rejected")
-                Bundle().apply {
-                    putBoolean(RuleContract.KEY_OK, true)
-                    putString(RuleContract.KEY_PARENT_AUTH_STATUS, rewarded.status.name)
                 }
             }
 
@@ -1613,68 +1413,6 @@ class RuleProvider : ContentProvider() {
         val newClaim: Boolean,
         val activeIncidentId: String,
     )
-
-    private data class PendingReward(
-        val rewardMillis: Long,
-        val transactionId: String,
-        val ruleVersion: Long,
-        val groupVersion: Long,
-        val modeGeneration: Long,
-    )
-
-    private fun putRewardedAdPending(
-        packageName: String,
-        sessionId: String,
-        transactionId: String,
-        rewardMillis: Long,
-        ruleVersion: Long,
-        groupVersion: Long,
-        modeGeneration: Long,
-    ): Boolean {
-        if (packageName.contains('|') || sessionId.contains('|') || transactionId.contains('|')) return false
-        val key = "${packageName.take(100)}.${sessionId.take(120)}"
-        return synchronized(rewardedAdPendingLock) {
-            context?.getSharedPreferences("rewarded_ad_pending_private", Context.MODE_PRIVATE)
-                ?.let {
-                    val existing = readRewardedAdPending(packageName, sessionId, "")
-                    if (existing != null && existing.transactionId != transactionId) return@synchronized false
-                    val nowElapsedMillis = SystemClock.elapsedRealtime()
-                    val nowWallMillis = System.currentTimeMillis()
-                    it.edit().putString(key, listOf(rewardMillis, transactionId.take(100), ruleVersion, groupVersion, modeGeneration)
-                        .joinToString("|"))
-                        .putLong("${key}.expires", safeAdd(nowElapsedMillis, REWARDED_AD_PENDING_TTL_MILLIS))
-                        .putLong("${key}.wall_expires", safeAdd(nowWallMillis, REWARDED_AD_PENDING_TTL_MILLIS))
-                        .commit()
-                } ?: false
-        }
-    }
-
-    private fun readRewardedAdPending(packageName: String, sessionId: String, transactionId: String): PendingReward? {
-        val key = "${packageName.take(100)}.${sessionId.take(120)}"
-        val prefs = context?.getSharedPreferences("rewarded_ad_pending_private", Context.MODE_PRIVATE) ?: return null
-        val raw = prefs.getString(key, null) ?: return null
-        val values = raw.split('|')
-        if (values.size != 5) return null
-        val pending = runCatching {
-            PendingReward(values[0].toLong(), values[1], values[2].toLong(), values[3].toLong(), values[4].toLong())
-        }.getOrNull()
-        val active = pending != null &&
-            (transactionId.isBlank() || pending.transactionId == transactionId) &&
-            prefs.getLong("${key}.expires", 0L) > SystemClock.elapsedRealtime() &&
-            prefs.getLong("${key}.wall_expires", 0L) > System.currentTimeMillis()
-        if (!active) {
-            prefs.edit().remove(key).remove("${key}.expires").remove("${key}.wall_expires").commit()
-            return null
-        }
-        return pending
-    }
-
-    private fun removeRewardedAdPending(packageName: String, sessionId: String, transactionId: String): Boolean {
-        val key = "${packageName.take(100)}.${sessionId.take(120)}"
-        val prefs = context?.getSharedPreferences("rewarded_ad_pending_private", Context.MODE_PRIVATE) ?: return false
-        if (prefs.getString(key, null)?.split('|')?.getOrNull(1) != transactionId) return false
-        return prefs.edit().remove(key).remove("${key}.expires").remove("${key}.wall_expires").commit()
-    }
 
     private fun isConfiguredPackage(repository: RuleRepository, packageName: String): Boolean {
         if (Binder.getCallingUid() == Process.myUid()) return true

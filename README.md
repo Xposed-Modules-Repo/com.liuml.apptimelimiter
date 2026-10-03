@@ -1,19 +1,23 @@
 # Time Stop
 
-限制页可展开查看主要原因及其他同时生效的限制，区分个人/分组每日额度、单次额度、时段和冷却。本次计划保持到期退出、不触发冷却的语义。预计可用时间同时考虑全部已知解除条件；单次重置时间或统计未知时不承诺具体时间，实际恢复时仍复检规则。
+The interface uses neutral grouped backgrounds, rounded cards and consistent line icons, with three accent colors and dark mode. Settings use a category directory and detail pages, preserving drafts on return. Bottom actions respect system bars and the keyboard. Both protection modes expose reminders and free extensions of 1–15 minutes; restriction pages show daily/session availability.
+
+LSPosed settings offer per-app Root force-stop actions for outdated or failed Hooks. Only configured, permitted targets are stopped; reopen them manually to verify the Hook. Missing scope or a disabled module still requires LSPosed configuration.
+
+Restriction pages explain personal and group quotas, session limits, schedules and cooldowns. Session plans exit at expiry without starting a cooldown. Availability estimates account for known restrictions and are rechecked when the app resumes.
 
 > Precision app-time control for Android power users who want policy, telemetry, and enforcement in the same loop.
 
 ![Android 8.1+](https://img.shields.io/badge/Android-8.1%2B-3DDC84?logo=android&logoColor=white)
 ![LSPosed API 93+](https://img.shields.io/badge/LSPosed-API%2093%2B-5C6BC0)
-![Version 0.11.22](https://img.shields.io/badge/version-0.11.22-2E7D5B)
+![Version 0.11.24](https://img.shields.io/badge/version-0.11.24-2E7D5B)
 ![License GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
 Stock screen-time tools are usually built for reports, daily caps, and focus modes. **Time Stop** is built for people who want sharper controls: per-app quotas, per-launch timers, weekly allow/block windows, shared group budgets, cooldowns after forced exits, Hook verification, and diagnostics that show what is actually happening inside the target process.
 
 [Latest release](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed module page](https://modules.lsposed.org/module/com.liuml.apptimelimiter/) · [Obtainium](#obtainium) · [中文说明](#中文说明)
 
-Current development build: `0.11.22 (61)` Modern. The legacy migration builds are retained only for existing users completing the two-stage upgrade.
+Current release: `0.11.24 (63)` Modern. The legacy migration builds are retained only for existing users completing the two-stage upgrade.
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -40,7 +44,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Control Lock and parent override | Optionally protects rule-changing settings with a private 4–8 digit PIN for family or personal use. PIN derivation runs off the UI thread, repeated submissions are suppressed, and an active lockout shows a live countdown instead of freezing or closing the manager. At a hard limit, a parent can temporarily allow the target app until a fixed deadline, including app re-entry. |
 | Non-root basic protection | Uses a content-blind accessibility service for foreground package changes plus Android usage access for daily calibration. An opt-in enhanced compatibility mode adds package-only content-change events for ROMs that miss normal window events; it still retrieves no nodes, text, input, or notifications and uses no foreground service or continuous polling. |
 | Optional force-stop enhancement | Basic protection selects one limit action: restriction page, Root force-stop, or Shizuku force-stop. Root and Shizuku only execute validated force-stops for configured third-party targets; missing permission, a stopped service, binder failure, or a protected package falls back to the restriction page. |
-| Rewarded extension | A user may voluntarily watch a rewarded ad only from Time Stop's restriction page to request a temporary extension. Privacy consent is required; only a confirmed reward grants time, and quotas, schedules, cooldowns, PIN, and group limits still apply. |
+| Free extension | All ordinary extensions are free within the daily and per-session limits; no ads are loaded or displayed. |
 | Daily cumulative mode | Uses the stronger source for each app: Android system usage when available, or Hook-local foreground accounting, then resets at local midnight. |
 | Per-launch mode | Starts a fresh foreground timer for the target process. If the process survives in the background, staying away for at least the configured cooldown counts as an effective rest and starts a new cycle. |
 | Session planning | Optionally asks for a 5, 10, 15, 30, or custom 1–60 minute plan when the target process first opens. Quick choices and a one-minute-step slider share one compact page, while the fixed footer keeps exit and skip actions visible. Values beyond the earliest remaining timed quota are rejected. |
@@ -50,7 +54,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Enforcement mode | Defaults to closing the task and terminating the current safe third-party Hook process. Separate background processes may survive; package-wide force-stop requires Standard protection + Shizuku. The themed standalone break page uses a 30-second, single-use internal token, offers an exit-to-Home action, and attempts to pause common media. Media-object hooks are installed only when a target process starts in break-page mode, so force-stop and reopen managed apps after switching modes. |
 | Language | Supports system-default, Simplified Chinese, and English UI; Hook warnings use the same preference. |
 | Appearance | Offers health green, calm blue, and focus purple across management and target-side surfaces, each with follow-system, light, and dark modes. |
-| Delay action | Lets the user add 1-60 minutes for normal time limits while keeping schedule blocks strict. |
+| Delay action | Lets the user add 1–15 minutes within daily and per-session extension limits while keeping schedule blocks strict. |
 | Post-exit cooldown | Blocks reopening for 1-1,440 minutes after a daily or per-launch quota event. A group uses one fixed shared cooldown window for all members; repeated openings never refresh its start or inflate limit-hit counts. Schedule denials do not start cooldown. |
 | Group sync loop | Grouped foreground apps synchronize daily and per-launch usage every 15 seconds without keeping the manager app alive. Cross-member handoff uses one persisted session and one incident ID. |
 | Hook and scope status | Registers the API 102 service listener at process creation, reads real scope when available, automatically requests scope for newly managed apps, and removes scope after the last personal or group rule is deleted. Framework confirmation is still required; unsupported frameworks keep the current-version Hook heartbeat fallback. |
@@ -60,20 +64,11 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 
 Changing a rule resets the Hook-local accumulator for that app, but Android's system usage for the current day remains part of the daily baseline when usage access is granted. That makes rule tweaking visible, not a loophole.
 
-## Local TopOn Configuration
+## Ad-free build and PIN limits
 
-TopOn credentials are read only from `%USERPROFILE%\.gradle\gradle.properties`; they are never stored in this repository, project `gradle.properties`, source code, diagnostics, backups, or Git. A local build that needs real rewarded-ad requests must provide:
+No advertising SDK, initialization, preload, display or rewards are included. Existing user-level ad credentials are not read or modified. Ordinary extensions are free within the configured daily and per-session limits. PIN unlocks share a manager-private daily limit across all apps: default 3, configurable 0–50. Zero blocks new unlocks without revoking active allowances.
 
-```properties
-toponAppId=<TopOn App ID>
-toponAppKey=<TopOn App Key>
-toponPlacementId=<rewarded_extension_v1 placement ID>
-toponTestMode=false
-# Debug uses the deterministic local reward simulation unless this is explicitly true.
-toponLiveTestAds=false
-```
-
-Set `toponLiveTestAds=true` only after registering the device as a TopOn test device. If any required local value is absent, real ad display safely fails and no temporary extension is granted.
+PIN verification reserves a slot; verified target foreground activation commits the fixed deadline and charges that local day. Cancellation, expiry and failed writes do not spend slots. Re-entry never renews the deadline. Management PIN verification is not subject to this quota. This device-private setting is excluded from portable backups and Hook rule mirrors.
 
 ## Architecture
 
@@ -171,7 +166,7 @@ Obtainium is a third-party updater. It does not change Time Stop's protection en
 
 ### F-Droid
 
-Time Stop is licensed as GPL-3.0-only so it can be submitted to F-Droid-compatible repositories. Packaging metadata is kept in `packaging/fdroid/`. Until the official F-Droid review is accepted, use GitHub Releases, LSPosed, Obtainium, or a self-hosted F-Droid repository.
+Time Stop is licensed as GPL-3.0-only. This build removes the advertising SDK. Official F-Droid eligibility has not been verified.
 
 ## Diagnostics
 
@@ -248,7 +243,7 @@ This tool should be used only by the device owner or on explicitly authorized ma
 
 [下载最新版本](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed 模块页面](https://modules.lsposed.org/module/com.liuml.apptimelimiter/)
 
-当前版本：`0.11.22 (61)` Modern 构建。传统迁移版仅用于存量用户完成两阶段升级。
+当前版本：`0.11.24 (63)` Modern 构建。传统迁移版仅用于存量用户完成两阶段升级。
 
 ## 它和系统屏幕时间有什么不同？
 
@@ -274,10 +269,10 @@ This tool should be used only by the device owner or on explicitly authorized ma
 | --- | --- |
 | 独立应用规则 | 每个应用分别保存启用状态、时间额度和时段计划，互不影响。 |
 | 应用分组与统一规则 | 可为一组应用统一开启共享每日额度、连续单次打开、可用时段和退出后冷却。组内成员切换时共享同一份单次余额；全组真正休息后才开始新轮次。 |
-| 全局保护模式 | 设置中三选一：LSPosed、普通保护、普通保护 + Shizuku。模式切换后目标应用需强停并重开，面板通过模式代次确认 Hook 已加载新配置。 |
+| 全局保护模式 | 设置中选择 LSPosed 或普通保护；普通保护可选限制页、Root 或 Shizuku 强停动作。模式切换后目标应用需强停并重开，面板通过模式代次确认 Hook 已加载新配置。 |
 | 非 Root 普通保护 | 通过无障碍服务感知前台包名，通过系统使用情况访问校准每日累计；可选“增强兼容检测”为漏发普通窗口事件的系统增加包名级内容变化事件，但仍不读取页面节点、文字、输入内容或通知，不启动前台常驻服务，也不持续轮询。 |
 | Shizuku 强停模式 | Shizuku 只负责在到限后强停已配置的第三方应用，不参与计时；未安装、未授权、服务未运行、Binder 断开或执行失败时自动回退普通限制页，不切换到 LSPosed。 |
-| 可选激励延时 | 用户只能在时停的独立限制页中主动选择观看激励广告来申请临时延时。需要先同意隐私说明，只有确认奖励后才会发放时间；每日、单会话、时段、冷却、PIN 和分组限制仍然生效。 |
+| 免费延时 | 在既有每日和每轮次数内免费延时，保留开关和自定义时长；不加载或显示广告。 |
 | 历史统计与加密同步 | 可按日期查看使用图表、周汇总、打开次数和限制触发记录，并可筛选系统应用。规则、分组和便携设置可手动上传或下载到自配置的 HTTPS WebDAV，传输内容使用 AES-GCM 加密，不包含 PIN、统计、诊断或运行状态。 |
 | 设置内保护状态 | 设置顶部同时展示所选模式、实际执行链路、明确异常和修复入口；LSPosed 未取得权威证据时显示“等待验证”而不是误报未生效，Shizuku 不可用时明确回退普通保护独立限制页。 |
 | 应用列表过滤 | 应用管理默认只显示第三方应用；需要管理系统应用时可手动开启“显示系统应用”。安装、卸载、更新应用或返回时停后会自动刷新，也可在应用页下拉刷新。 |
@@ -286,9 +281,9 @@ This tool should be used only by the device owner or on explicitly authorized ma
 | 本次使用计划 | 可为单个应用开启“打开时制定计划”；同一页面提供 5、10、15、30 分钟快捷选择和 1–60 分钟拖动条，默认5分钟、每次调整1分钟。LSPosed 与非 Root 共用同一界面组件，固定底栏确保退出和跳过按钮始终可见；选择超过最早剩余额度时会即时提示并禁用提交，最终提交仍再次校验。 |
 | 每周时段规则 | 支持“仅指定时段允许”和“指定时段禁止”，可组合多个星期并覆盖跨午夜时段。 |
 | 精确前台计时 | 仅统计 Activity 处于前台的时间，应用切到后台后暂停计时。 |
-| 到期提醒与延时 | LSPosed Hook 目标到期前 5 秒可显示与全局颜色主题一致的顶部或全屏倒计时、触发一次长震动，并提供退出应用或临时延长 1-60 分钟；纯非 Root 模式不显示这些 Hook 专属设置，本次计划在结束前 5 秒提供退出或重新计划入口。 |
+| 到期提醒与延时 | 到期前可显示倒计时提醒并提供退出或延时入口；普通延时支持 1–15 分钟，受每日和每轮次数限制。本次计划在结束前提供退出或重新计划入口。 |
 | 限制执行方式 | 设置页按引擎分别显示有效选项：LSPosed 可选“强制退出”或“独立休息页”；非 Root 普通保护可选“独立限制页”或需要 Shizuku 的“强制退出”。LSPosed 强制退出会关闭任务并结束当前 Hook 进程，但多进程应用的独立后台服务仍可能存活；需要整包强停时使用普通保护 + Shizuku。独立页跟随全局颜色和明暗主题并提供退出到桌面的按钮；Shizuku 不可用或执行失败时自动回退限制页。 |
-| PIN 临时放行 | 可选择 1–60 分钟，默认 5 分钟。每天所有应用共享首次免费 PIN 放行，其后需验证 PIN 并主动观看激励广告，获得奖励才放行。目标应用恢复前台后开始固定计时；Modern 版支持息屏、退出重进及目标/时停进程重建，截止前不重复限制或弹时间定制。设备重启、相关规则/模式变更、关闭管控锁或到期失效。广告无填充、失败或未获奖励时保持限制。 |
+| PIN 临时放行 | 可选择 1–60 分钟，默认 5 分钟。每日所有应用共享次数，默认 3，可设置 0–50；验证预占、目标恢复前台才计次，跨日按激活当天复检。已有授权在固定截止时间前跨退出重进、息屏和进程重建保持有效；设备重启、相关规则/模式变化或关闭管控锁失效。管理设置验证不计次。 |
 | 开屏使用时间提示 | 默认开启，仅在重新进入管控应用时短暂显示今日使用时间和可用余额，PIN 放行期间显示放行剩余时间。可在设置关闭，与每半小时提醒独立，不新增权限。 |
 | 管控锁与安全验证 | 使用私有 4–8 位 PIN 保护规则、分组和设置修改，适用于家长管控和成人自我约束；PIN 派生不在主线程执行，失败次数递增锁定并显示实时倒计时。可选强生物识别找回，但只能重设 PIN，不能显示旧 PIN。 |
 | 语言 | 支持跟随系统、简体中文和 English，管理界面与目标应用内 Hook 提醒使用同一设置。 |
@@ -308,7 +303,7 @@ Hook 计时仅覆盖 `Activity.onResume` 到 `Activity.onPause` 的前台阶段�
 
 ## 架构
 
-Root 增强开启时由时停请求授权，最多等待 30 秒；未授权会关闭增强选择并提示，基础管控不受影响。广告失败不消耗延时次数，广告源错误与明确无填充分开提示。
+Root 增强开启时由时停请求授权，最多等待 30 秒；未授权会关闭增强选择并提示，基础管控不受影响。普通延时无需广告，仍受每日与每轮次数限制。
 
 ```mermaid
 flowchart LR
@@ -402,7 +397,7 @@ Obtainium 是第三方更新工具，只负责检查 Release 页面并由用户�
 
 ### F-Droid
 
-时停使用 GPL-3.0-only 授权。当前版本包含专有的 TopOn 广告 SDK，按现有构建不能提交官方 F-Droid。`packaging/fdroid/` 保留给未来移除专有依赖的构建变体；当前版本请使用 GitHub Releases、LSPosed 或 Obtainium。
+时停使用 GPL-3.0-only 授权。当前构建已移除广告 SDK。`packaging/fdroid/` 为打包资料；尚未完成官方 F-Droid 入库验证。
 
 ## 诊断日志判断方法
 
@@ -482,7 +477,7 @@ Obtainium 是第三方更新工具，只负责检查 Release 页面并由用户�
 时停是采用 GPL-3.0-only 授权的自由软件。你可以在 GNU General Public License 第 3 版的条款下使用、学习、修改和再分发本项目。完整条款见 [LICENSE](LICENSE)，第三方组件仍分别遵循其原有许可证。
 # 2026-09-17 可靠性修复说明
 
-PIN 每日首次免费资格先预占，恢复目标应用才正式计次；两分钟未恢复不消耗免费机会。广告加载超时后可重新请求，迟到回调不会发放奖励。普通模式半小时提醒在展示前去重；更新检查支持同版本名称下更高版本号的修复包。真实广告能否展示仍取决于广告源填充。
+PIN 每日次数先预占，目标应用恢复时原子计次；两分钟未激活不消耗次数。已停用全部广告路径。普通模式半小时提醒在展示前去重；更新检查支持同版本名称下更高版本号的修复包。
 
 日统计和周报均通过点击圆环分段查看详情，外圈应用图标只作标识。小占比、图标无法解析或因拥挤省略的应用合并为灰色“其他”，点击可查看汇总和成员；不会从总时长中扣除这些应用。
 

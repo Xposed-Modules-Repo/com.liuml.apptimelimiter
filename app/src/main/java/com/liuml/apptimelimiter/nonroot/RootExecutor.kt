@@ -25,6 +25,22 @@ class RootExecutor(context: Context) : RestrictionExecutor {
     /** User-initiated authorization needs time for the root manager's confirmation dialog. */
     fun requestAuthorization(): Boolean = runCommand("id", 30_000L) == 0
 
+    /** Manager settings action: the selected app may already be in the background. */
+    fun forceStopForHookReload(packageName: String): RestrictionExecutionResult {
+        if (RuleRepository(appContext).getGlobalSettings().protectionMode !=
+            com.liuml.apptimelimiter.data.ProtectionMode.XPOSED) {
+            return RestrictionExecutionResult.REJECTED
+        }
+        val request = RestrictionRequest(
+            packageName = packageName, userId = android.os.Process.myUid() / 100000,
+            reason = "manual_hook_reload", incidentId = "hook-reload-${java.util.UUID.randomUUID()}",
+            ruleVersion = 0, groupVersion = 0, modeGeneration = 0,
+            foregroundPackage = null, foregroundGeneration = 0, sessionId = "",
+            allowDelay = false, allowPin = false, allowAd = false,
+        )
+        return executeValidated(request, manualReload = true)
+    }
+
     override fun execute(request: RestrictionRequest): RestrictionExecutionResult {
         val diagnostics = com.liuml.apptimelimiter.diagnostics.DiagnosticsRepository(appContext)
         diagnostics.recordIncident(request.packageName, request.incidentId, "ROOT_FORCE_STOP_REQUESTED", "REQUESTED")
@@ -33,10 +49,10 @@ class RootExecutor(context: Context) : RestrictionExecutor {
         }
     }
 
-    private fun executeValidated(request: RestrictionRequest): RestrictionExecutionResult {
+    private fun executeValidated(request: RestrictionRequest, manualReload: Boolean = false): RestrictionExecutionResult {
         // The interface is synchronous: never wait for su or PackageManager on the UI thread.
         if (Looper.myLooper() == Looper.getMainLooper()) return RestrictionExecutionResult.FALLBACK_REQUIRED
-        RootExecutionSafetyPolicy.validate { isValidRequest(request) }?.let { return it }
+        RootExecutionSafetyPolicy.validate { isValidRequest(request, manualReload) }?.let { return it }
         val target = resolveTarget(request) ?: return RestrictionExecutionResult.FALLBACK_REQUIRED
         val key = "${request.userId}:${request.packageName}:${request.incidentId}"
         return RootExecutionSafetyPolicy.execute(executions, key) {
@@ -52,9 +68,9 @@ class RootExecutor(context: Context) : RestrictionExecutor {
 
     override fun cancel(requestId: String) = Unit
 
-    private fun isValidRequest(request: RestrictionRequest): Boolean {
+    private fun isValidRequest(request: RestrictionRequest, manualReload: Boolean): Boolean {
         if (!PackageNamePolicy.isValid(request.packageName) || request.userId < 0) return false
-        if (request.foregroundPackage != request.packageName || request.incidentId.isBlank()) return false
+        if ((!manualReload && request.foregroundPackage != request.packageName) || request.incidentId.isBlank()) return false
         val info = appContext.packageManager.getApplicationInfo(request.packageName, 0)
         if (request.packageName == appContext.packageName) return false
         if (info.flags and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0) {

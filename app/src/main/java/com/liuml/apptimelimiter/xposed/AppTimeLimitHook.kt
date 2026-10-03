@@ -47,7 +47,6 @@ import com.liuml.apptimelimiter.core.SharedGroupSessionAction
 import com.liuml.apptimelimiter.core.UsageMath
 import com.liuml.apptimelimiter.core.UsageReportingPolicy
 import com.liuml.apptimelimiter.core.UsageMilestonePolicy
-import com.liuml.apptimelimiter.core.RewardedAdPolicy
 import com.liuml.apptimelimiter.core.DailyUsageStatePolicy
 import com.liuml.apptimelimiter.core.ExtensionQuotaPolicy
 import com.liuml.apptimelimiter.core.ProcessTerminationPolicy
@@ -424,8 +423,8 @@ internal class RuntimeLimiter(
         resumedDuringHandoff: Boolean,
     ) {
         val rule = readRule(activity, reloadFallback = true)
-        consumePendingRewardedAd(activity, rule)
         refreshTemporaryParentOverride(activity, rule)
+        if (rule.protectionMode == ProtectionMode.XPOSED) syncFreePageExtension(activity)
         if ((processWasForeground || resumedDuringHandoff) && previousActivity !== activity) {
             diagnostic(
                 activity,
@@ -1086,16 +1085,13 @@ internal class RuntimeLimiter(
         if (mode == SessionPlanDialogMode.REPLAN) {
             val extension = consumeExtensionQuota(activity, rule)
             if (!extension.accepted) {
-                if (extension.requiresAd) {
-                    launchRewardedAdPage(activity, rule)
-                } else {
+
                     Toast.makeText(
                         activity,
                         hookText(activity, rule, "今日延时次数已用完", "Today's delay limit has been used"),
                         Toast.LENGTH_LONG,
                     ).show()
                     showSessionPlanWarning()
-                }
                 return
             }
         }
@@ -2997,7 +2993,6 @@ internal class RuntimeLimiter(
         perLaunchCommittedMs = 0L
         clearSharedGroupSessionState()
         perLaunchCycleGeneration++
-        resetRewardedAdSession(activity)
         grantedExtensionMs = 0L
         warningShownForExtensionMs = Long.MIN_VALUE
         warningVibratedForExtensionMs = Long.MIN_VALUE
@@ -3038,7 +3033,6 @@ internal class RuntimeLimiter(
         perLaunchCommittedMs = 0L
         clearSharedGroupSessionState()
         perLaunchCycleGeneration++
-        resetRewardedAdSession(activity)
         grantedExtensionMs = 0L
         warningShownForExtensionMs = Long.MIN_VALUE
         warningVibratedForExtensionMs = Long.MIN_VALUE
@@ -3076,25 +3070,6 @@ internal class RuntimeLimiter(
     }
 
     /** The Hook must never write ad state into the target app sandbox. */
-    private fun resetRewardedAdSession(activity: Activity) {
-        if (processSessionId.isBlank()) return
-        runCatching {
-            activity.contentResolver.call(
-                RuleContract.CONTENT_URI,
-                RuleContract.METHOD_RESET_REWARDED_AD_SESSION,
-                packageName,
-                Bundle().apply {
-                    putString(RuleContract.KEY_AD_SESSION_ID, processSessionId)
-                },
-            )
-        }.onSuccess { result ->
-            if (result?.getBoolean(RuleContract.KEY_OK, false) != true) {
-                diagnostic(activity, "WARN", "REWARDED_AD_SESSION_RESET_FAILED", "provider_rejected")
-            }
-        }.onFailure { error ->
-            diagnostic(activity, "WARN", "REWARDED_AD_SESSION_RESET_FAILED", error.javaClass.simpleName)
-        }
-    }
 
     private fun finishTarget(activity: Activity, message: String, statsPersisted: Boolean) {
         val runtimeRule = lastLoadedRule
@@ -3314,17 +3289,17 @@ internal class RuntimeLimiter(
             event = "USER_EXIT_REQUESTED",
             message = "source=$source",
         )
-        runCatching { activity.finishAndRemoveTask() }
-            .onFailure {
-                diagnostic(activity, level = "WARN", event = "USER_EXIT_FINISH_TASK_FAILED", message = it.toString())
-            }
-        runCatching { activity.finishAffinity() }
-            .onFailure {
-                diagnostic(activity, level = "WARN", event = "USER_EXIT_FINISH_AFFINITY_FAILED", message = it.toString())
-            }
-        runCatching { activity.moveTaskToBack(true) }
-            .onFailure {
-                diagnostic(activity, level = "WARN", event = "USER_EXIT_MOVE_TASK_FAILED", message = it.toString())
+        val home = Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_HOME)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        runCatching { activity.startActivity(home) }
+            .onFailure { error ->
+                diagnostic(activity, level = "WARN", event = "USER_EXIT_HOME_FAILED", message = error.toString())
+                runCatching { activity.moveTaskToBack(true) }
+                    .onFailure {
+                        diagnostic(activity, level = "WARN", event = "USER_EXIT_MOVE_TASK_FAILED", message = it.toString())
+                    }
             }
     }
 
@@ -4254,7 +4229,7 @@ internal class RuntimeLimiter(
                             ).show()
                             else -> when (grantExtension(activity, latest)) {
                                 ExtensionActionResult.GRANTED -> extensionsUsedThisProcess++
-                                ExtensionActionResult.REQUIRES_AD -> launchRewardedAdPage(activity, latest)
+                                ExtensionActionResult.REQUIRES_AD -> showExitWarning()
                                 ExtensionActionResult.RECOVERING_PROVIDER -> {
                                     keepExtensionActionInFlight = true
                                 }
@@ -4541,11 +4516,6 @@ internal class RuntimeLimiter(
                 ).show()
                 return ExtensionActionResult.RECOVERING_PROVIDER
             }
-            if (claim.requiresAd) {
-                // Free quota is exhausted but an ad-backed extension is still eligible.
-                scheduleDeadline(activity, rule)
-                return ExtensionActionResult.REQUIRES_AD
-            }
             restoreRejectedExtension(activity, rule, requestGeneration, claim)
             return ExtensionActionResult.REJECTED
         }
@@ -4609,124 +4579,31 @@ internal class RuntimeLimiter(
             ).show()
     }
 
-    private fun launchRewardedAdPage(
-        activity: Activity,
-        rule: HookRule,
-        providerRecoveryAttempted: Boolean = false,
-    ) {
-        val token = createBreakSessionToken(activity) ?: run {
-            diagnostic(
-                activity,
-                level = "WARN",
-                event = "REWARDED_AD_PAGE_REJECTED",
-                message = "break_session_unavailable",
-            )
-            if (!providerRecoveryAttempted) {
-                requestInteractiveProviderAccessRecovery(activity) { recovered, detail ->
-                    val active = !activity.isFinishing && !activity.isDestroyed &&
-                        resumedActivities.contains(activity) && !exitScheduled
-                    if (recovered && active) {
-                        diagnostic(
-                            activity,
-                            event = "REWARDED_AD_PAGE_PROVIDER_RECOVERED",
-                            message = detail.take(80),
-                        )
-                        launchRewardedAdPage(activity, readRule(activity, reloadFallback = true), true)
-                    } else if (active) {
-                        diagnostic(
-                            activity,
-                            level = "WARN",
-                            event = "REWARDED_AD_PAGE_PROVIDER_RECOVERY_FAILED",
-                            message = detail.take(80),
-                        )
-                        Toast.makeText(
-                            activity,
-                            hookText(
-                                activity,
-                                rule,
-                                "广告延时服务未连接，请重新打开应用后再试",
-                                "The ad extension service is unavailable. Reopen the app and try again.",
-                            ),
-                            Toast.LENGTH_SHORT,
-                        ).show()
-                    }
-                }
-            } else {
-                Toast.makeText(
-                    activity,
-                    hookText(
-                        activity,
-                        rule,
-                        "广告延时服务未连接，请重新打开应用后再试",
-                        "The ad extension service is unavailable. Reopen the app and try again.",
-                    ),
-                    Toast.LENGTH_SHORT,
-                ).show()
-            }
-            return
-        }
-        val intent = Intent().apply {
-            setClassName(BuildConfig.APPLICATION_ID, LimitBlockActivity::class.java.name)
-            putExtra(LimitBlockActivity.EXTRA_TARGET_PACKAGE, packageName)
-            putExtra(LimitBlockActivity.EXTRA_BREAK_SESSION_TOKEN, token)
-            putExtra(LimitBlockActivity.EXTRA_RULE_VERSION, rule.version)
-            putExtra(LimitBlockActivity.EXTRA_GROUP_VERSION, rule.groupVersion)
-            putExtra(LimitBlockActivity.EXTRA_ENGLISH, isEnglish(activity, rule))
-            putExtra(LimitBlockActivity.EXTRA_CONTROL_SESSION_ID, processSessionId)
-            putExtra(LimitBlockActivity.EXTRA_INCIDENT_ID, "ad:$packageName:$processSessionId")
-            putExtra(LimitBlockActivity.EXTRA_AD_ONLY, true)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
-        }
-        diagnostic(
-            activity,
-            event = "REWARDED_AD_PAGE_LAUNCH_REQUESTED",
-            message = "session=${processSessionId.take(24)}, rule=${rule.version}, group=${rule.groupVersion}",
-        )
-        runCatching { activity.startActivity(intent) }
-            .onSuccess {
-                diagnostic(activity, event = "REWARDED_AD_PAGE_LAUNCHED", message = "session=${processSessionId.take(24)}")
-            }
-            .onFailure {
-                diagnostic(
-                    activity,
-                    level = "WARN",
-                    event = "REWARDED_AD_PAGE_FAILED",
-                    message = it.javaClass.simpleName,
-                )
-                Toast.makeText(
-                    activity,
-                    hookText(activity, rule, "广告延时页面无法打开，请稍后重试", "Unable to open the ad extension page. Try again."),
-                    Toast.LENGTH_SHORT,
-                ).show()
-            }
-    }
+    private var pageExtensionSession = ""
+    private var pageExtensionTotal = 0L
 
-    private fun consumePendingRewardedAd(activity: Activity, rule: HookRule) {
-        val result = runCatching {
-            activity.contentResolver.call(
-                RuleContract.CONTENT_URI,
-                RuleContract.METHOD_CONSUME_REWARDED_AD,
-                packageName,
-                Bundle().apply { putString(RuleContract.KEY_AD_SESSION_ID, processSessionId) },
-            )
-        }.getOrNull()?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) } ?: return
-        val reward = result.getLong(RuleContract.KEY_AD_REWARD_MILLIS, 0L)
-            .coerceIn(0L, RewardedAdPolicy.MAX_REWARD_MILLIS)
-        if (reward <= 0L) return
-        grantedExtensionMs = UsageMath.addExtensionMillis(
-            grantedExtensionMs,
-            reward,
-            MAX_TOTAL_EXTENSION_MS,
-        )
-        extensionsUsedThisProcess = (extensionsUsedThisProcess + 1)
-            .coerceAtMost(rule.extensionSessionLimit)
-        warningShownForExtensionMs = Long.MIN_VALUE
-        diagnostic(
-            activity,
-            event = "REWARDED_AD_REWARD_APPLIED",
-            message = "reward=${reward / 1000}s; session=${processSessionId.take(40)}",
-        )
-        scheduleDeadline(activity, rule)
+    private fun syncFreePageExtension(activity: Activity) {
+        if (pageExtensionSession != processSessionId) {
+            pageExtensionSession = processSessionId
+            pageExtensionTotal = 0L
+        }
+        val total = runCatching { activity.contentResolver.call(
+            RuleContract.CONTENT_URI, "get_free_extension", packageName,
+            Bundle().apply { putString(RuleContract.KEY_PROCESS_SESSION_ID, processSessionId) }
+        ) }.getOrNull()?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) }
+            ?.getLong("extension_total_millis", 0L)?.coerceIn(0L, MAX_TOTAL_EXTENSION_MS) ?: return
+        val delta = (total - pageExtensionTotal).coerceAtLeast(0L)
+        if (delta > 0L) {
+            grantedExtensionMs = UsageMath.addExtensionMillis(grantedExtensionMs, delta, MAX_TOTAL_EXTENSION_MS)
+            pageExtensionTotal = total
+            parentUnlockCountdownGeneration++
+            warningCountdown?.let(mainHandler::removeCallbacks)
+            warningCountdown = null
+            dismissWarning(resetForCurrentLimit = false)
+            exitScheduled = false
+            removeBlockingOverlay(activity, "free_extension_granted")
+            warningShownForExtensionMs = Long.MIN_VALUE
+        }
     }
 
     private fun consumeExtensionQuota(activity: Activity, rule: HookRule): ExtensionClaimResult {

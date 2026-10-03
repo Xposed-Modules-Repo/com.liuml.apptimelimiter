@@ -1,10 +1,14 @@
 # Time Stop (Android)
 
+The interface uses iOS-inspired neutral grouped backgrounds, rounded cards, consistent line icons and switches. Home, apps, groups, statistics, weekly reports, rules, settings, PIN and restriction pages share the visual system, with three accent colors and dark mode. Settings use a category directory followed by detail pages; returning to the directory preserves drafts. Bottom actions respect system bars and the keyboard. Both protection modes expose reminders and extensions. General settings require Save and return; PIN limits and system authorization actions take effect after their separate confirmation. Ordinary extensions support 1–15 minutes, with daily/session availability shown on the restriction page. The statistics date precedes the chart, and clearing records requires confirmation.
+
+LSPosed settings offer a per-app “Force stop (Root required)” action. Time Stop requests Root and stops only configured, permitted targets; reopen the target manually to verify its Hook. This does not enable automatic Root enhancement or fix a disabled module or missing LSPosed scope.
+
 Restriction details can be expanded to show the main reason and other active limits, distinguishing app/group daily and session quotas, schedules, and cooldowns. Session plans still end with an exit and never start cooldowns. Expected availability considers all known release conditions; unknown session resets or usage data do not produce a promised time. Rules are checked again before access resumes.
 
 Precision app-time control for Android power users who want policy, telemetry, and enforcement in the same loop.
 
-Current development build: `0.11.22 (61)` Modern. Legacy migration builds are retained only for existing users completing the two-stage upgrade.
+Current release: `0.11.24 (63)` Modern. Legacy migration builds are retained only for existing users completing the two-stage upgrade.
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -32,7 +36,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Non-root basic protection | Uses content-blind accessibility foreground events and Android usage access. An opt-in enhanced compatibility mode adds package-only content-change events for ROMs that miss normal window events; it still retrieves no nodes, text, or input and adds no foreground service or continuous polling. |
 | Global protection mode | Select exactly one controller for all targets: LSPosed or Basic protection. Controllers never take over automatically. |
 | Optional force-stop enhancement | Basic protection can select the restriction page, Root, or Shizuku as one mutually exclusive limit action. Root and Shizuku only force-stop validated configured third-party targets; unavailable or failed actions fall back to the restriction page. |
-| Rewarded extension | A user may voluntarily watch a rewarded ad only from Time Stop's restriction page to request a temporary extension. Privacy consent is required; only a confirmed reward grants time, and quotas, schedules, cooldowns, PIN, and group limits still apply. |
+| Free extension | All ordinary extensions are free within the daily and per-session limits; no ads are loaded or displayed. |
 | Historical statistics | Review daily history with usage charts, weekly summaries, limit-hit counts, launch counts, and a system-app filter without uploading usage data. |
 | Encrypted WebDAV sync | Manually upload or download portable rules, groups, and portable settings through a user-configured HTTPS WebDAV endpoint. Payloads are encrypted with AES-GCM; PIN material, statistics, diagnostics, and runtime state stay local. |
 | Protection status in Settings | Settings shows the selected mode, actual execution path, confirmed issues, and repair actions. Unknown LSPosed evidence is shown as waiting for verification rather than inactive; unavailable Shizuku is shown as a basic-protection fallback. |
@@ -41,13 +45,13 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Session planning | Optionally asks for a 5, 10, 15, 30, or custom 1–60 minute plan when the target process first opens. Quick choices and a one-minute-step slider share one compact page, while the fixed footer keeps exit and skip actions visible. A choice beyond the earliest remaining quota shows an immediate warning and disables submission; the final submission is revalidated. |
 | Weekly schedules | Supports allow-only and block-during windows across multiple weekdays, including overnight ranges. Schedule blocks cannot be bypassed with the delay action. |
 | Foreground-only accounting | Counts only the `onResume` to `onPause` phase. Background residency does not burn the quota. |
-| Warning UI | LSPosed Hook targets can show a five-second top or full-screen warning matching the selected global color, optionally vibrate once, and offer exit or a 1-60 minute extension. Pure non-root mode hides these Hook-only settings; its session plan offers exit or replan five seconds before expiry. |
+| Warning UI | Countdown reminders offer exit or a 1–15 minute extension within daily and per-session limits. Session plans offer exit or replan before expiry. |
 | Enforcement mode | Settings expose only actions supported by each engine. LSPosed force-exit closes the task and terminates the current Hook process; separate background processes may survive, while package-wide force-stop requires Standard protection + Shizuku. LSPosed also offers a themed standalone break page with an exit-to-Home action. Non-root basic protection offers the same styled restriction page or Shizuku force-stop, with automatic page fallback if Shizuku is unavailable or fails. |
-| PIN allowance | Choose 1–60 minutes (default 5). The first successful PIN allowance each day is free across all apps; later allowances require PIN verification and a voluntarily watched rewarded ad. Time starts once the target resumes. Modern allowances survive screen-off, app re-entry and target/manager process recreation, without restriction or planning prompts before the fixed deadline. Reboot, relevant rule/mode changes, disabling Control Lock or expiry invalidate them. Ad failure or no reward keeps restrictions in place. |
+| PIN allowance | Choose 1–60 minutes (default 5). All apps share a daily PIN unlock limit, default 3 and configurable 0–50. It is charged only on target foreground activation. Re-entry, screen-off and process recreation preserve the fixed deadline. Reboot, relevant rule/mode changes, disabling Control Lock or expiry invalidate it. |
 | Usage tip on app entry | Enabled by default for managed apps. Briefly shows today's usage and available time, or remaining PIN allowance. Independently switchable from half-hour reminders, without new permissions. |
 | Language | Supports system-default, Simplified Chinese, and English UI; Hook warnings use the same preference. |
 | Appearance | Offers health green, calm blue, and focus purple across all in-app and target-side surfaces, each with follow-system, light, and dark modes. Plan prompts, full-screen warnings, and restriction pages can also show built-in or custom time-reflection lines. |
-| Delay action | Lets the user add 1-60 minutes for normal time limits while keeping schedule blocks strict. |
+| Delay action | Lets the user add 1–15 minutes within daily and per-session extension limits while keeping schedule blocks strict. |
 | Post-exit cooldown | Blocks reopening for 1-1,440 minutes after a daily or per-launch quota event. A group uses one fixed shared cooldown window for all members; repeated openings do not refresh it or inflate limit-hit counts. Schedule denials do not start cooldown. |
 | Group sync loop | Grouped foreground apps synchronize daily and per-launch usage every 15 seconds without keeping the manager app alive. Cross-member handoff uses one persisted session and one incident ID. |
 | Non-blocking system usage | Daily Android `UsageEvents` are refreshed in the module process and reused as a short-lived snapshot, avoiding a full-day scan on the target app's main thread. |
@@ -59,24 +63,15 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 
 Changing a rule resets the Hook-local accumulator for that app, but Android's system usage for the current day remains part of the daily baseline when usage access is granted. That makes rule tweaking visible, not a loophole.
 
-## Local TopOn Configuration
+## Ad-free build and PIN limits
 
-TopOn credentials are read only from `%USERPROFILE%\.gradle\gradle.properties`; they are never stored in this repository, project `gradle.properties`, source code, diagnostics, backups, or Git. A local build that needs real rewarded-ad requests must provide:
+No advertising SDK, initialization, preload, display or rewards are included. Existing user-level ad credentials are not read or modified. Ordinary extensions are free within the configured daily and per-session limits. PIN unlocks share a manager-private daily limit across all apps: default 3, configurable 0–50. Zero blocks new unlocks without revoking active allowances.
 
-```properties
-toponAppId=<TopOn App ID>
-toponAppKey=<TopOn App Key>
-toponPlacementId=<rewarded_extension_v1 placement ID>
-toponTestMode=false
-# Debug uses the deterministic local reward simulation unless this is explicitly true.
-toponLiveTestAds=false
-```
-
-Set `toponLiveTestAds=true` only after registering the device as a TopOn test device. If any required local value is absent, real ad display safely fails and no temporary extension is granted.
+PIN verification reserves a slot; verified target foreground activation commits the fixed deadline and charges that local day. Cancellation, expiry and failed writes do not spend slots. Re-entry never renews the deadline. Management PIN verification is not subject to this quota. This device-private setting is excluded from portable backups and Hook rule mirrors.
 
 ## Architecture
 
-Enabling Root enhancement requests authorization from Time Stop, with a 30-second wait. Failure disables the selection and keeps basic protection active. Failed ads do not consume extensions; source errors are distinguished from explicit no-fill responses.
+Enabling Root enhancement requests authorization from Time Stop, with a 30-second wait. Failure disables the selection and keeps basic protection active. Ordinary extensions are ad-free and retain their daily and per-session limits.
 
 ```mermaid
 flowchart LR
@@ -174,7 +169,7 @@ Obtainium is a third-party updater. It does not change Time Stop's protection en
 
 ### F-Droid
 
-Time Stop is licensed as GPL-3.0-only. The current release includes the proprietary TopOn advertising SDK, so it is not eligible for the official F-Droid repository as built. `packaging/fdroid/` is retained for a future flavor that removes proprietary dependencies. Use GitHub Releases, LSPosed, or Obtainium for the current release.
+Time Stop is licensed as GPL-3.0-only. This build removes the advertising SDK. `packaging/fdroid/` contains packaging materials; official F-Droid eligibility has not been verified.
 
 ## Diagnostics
 
@@ -258,7 +253,7 @@ redistribute it under the terms of the GNU General Public License version 3 only
 licenses.
 # Reliability fixes — 2026-09-17
 
-The first daily free PIN allowance is reserved until the target resumes. An unused reservation expires after two minutes without spending it. Ad load timeouts allow a fresh request; stale callbacks cannot grant rewards. Normal-mode usage reminders deduplicate before display. Update checks recognize higher version codes with the same version name. Live ad availability still depends on ad-source fill.
+Daily PIN slots are reserved until the target resumes. Unused reservations expire after two minutes without spending a slot. All advertising paths are disabled. Normal-mode usage reminders deduplicate before display, and update checks recognize higher version codes with the same version name.
 
 Daily statistics and weekly reports open details by tapping ring segments; outer app icons are decorative labels. Small shares, unavailable icons and icons omitted to avoid collisions are combined into gray Other. Its details list the aggregate and members without removing their time from the total.
 

@@ -39,6 +39,7 @@ class ManagerControlDatabaseInstrumentedTest {
 
     private fun prepare() {
         ParentAuthStore.initializeForTests(db, 7)
+        ParentAuthStore.setDailyLimit(1)
         atomic {
             assertNotNull(runtime.claim(token, "incident", now()))
             assertTrue(runtime.transition(token, "incident", ControlRuntimeState.WAITING_PARENT_AUTH, now()))
@@ -49,7 +50,7 @@ class ManagerControlDatabaseInstrumentedTest {
 
     private fun complete() = atomic {
         ParentAuthStore.complete("private-token", true, 60_000L, wall(), now(),
-            enforceDailyAd = true, deferActivation = true, isIdentityCurrent = {
+            deferActivation = true, isIdentityCurrent = {
                 runtime.transition(token, "incident", ControlRuntimeState.OVERRIDE_PENDING, now())
             })
     }
@@ -70,7 +71,7 @@ class ManagerControlDatabaseInstrumentedTest {
         assertEquals(ControlRuntimeState.WAITING_PARENT_AUTH, runtime.read(token, now())?.state)
         assertEquals(ParentAuthStatus.WAITING, ParentAuthStore.challenge("private-token")?.status)
         assertNull(ParentAuthStore.pendingOverride(identity, now()))
-        assertFalse(ParentAuthStore.isAdRequired(wall(), now()))
+        assertFalse(ParentAuthStore.quotaExhausted(wall(), now()))
         assertEquals(before, db.pendingDiagnostics())
         assertNotNull("Receipt must also have rolled back", complete())
     }
@@ -79,7 +80,7 @@ class ManagerControlDatabaseInstrumentedTest {
         prepare()
         val result = ParentAuthStore.atomicOperation({ it }) {
             assertTrue(runtime.transition(token, "incident", ControlRuntimeState.OVERRIDE_PENDING, now()))
-            ParentAuthStore.markVerifiedWaitingForAd("private-token", wall())
+            ParentAuthStore.complete("private-token", true, 60_000, wall(), now(), deferActivation = true)
             false
         }
         assertFalse(result)
@@ -124,7 +125,7 @@ class ManagerControlDatabaseInstrumentedTest {
         }
         assertEquals(activated, ParentAuthStore.activateOverride(identity, true, now() + 1_000, true))
         assertEquals(1, db.preferences("parent_auth_runtime").getInt("quota_count", 0))
-        assertTrue(ParentAuthStore.isAdRequired(wall(), now()))
+        assertTrue(ParentAuthStore.quotaExhausted(wall(), now()))
     }
 
     @Test fun foregroundAndPendingDeadlineAreStillMandatory() {
@@ -199,7 +200,9 @@ class ManagerControlDatabaseInstrumentedTest {
         db = ManagerControlDatabase(context, "$prefix.db") { enabled }
         assertEquals("migrated", runtime.read(token, now())?.incident)
         ParentAuthStore.initializeForTests(db, 7)
-        assertTrue(ParentAuthStore.isAdRequired(wall(), now()))
+        assertEquals(1, ParentAuthStore.usedToday(wall()))
+        assertEquals(3, ParentAuthStore.dailyLimit())
+        assertFalse(ParentAuthStore.quotaExhausted(wall(), now()))
         assertTrue(runtime.transition(token, "migrated", ControlRuntimeState.WAITING_PARENT_AUTH, now()))
         assertEquals(original, legacyRuntime.all)
     }
@@ -289,4 +292,72 @@ class ManagerControlDatabaseInstrumentedTest {
         assertEquals("Active queries and idempotent activation must not write", 0, writes)
         assertEquals(active, prefs.all)
     }
+    @Test fun noAdMigrationPreservesActiveCancelsPendingAndUsesMaximumKnownCountOnce() {
+        prepare()
+        ParentAuthStore.setDailyLimit(50)
+        assertNotNull(complete())
+        val active = ParentAuthStore.activateOverride(identity, true, now(), true)!!
+        val other = identity.copy(packageName = "test.second", processSessionId = "second")
+        ParentAuthStore.issue("pending-old", other, "old", "QUOTA", wall())
+        ParentAuthStore.consumeForUi("pending-old", wall())
+        ParentAuthStore.complete("pending-old", true, 60_000, wall(), now(), deferActivation = true)
+        ParentAuthStore.migrateNoAds(wall(), 7)
+        assertEquals(7, ParentAuthStore.usedToday(wall()))
+        assertEquals(active, ParentAuthStore.getOverride(identity, false, wall(), now()))
+        assertNull(ParentAuthStore.pendingOverride(other, now()))
+        assertNull(ParentAuthStore.challenge("pending-old"))
+        ParentAuthStore.migrateNoAds(wall(), 49)
+        assertEquals(7, ParentAuthStore.usedToday(wall()))
+        ParentAuthStore.initializeForTests(db, 7)
+        assertEquals(7, ParentAuthStore.usedToday(wall()))
+        assertEquals(active, ParentAuthStore.getOverride(identity, false, wall(), now()))
+        assertEquals(50, ParentAuthStore.dailyLimit())
+    }
+
+    @Test fun migrationFailureRollsBackMarkerQuotaAndPendingState() {
+        prepare()
+        val pending = complete()!!.parentOverride
+        db.beforeCommitForTests = { throw IllegalStateException("injected migration failure") }
+        try { ParentAuthStore.migrateNoAds(wall(), 9); fail("Expected rollback") }
+        catch (_: IllegalStateException) {}
+        db.beforeCommitForTests = null
+        assertFalse(db.preferences("parent_auth_runtime").getBoolean("no_ad_quota_migrated_v1", false))
+        assertEquals(0, ParentAuthStore.usedToday(wall()))
+        assertEquals(pending, ParentAuthStore.pendingOverride(identity, now()))
+        ParentAuthStore.migrateNoAds(wall(), 9)
+        assertEquals(9, ParentAuthStore.usedToday(wall()))
+    }
+
+    @Test fun limitSaveFailureDoesNotChangePrivateLimitOrSpentCount() {
+        prepare()
+        assertEquals(1, ParentAuthStore.dailyLimit())
+        db.beforeCommitForTests = { throw IllegalStateException("injected settings failure") }
+        assertFalse(ParentAuthStore.setDailyLimit(0))
+        db.beforeCommitForTests = null
+        assertEquals(1, ParentAuthStore.dailyLimit())
+        assertTrue(ParentAuthStore.setDailyLimit(0))
+        assertNull(complete())
+        assertEquals(0, ParentAuthStore.usedToday(wall()))
+        assertEquals(ParentAuthStatus.WAITING, ParentAuthStore.challenge("private-token")?.status)
+    }
+
+    @Test fun activationOutboxAndQuotaCommitOnceAndSurviveReopen() {
+        prepare()
+        complete()
+        assertTrue(db.preferences("pin_statistics_outbox").all.isEmpty())
+        val active = ParentAuthStore.activateOverride(identity, true, now(), true)!!
+        assertEquals(1, ParentAuthStore.usedToday(wall()))
+        assertEquals(1, db.preferences("pin_statistics_outbox").all.size)
+        assertEquals(active, ParentAuthStore.activateOverride(identity, true, now(), true))
+        db.closeForTests()
+        db = ManagerControlDatabase(context, "$prefix.db") { enabled }
+        ParentAuthStore.initializeForTests(db, 7)
+        db.drainPinStatistics(context)
+        db.drainPinStatistics(context)
+        assertTrue(db.preferences("pin_statistics_outbox").all.isEmpty())
+        assertEquals(1, com.liuml.apptimelimiter.statistics.UsageStatsRepository(context)
+            .allParentUnlocksForDay(java.time.LocalDate.now()))
+        assertEquals(1, ParentAuthStore.usedToday(wall()))
+    }
+
 }

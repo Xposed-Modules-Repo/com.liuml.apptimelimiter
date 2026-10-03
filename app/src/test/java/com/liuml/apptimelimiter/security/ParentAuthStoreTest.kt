@@ -28,22 +28,63 @@ class ParentAuthStoreTest {
         assertNull(ParentAuthStore.getOverride(identity, true, 2_002L, 3_630_000L, activate = true))
     }
 
-    @Test fun `global first PIN wins atomically and second requires reward without double counting`() {
+    @Test fun `quota boundaries are shared globally and duplicate callbacks do not spend twice`() {
         val now = 1_900_000_000_000L
-        val a = identity.copy(packageName = "quota.a")
-        val b = identity.copy(packageName = "quota.b")
-        ParentAuthStore.issue("qa", a, "a", "QUOTA", now)
-        ParentAuthStore.issue("qb", b, "b", "QUOTA", now)
-        ParentAuthStore.consumeForUi("qa", now + 1)
-        ParentAuthStore.consumeForUi("qb", now + 1)
-        assertNotNull(ParentAuthStore.complete("qa", true, 60_000, now + 2, 1_000, enforceDailyAd = true))
-        assertNull(ParentAuthStore.complete("qb", true, 60_000, now + 2, 1_000, enforceDailyAd = true))
-        assertNotNull(ParentAuthStore.markVerifiedWaitingForAd("qb", now + 3))
-        assertNull(ParentAuthStore.complete("qb", true, 60_000, now + 4, 1_000, enforceDailyAd = true))
-        assertNotNull(ParentAuthStore.markAdRewarded("qb", now + 5))
-        assertNotNull(ParentAuthStore.complete("qb", true, 60_000, now + 6, 1_000, enforceDailyAd = true))
-        assertNotNull(ParentAuthStore.complete("qb", true, 60_000, now + 7, 1_000, enforceDailyAd = true))
-        assertFalse(ParentAuthStore.isAdRequired(now + 86_400_000))
+        listOf(0, 1, 3, 50).forEach { limit ->
+            ParentAuthStore.resetForTests()
+            assertTrue(ParentAuthStore.setDailyLimitForTests(limit))
+            repeat(limit + 1) { index ->
+                val id = identity.copy(packageName = "app.p$index")
+                val token = "quota$index"
+                ParentAuthStore.issue(token, id, token, "QUOTA", now)
+                ParentAuthStore.consumeForUi(token, now + 1)
+                val result = ParentAuthStore.complete(token, true, 60_000, now + 2, 1_000)
+                if (index < limit) {
+                    assertNotNull(result)
+                    assertEquals(result, ParentAuthStore.complete(token, true, 60_000, now + 3, 1_001))
+                } else assertNull(result)
+            }
+            assertEquals(limit, ParentAuthStore.usedToday(now))
+            assertFalse(ParentAuthStore.setDailyLimitForTests(-1))
+            assertFalse(ParentAuthStore.setDailyLimitForTests(51))
+        }
+    }
+
+    @Test fun `lowering quota preserves active grant but rejects pending activation`() {
+        val now = 1_900_000_000_000L
+        ParentAuthStore.issue("active", identity, "a", "QUOTA", now)
+        ParentAuthStore.consumeForUi("active", now + 1)
+        val active = ParentAuthStore.complete("active", true, 60_000, now + 2, 1_000)!!.parentOverride
+        val second = identity.copy(packageName = "app.second")
+        ParentAuthStore.issue("pending", second, "b", "QUOTA", now)
+        ParentAuthStore.consumeForUi("pending", now + 1)
+        ParentAuthStore.complete("pending", true, 60_000, now + 2, 1_000, deferActivation = true)
+        ParentAuthStore.setDailyLimitForTests(0)
+        assertEquals(active, ParentAuthStore.getOverride(identity.copy(processSessionId = "restarted"), false, now + 3, 1_001))
+        assertNull(ParentAuthStore.activateOverride(second, true, 1_001, true, now + 3))
+        assertEquals(1, ParentAuthStore.usedToday(now))
+        ParentAuthStore.setDailyLimitForTests(3)
+        assertNotNull(ParentAuthStore.activateOverride(second, true, 1_002, true, now + 4))
+        assertEquals(2, ParentAuthStore.usedToday(now))
+        ParentAuthStore.clear()
+        assertEquals(2, ParentAuthStore.usedToday(now))
+    }
+
+    @Test fun `midnight activation rechecks new day quota and charges only new day`() {
+        val midnight = java.time.LocalDate.of(2026, 9, 24).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        ParentAuthStore.setDailyLimitForTests(1)
+        ParentAuthStore.issue("previous", identity, "a", "QUOTA", midnight - 1_000)
+        ParentAuthStore.consumeForUi("previous", midnight - 999)
+        ParentAuthStore.complete("previous", true, 60_000, midnight - 998, 1_000, deferActivation = true)
+        val other = identity.copy(packageName = "app.second")
+        ParentAuthStore.issue("today", other, "b", "QUOTA", midnight)
+        ParentAuthStore.consumeForUi("today", midnight + 1)
+        ParentAuthStore.complete("today", true, 60_000, midnight + 2, 2_000)
+        assertNull(ParentAuthStore.activateOverride(identity, true, 2_001, true, midnight + 3))
+        assertEquals(0, ParentAuthStore.usedToday(midnight - 1))
+        ParentAuthStore.setDailyLimitForTests(2)
+        assertNotNull(ParentAuthStore.activateOverride(identity, true, 2_002, true, midnight + 4))
+        assertEquals(2, ParentAuthStore.usedToday(midnight))
     }
 
     @After
@@ -54,7 +95,7 @@ class ParentAuthStoreTest {
         ParentAuthStore.issue("readonly", identity, "event", "QUOTA", now)
         ParentAuthStore.consumeForUi("readonly", now + 1)
         ParentAuthStore.complete("readonly", true, 60_000, now + 2, 1_000,
-            enforceDailyAd = true, deferActivation = true)
+            deferActivation = true)
         val pending = ParentAuthStore.pendingOverride(identity, 1_001)!!
         repeat(20) { index ->
             assertNull(ParentAuthStore.getOverride(identity, true, now + 3 + index, 2_000L + index, activate = true))
@@ -62,7 +103,7 @@ class ParentAuthStoreTest {
         }
         assertNull(ParentAuthStore.pendingOverride(identity, 121_000))
         assertNull(ParentAuthStore.activateOverride(identity, true, 121_000, foregroundVerified = true))
-        assertFalse(ParentAuthStore.isAdRequired(now + 120_003, 121_001))
+        assertFalse(ParentAuthStore.quotaExhausted(now + 120_003, 121_001))
     }
 
     @Test fun `activation needs current identity foreground evidence and interactive screen`() {
@@ -99,31 +140,34 @@ class ParentAuthStoreTest {
     }
 
     @Test fun `unactivated free reservation expires without spending daily allowance`() {
+        ParentAuthStore.setDailyLimitForTests(1)
         val now = 1_900_000_000_000L
         ParentAuthStore.issue("reserved", identity, "event", "QUOTA", now)
         ParentAuthStore.consumeForUi("reserved", now + 1)
         assertNotNull(ParentAuthStore.complete("reserved", true, 60_000, now + 2, 1_000,
-            enforceDailyAd = true, deferActivation = true))
-        assertTrue(ParentAuthStore.isAdRequired(now + 3, 1_001))
-        assertFalse(ParentAuthStore.isAdRequired(now + 120_003, 121_001))
+            deferActivation = true))
+        assertTrue(ParentAuthStore.quotaExhausted(now + 3, 1_001))
+        assertFalse(ParentAuthStore.quotaExhausted(now + 120_003, 121_001))
         assertNull(ParentAuthStore.getOverride(identity, true, now + 120_003, 121_001, activate = true))
     }
 
     @Test fun `activation spends reservation once and subsequent entry retains deadline`() {
+        ParentAuthStore.setDailyLimitForTests(1)
         val now = 1_900_000_000_000L
         ParentAuthStore.issue("activate", identity, "event", "QUOTA", now)
         ParentAuthStore.consumeForUi("activate", now + 1)
         ParentAuthStore.complete("activate", true, 60_000, now + 2, 1_000,
-            enforceDailyAd = true, deferActivation = true)
-        val active = ParentAuthStore.activateOverride(identity, true, 2_000, foregroundVerified = true)!!
+            deferActivation = true)
+        val active = ParentAuthStore.activateOverride(identity, true, 2_000, foregroundVerified = true, nowMillis = now + 3)!!
         assertEquals(62_000L, active.expiresAtElapsedMillis)
         assertEquals("", active.pendingQuotaDay)
-        assertTrue(ParentAuthStore.isAdRequired(now + 200_000, 201_000))
+        assertTrue(ParentAuthStore.quotaExhausted(now + 200_000, 201_000))
         assertEquals(active, ParentAuthStore.getOverride(identity, false, now + 4, 3_000))
-        assertFalse(ParentAuthStore.needsAdForCompletion("activate", now + 4, 3_000))
+        assertEquals(1, ParentAuthStore.usedToday(now))
     }
 
     @Test fun `concurrent free reservations have exactly one winner`() {
+        ParentAuthStore.setDailyLimitForTests(1)
         val now = 1_900_000_000_000L
         (0..7).forEach {
             ParentAuthStore.issue("race$it", identity.copy(packageName = "app.p$it"), "e$it", "QUOTA", now)
@@ -134,7 +178,7 @@ class ParentAuthStoreTest {
         val threads = (0..7).map { index -> Thread {
             gate.await()
             if (ParentAuthStore.complete("race$index", true, 60_000, now + 2, 1_000,
-                    enforceDailyAd = true, deferActivation = true) != null) winners.incrementAndGet()
+                    deferActivation = true) != null) winners.incrementAndGet()
         }.apply { start() } }
         gate.countDown()
         threads.forEach { it.join(5_000) }
@@ -197,23 +241,6 @@ class ParentAuthStoreTest {
             ParentAuthStore.status("token", "app.a", "session-a", 32_000L),
         )
         assertNull(ParentAuthStore.complete("token", true, 60_000L, 32_001L, 1_000L))
-    }
-
-    @Test
-    fun `verified PIN requires an ad reward before it can grant`() {
-        ParentAuthStore.issue("token", identity, "incident", "QUOTA", 1_000L)
-        ParentAuthStore.consumeForUi("token", 1_001L)
-        assertEquals(
-            ParentAuthStatus.VERIFIED_WAITING_AD,
-            ParentAuthStore.markVerifiedWaitingForAd("token", 1_002L)?.status,
-        )
-        assertNull(ParentAuthStore.complete("token", true, 60_000L, 1_003L, 5_000L))
-        assertEquals(
-            ParentAuthStatus.AD_REWARDED,
-            ParentAuthStore.markAdRewarded("token", 1_004L)?.status,
-        )
-        assertNotNull(ParentAuthStore.complete("token", true, 60_000L, 1_005L, 5_001L))
-        assertNotNull(ParentAuthStore.complete("token", true, 60_000L, 1_006L, 5_002L))
     }
 
     @Test

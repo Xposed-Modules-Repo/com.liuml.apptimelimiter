@@ -45,7 +45,7 @@ class ManagerControlDatabase internal constructor(context: Context, name: String
     init {
         // Repository reads stay outside the SQLite lock, and only after the gate above.
         val legacyDay = java.time.LocalDate.now().toString()
-        val legacyQuotaUsed = com.liuml.apptimelimiter.data.RuleRepository(context).isParentUnlockAdRequired(legacyDay)
+        val legacyQuotaUsed = com.liuml.apptimelimiter.data.RuleRepository(context).legacyParentUnlockCount(legacyDay)
         transaction {
             val migrated = db.rawQuery("SELECT value FROM metadata WHERE key='legacy_import_v1'", null).use { it.moveToFirst() }
             if (!migrated) {
@@ -64,7 +64,7 @@ class ManagerControlDatabase internal constructor(context: Context, name: String
                 }
                 val auth = preferences("parent_auth_runtime")
                 if (auth.getString("quota_day", "").isNullOrBlank()) {
-                    check(auth.edit().putString("quota_day", legacyDay).putInt("quota_count", if (legacyQuotaUsed) 1 else 0).commit())
+                    check(auth.edit().putString("quota_day", legacyDay).putInt("quota_count", legacyQuotaUsed).commit())
                 }
                 db.execSQL("INSERT INTO metadata VALUES('legacy_import_v1','1')")
             }
@@ -134,6 +134,25 @@ class ManagerControlDatabase internal constructor(context: Context, name: String
 
     /** Clear under the consumer's drain lock before clearing its timeline, preventing replay. */
     fun discardDiagnostics() = transaction { db.delete("diagnostic_outbox", null, null); Unit }
+
+    internal fun enqueuePinStatistic(packageName: String, receipt: String, day: String) {
+        check(hasTransaction())
+        val prefs = preferences("pin_statistics_outbox")
+        check(prefs.edit().putString(receipt, JSONObject().put("package", packageName).put("day", day).toString()).commit())
+    }
+
+    /** Delivered after the authority transaction. Failures remain queued for the next manager call. */
+    fun drainPinStatistics(context: Context) {
+        val pending = preferences("pin_statistics_outbox").all.toMap()
+        pending.forEach { (key, raw) ->
+            runCatching {
+                val value = JSONObject(raw as String)
+                val accepted = com.liuml.apptimelimiter.statistics.UsageStatsRepository(context)
+                    .recordParentUnlockEvent(value.getString("package"), java.time.LocalDate.parse(value.getString("day")), key)
+                if (accepted) preferences("pin_statistics_outbox").edit().remove(key).commit()
+            }
+        }
+    }
 
     internal fun preferences(namespace: String): SharedPreferences = SqlPreferences(namespace)
     internal fun hasTransaction(): Boolean = db.inTransaction()

@@ -59,17 +59,15 @@ class SessionPlanPanel(
     init {
         orientation = VERTICAL
         setPadding(ui.dp(22), ui.dp(18), ui.dp(22), ui.dp(16))
-        background = ui.roundedBackground(colors.surface, 24f, 1, colors.outline)
+        background = ui.roundedBackground(colors.surface, 24f)
         val header = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             addView(eyebrowView, LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(
-                TextView(context).apply {
-                    text = "×"
-                    textSize = 28f
-                    gravity = Gravity.CENTER
-                    setTextColor(colors.textSecondary)
+                android.widget.ImageView(context).apply {
+                    setImageDrawable(FunctionIconDrawable("close", colors.textSecondary))
+                    setPadding(ui.dp(13), ui.dp(13), ui.dp(13), ui.dp(13))
                     contentDescription = ui.text("关闭本次计划", "Close session plan")
                     isClickable = true
                     isFocusable = true

@@ -218,6 +218,19 @@ object UiText {
     }
 
     private val EXACT = mapOf(
+        "可统一设置共享每日额度、每轮使用上限、可用时段和共享冷却；加入后个人规则暂停，移出后恢复。" to "Configure shared daily, per-launch, schedule, and cooldown rules. Personal rules are suspended while grouped and resume after removal.",
+        "每日累计、每轮使用上限、可用时段和到限后冷却可以独立开启，也可以组合生效。" to "Daily, per-launch, schedule and post-exit cooldown rules can work independently or together.",
+        "将短视频、游戏等应用归入同一组，统一配置共享每日额度、每轮使用上限、时段和冷却。" to "Group short-video, game and similar apps under shared daily, per-launch, schedule and cooldown rules.",
+        "需先开启每日累计或每轮使用上限，才能启用到限后冷却。" to "Enable a daily or per-launch quota before enabling post-exit cooldown.",
+        "每轮使用上限、每日累计、每周可用时段和到限后冷却可以组合使用。" to "Per-launch, daily, weekly schedule and post-exit cooldown rules can be combined.",
+        "每轮使用上限" to "Session usage limit",
+        "到限后冷却" to "Cooling-off period after a limit",
+        "短暂切换页面或离开后返回可能延续本轮；完成规定休息后开始新一轮" to "Switching screens or returning shortly may continue this session. A new session starts after the required break.",
+        "两个限制可同时开启，任一达到上限即执行当前模式的管控方式。" to "Both limits can be enabled. Reaching either applies the selected protection action.",
+        "查看所选日期的应用使用情况" to "App usage for the selected date",
+        "管控页" to "Restriction page",
+        "加入 QQ 群交流使用体验；问题反馈请使用下方日志文件入口" to "Join the QQ community to discuss the app. Use the log-file feedback entry below to report issues.",
+        "当前规则要求到限后冷却，不可延时" to "This rule requires a cooling-off period; extensions are unavailable",
         "时停" to "Time Stop",
         "首页" to "Home",
         "应用" to "Apps",

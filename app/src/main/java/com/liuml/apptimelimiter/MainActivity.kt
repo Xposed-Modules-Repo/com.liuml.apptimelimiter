@@ -70,7 +70,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
+import com.liuml.apptimelimiter.ui.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -82,11 +82,11 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.OutlinedButton
+import com.liuml.apptimelimiter.ui.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
+import com.liuml.apptimelimiter.ui.Switch
 import androidx.compose.material3.Text as MaterialText
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
@@ -1474,7 +1474,7 @@ private fun TimeLimiterScreen(
                                 MainSection.HOME -> "应用使用时长管控"
                                 MainSection.APPS -> "已启用 ${enabledPackages.size} 个应用"
                                 MainSection.GROUPS -> "${groups.size} 个应用分组"
-                                MainSection.STATS -> "展示今日使用过的全部应用"
+                                MainSection.STATS -> "查看所选日期的应用使用情况"
                             },
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1485,16 +1485,27 @@ private fun TimeLimiterScreen(
                     containerColor = MaterialTheme.colorScheme.background,
                 ),
                 actions = {
-                    TextButton(onClick = { showSettings = true }) { Text("设置") }
+                    TextButton(onClick = { showSettings = true }) {
+                        FunctionIcon("settings", Modifier.size(20.dp))
+                        Spacer(Modifier.size(6.dp))
+                        Text("设置")
+                    }
                 },
             )
         },
         bottomBar = {
-            NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
+            NavigationBar(containerColor = MaterialTheme.colorScheme.surface, tonalElevation = 0.dp) {
                 MainSection.entries.forEach { section ->
                     val selected = selectedSection == section
                     NavigationBarItem(
                         selected = selected,
+                        colors = androidx.compose.material3.NavigationBarItemDefaults.colors(
+                            selectedIconColor = MaterialTheme.colorScheme.primary,
+                            selectedTextColor = MaterialTheme.colorScheme.primary,
+                            indicatorColor = Color.Transparent,
+                            unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        ),
                         onClick = {
                             selectedSection = section
                             usageRevision++
@@ -1520,6 +1531,8 @@ private fun TimeLimiterScreen(
         when (selectedSection) {
             MainSection.HOME -> HomeDashboard(
                 modifier = Modifier.fillMaxSize().padding(padding),
+                protection = protectionPresentation,
+                onOpenProtection = { showSettings = true },
                 enabledCount = enabledPackages.size,
                 todayTotalMillis = todayTotalMillis,
                 statsEnabled = statsEnabled,
@@ -2692,7 +2705,7 @@ private fun TimeLimiterScreen(
                     }
                     Text(
                         if (basicProtectionAvailable) {
-                            "普通保护仍会使用独立限制页，但在问题解决前不能通过 Shizuku 强制退出。"
+                            "普通保护仍会使用管控页，但在问题解决前不能通过 Shizuku 强制退出。"
                         } else {
                             "必要权限缺失时，普通保护不会生效。请完成授权后重新打开目标应用。"
                         },
@@ -3373,6 +3386,8 @@ private enum class MainSection(val label: String) {
 @Composable
 private fun HomeDashboard(
     modifier: Modifier,
+    protection: ProtectionPresentationSnapshot,
+    onOpenProtection: () -> Unit,
     enabledCount: Int,
     todayTotalMillis: Long,
     statsEnabled: Boolean,
@@ -3383,11 +3398,21 @@ private fun HomeDashboard(
     onOpenGuide: () -> Unit,
     onOpenLogs: () -> Unit,
 ) {
+    val context = LocalContext.current
+    var showCountHelp by remember { mutableStateOf(false) }
     LazyColumn(
         modifier = modifier,
         contentPadding = androidx.compose.foundation.layout.PaddingValues(20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
+        item {
+            DashboardActionCard(
+                iconKey = "settings",
+                title = protectionPresentationTitle(context, protection),
+                description = localizedText(context, "查看保护状态与设置", "View protection status and settings"),
+                onClick = onOpenProtection,
+            )
+        }
         if (statsEnabled && !usageAccessGranted) {
             item {
                 UsageAccessCard(onRequestUsageAccess)
@@ -3417,7 +3442,8 @@ private fun HomeDashboard(
             }
         }
         item {
-            Text(
+            TextButton(onClick = { showCountHelp = !showCountHelp }) { Text(localizedText(context, "统计说明", "About these statistics")) }
+            if (showCountHelp) Text(
                 "今日限制触发按自然日重置；同一额度或时段事件反复进入只记录一次。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -3444,8 +3470,13 @@ private fun HomeDashboard(
         }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onOpenGuide) { Text("配置要求") }
-                OutlinedButton(onClick = onOpenLogs) { Text("诊断日志") }
+                OutlinedButton(onClick = onOpenGuide) {
+                    FunctionIcon("help", Modifier.size(20.dp)); Spacer(Modifier.size(6.dp))
+                    Text(localizedText(context, "使用指南", "User guide"))
+                }
+                OutlinedButton(onClick = onOpenLogs) {
+                    FunctionIcon("history", Modifier.size(20.dp)); Spacer(Modifier.size(6.dp)); Text("诊断日志")
+                }
             }
         }
     }
@@ -3489,9 +3520,9 @@ private fun protectionPresentationDetail(
         },
     )
     ProtectionPresentationState.XPOSED_REPAIR_REQUIRED -> localizedText(context, "仅列出明确未加入作用域、Hook 版本过旧或加载失败的应用。", "Only confirmed scope omissions, outdated Hooks, or Hook load failures are listed.")
-    ProtectionPresentationState.ACCESSIBILITY_RUNNING -> localizedText(context, "无障碍识别前台，使用情况访问校准计时，到限使用独立限制页。", "Accessibility detects foreground apps, Usage Access calibrates timing, and limits use the standalone page.")
+    ProtectionPresentationState.ACCESSIBILITY_RUNNING -> localizedText(context, "无障碍识别前台，使用情况访问校准计时，到限使用管控页。", "Accessibility detects foreground apps, Usage Access calibrates timing, and limits use the standalone page.")
     ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_RUNNING -> localizedText(context, "普通保护负责计时，Shizuku 已就绪并优先执行强停。", "Basic protection tracks time and Shizuku is ready to force-stop.")
-    ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_FALLBACK -> localizedText(context, "Shizuku 未就绪，基础计时仍生效；到限后回退独立限制页。", "Shizuku is not ready. Basic timing works and limits fall back to the standalone page.")
+    ProtectionPresentationState.ACCESSIBILITY_SHIZUKU_FALLBACK -> localizedText(context, "Shizuku 未就绪，基础计时仍生效；到限后回退管控页。", "Shizuku is not ready. Basic timing works and limits fall back to the standalone page.")
     ProtectionPresentationState.ACCESSIBILITY_NOT_READY -> localizedText(context, "请完成无障碍连接和使用情况访问授权。", "Connect accessibility and grant Usage Access.")
 }
 
@@ -3523,50 +3554,9 @@ private fun UsageAccessCard(onRequestUsageAccess: () -> Unit) {
 @Composable
 private fun FunctionIcon(
     iconKey: String,
-    modifier: Modifier = Modifier.size(34.dp),
+    modifier: Modifier = Modifier.size(26.dp),
     tint: Color = MaterialTheme.colorScheme.primary,
-) {
-    Canvas(modifier = modifier) {
-        val stroke = Stroke(
-            width = 2.1.dp.toPx(),
-            cap = StrokeCap.Round,
-            join = StrokeJoin.Round,
-        )
-        fun point(value: Float): Float = value / 24f * size.minDimension
-        fun path(draw: Path.() -> Unit) {
-            drawPath(Path().apply(draw), color = tint, style = stroke)
-        }
-        fun line(x1: Float, y1: Float, x2: Float, y2: Float) {
-            drawLine(tint, Offset(point(x1), point(y1)), Offset(point(x2), point(y2)), stroke.width, stroke.cap)
-        }
-        when (iconKey) {
-            "home" -> {
-                path { moveTo(point(3.5f), point(10.5f)); lineTo(point(12f), point(3f)); lineTo(point(20.5f), point(10.5f)) }
-                path { moveTo(point(5f), point(9.5f)); lineTo(point(5f), point(20f)); lineTo(point(19f), point(20f)); lineTo(point(19f), point(9.5f)) }
-                path { moveTo(point(9f), point(20f)); lineTo(point(9f), point(15f)); lineTo(point(15f), point(15f)); lineTo(point(15f), point(20f)) }
-            }
-            "apps" -> listOf(4f to 4f, 14f to 4f, 4f to 14f, 14f to 14f).forEach { (x, y) ->
-                drawRoundRect(tint, Offset(point(x), point(y)), androidx.compose.ui.geometry.Size(point(6f), point(6f)), CornerRadius(point(.8f), point(.8f)), style = stroke)
-            }
-            "groups" -> {
-                drawCircle(tint, point(3f), Offset(point(9f), point(8f)), style = stroke)
-                drawCircle(tint, point(2.5f), Offset(point(17f), point(9f)), style = stroke)
-                path { moveTo(point(3.5f), point(20f)); cubicTo(point(4f), point(16.8f), point(5.8f), point(15f), point(9f), point(15f)); cubicTo(point(12.1f), point(15f), point(14f), point(16.8f), point(14.5f), point(20f)) }
-                path { moveTo(point(14f), point(15.5f)); cubicTo(point(16.8f), point(15.3f), point(18.8f), point(17f), point(19.5f), point(20f)) }
-            }
-            "stats" -> { line(4f, 20f, 4f, 10f); line(10f, 20f, 10f, 5f); line(16f, 20f, 16f, 13f); line(2f, 20f, 22f, 20f) }
-            "timer" -> { drawCircle(tint, point(8f), Offset(point(12f), point(13f)), style = stroke); line(12f, 13f, 12f, 8f); line(9f, 3f, 15f, 3f); line(12f, 3f, 12f, 5f) }
-            else -> {
-                drawCircle(tint, point(7.5f), Offset(point(12f), point(12f)), style = stroke)
-                drawCircle(tint, point(3f), Offset(point(12f), point(12f)), style = stroke)
-                line(12f, 2.5f, 12f, 5f); line(12f, 19f, 12f, 21.5f)
-                line(2.5f, 12f, 5f, 12f); line(19f, 12f, 21.5f, 12f)
-                line(5.3f, 5.3f, 7.4f, 7.4f); line(16.6f, 16.6f, 18.7f, 18.7f)
-                line(18.7f, 5.3f, 16.6f, 7.4f); line(7.4f, 16.6f, 5.3f, 18.7f)
-            }
-        }
-    }
-}
+) = com.liuml.apptimelimiter.ui.FunctionIcon(iconKey, modifier, tint)
 
 @Composable
 private fun DashboardMetricCard(
@@ -3623,8 +3613,12 @@ private fun DashboardActionCard(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(18.dp),
         ) {
-            FunctionIcon(iconKey, modifier = Modifier.size(38.dp))
-            Column {
+            Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(12.dp)) {
+                Box(Modifier.size(46.dp), contentAlignment = Alignment.Center) {
+                    FunctionIcon(iconKey, modifier = Modifier.size(27.dp))
+                }
+            }
+            Column(Modifier.weight(1f)) {
                 Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Text(
                     description,
@@ -3632,6 +3626,7 @@ private fun DashboardActionCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            FunctionIcon("chevron", Modifier.size(18.dp), MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -3706,6 +3701,8 @@ private fun UsageStatisticsScreen(
     val canGoPrevious = StatisticsDateRangePolicy.canSelect(selectedDate.minusDays(1L), today)
     val canGoNext = StatisticsDateRangePolicy.canSelect(selectedDate.plusDays(1L), today)
     var showDatePicker by remember { mutableStateOf(false) }
+    var showDataActions by remember { mutableStateOf(false) }
+    var confirmClearStatistics by remember { mutableStateOf(false) }
     var selectedChartPackage by rememberSaveable(selectedDate, showSystemApps) { mutableStateOf<String?>(null) }
     val selectedChartSummary = visibleSummaries.firstOrNull {
         it.packageName == selectedChartPackage
@@ -3806,6 +3803,7 @@ private fun UsageStatisticsScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 OutlinedButton(onClick = onOpenWeeklyReport) {
+                    FunctionIcon("calendar", Modifier.size(20.dp)); Spacer(Modifier.size(6.dp))
                     Text(localizedText(context, "查看时间周报", "View weekly report"))
                 }
             }
@@ -3836,32 +3834,6 @@ private fun UsageStatisticsScreen(
             }
         }
         item {
-            if (loading) {
-                Box(Modifier.fillMaxWidth().height(250.dp), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
-                }
-            } else {
-                StatisticsRingOverview(
-                    modifier = Modifier.fillMaxWidth(),
-                    totalMillis = totalMillis,
-                    summaries = visibleSummaries,
-                    periodLabel = selectedDate.toString(),
-                    appsByPackage = chartAppsByPackage,
-                    colors = chartColors,
-                    onAppClick = { selectedChartPackage = it },
-                )
-            }
-        }
-        item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                StatisticsMetric(formatDashboardDuration(totalMillis), localizedText(context, "总使用", "Usage"), Modifier.weight(1f))
-                StatisticsMetric(launchCount.toString(), localizedText(context, "启动次数", "Launches"), Modifier.weight(1f))
-                StatisticsMetric(limitHitCount.toString(), localizedText(context, "限制触发", "Limits"), Modifier.weight(1f))
-                StatisticsMetric(controlledCount.toString(), localizedText(context, "管控应用", "Managed"), Modifier.weight(1f))
-                StatisticsMetric(recordedCount.toString(), localizedText(context, "记录应用", "Recorded"), Modifier.weight(1f))
-            }
-        }
-        item {
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -3876,7 +3848,9 @@ private fun UsageStatisticsScreen(
                         enabled = canGoPrevious,
                         onClick = { onDateChange(selectedDate.minusDays(1L)) },
                     ) {
-                        Text("‹", style = MaterialTheme.typography.headlineMedium)
+                        FunctionIcon("back", Modifier.size(24.dp).semantics {
+                            contentDescription = localizedText(context, "前一天", "Previous day")
+                        })
                     }
                     TextButton(
                         onClick = { showDatePicker = true },
@@ -3895,14 +3869,52 @@ private fun UsageStatisticsScreen(
                         enabled = canGoNext,
                         onClick = { onDateChange(selectedDate.plusDays(1L)) },
                     ) {
-                        Text("›", style = MaterialTheme.typography.headlineMedium)
+                        FunctionIcon("chevron", Modifier.size(24.dp).semantics {
+                            contentDescription = localizedText(context, "后一天", "Next day")
+                        })
                     }
                 }
             }
         }
         item {
+            if (loading) {
+                Box(Modifier.fillMaxWidth().height(250.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else {
+                StatisticsRingOverview(
+                    modifier = Modifier.fillMaxWidth(),
+                    totalMillis = totalMillis,
+                    summaries = visibleSummaries,
+                    periodLabel = selectedDate.toString(),
+                    appsByPackage = chartAppsByPackage,
+                    colors = chartColors,
+                    onAppClick = { selectedChartPackage = it },
+                )
+            }
+        }
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                StatisticsMetric(formatDashboardDuration(totalMillis), localizedText(context, "总使用", "Usage"), Modifier.weight(1f))
+                StatisticsMetric(launchCount.toString(), localizedText(context, "启动次数", "Launches"), Modifier.weight(1f))
+                StatisticsMetric(limitHitCount.toString(), localizedText(context, "限制触发", "Limits"), Modifier.weight(1f))
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                StatisticsMetric(controlledCount.toString(), localizedText(context, "管控应用", "Managed"), Modifier.weight(1f))
+                StatisticsMetric(recordedCount.toString(), localizedText(context, "记录应用", "Recorded"), Modifier.weight(1f))
+            }
+            }
+        }
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                TextButton(onClick = onClear) { Text(localizedText(context, "清空模块记录", "Clear module records")) }
+                TextButton(onClick = { showDataActions = !showDataActions }) { Text(localizedText(context, "统计数据管理", "Manage statistics")) }
+            }
+            if (showDataActions) {
+                Text(localizedText(context, "仅清除时停记录，不会删除系统使用记录或重置 PIN 解锁配额。", "Clears Time Stop records only; system usage and PIN quotas are unchanged."), style = MaterialTheme.typography.bodySmall)
+                TextButton(onClick = { confirmClearStatistics = true }) { Text(localizedText(context, "清除时停统计记录", "Clear Time Stop records"), color = MaterialTheme.colorScheme.error) }
+            }
             }
         }
         if (sorted.isEmpty()) {
@@ -3946,6 +3958,15 @@ private fun UsageStatisticsScreen(
                 }
             }
         }
+    }
+    if (confirmClearStatistics) {
+        AlertDialog(
+            onDismissRequest = { confirmClearStatistics = false },
+            title = { Text(localizedText(context, "清除所有时停统计记录？", "Clear all Time Stop statistics?")) },
+            text = { Text(localizedText(context, "将清除全部日期的时停统计，无法撤销。系统使用记录、管控规则及 PIN 配额不受影响。", "This deletes Time Stop statistics for all dates and cannot be undone. System usage, rules and PIN quotas are unchanged.")) },
+            confirmButton = { TextButton(onClick = { confirmClearStatistics = false; onClear() }) { Text(localizedText(context, "清除记录", "Clear records")) } },
+            dismissButton = { TextButton(onClick = { confirmClearStatistics = false }) { Text(localizedText(context, "取消", "Cancel")) } },
+        )
     }
     selectedChartSummary?.let { summary ->
         val app = appByPackage[summary.packageName]
@@ -4122,8 +4143,17 @@ private fun WeeklyReportScreen(
         topBar = {
             TopAppBar(
                 title = { Text(localizedText(context, "时间周报", "Weekly report")) },
-                navigationIcon = { TextButton(onClick = onBack) { Text("‹") } },
-                actions = { TextButton(onClick = { showPrevious = !showPrevious }) { Text(if (showPrevious) "本周" else "上周") } },
+                navigationIcon = { TextButton(onClick = onBack) {
+                    FunctionIcon("back", Modifier.size(24.dp).semantics {
+                        contentDescription = localizedText(context, "返回统计", "Back to statistics")
+                    })
+                } },
+                actions = {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilterChip(selected = !showPrevious, onClick = { showPrevious = false }, label = { Text(localizedText(context, "本周", "This week")) })
+                        FilterChip(selected = showPrevious, onClick = { showPrevious = true }, label = { Text(localizedText(context, "上周", "Last week")) })
+                    }
+                },
             )
         },
     ) { padding ->
@@ -4185,12 +4215,12 @@ private fun WeeklyReportScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(summary.packageName, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        StatisticsDetailMetric(formatDashboardDuration(summary.durationMillis), localizedText(context, "本周使用", "Weekly usage"), Modifier.weight(1f))
+                        StatisticsDetailMetric(formatDashboardDuration(summary.durationMillis), localizedText(context, "所选周使用", "Selected week usage"), Modifier.weight(1f))
                         StatisticsDetailMetric(summary.launchCount.toString(), localizedText(context, "启动次数", "Launches"), Modifier.weight(1f))
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         StatisticsDetailMetric(summary.limitHitCount.toString(), localizedText(context, "限制触发", "Limits"), Modifier.weight(1f))
-                        StatisticsDetailMetric("${share.toInt()}%", localizedText(context, "占本周总时长", "Share of week"), Modifier.weight(1f))
+                        StatisticsDetailMetric("${share.toInt()}%", localizedText(context, "占所选周总时长", "Share of selected week"), Modifier.weight(1f))
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         StatisticsDetailMetric(summary.reminderCount.toString(), localizedText(context, "时停提醒", "Reminders"), Modifier.weight(1f))
@@ -4225,7 +4255,7 @@ private fun WeeklyReportInsights(
         shape = RoundedCornerShape(16.dp),
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(localizedText(context, "本周建议", "Weekly suggestions"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text(localizedText(context, "本期建议", "Suggestions for this week"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             insights.forEach { insight ->
                 Text(
                     text = localizedText(context, insight.zh, insight.en),
@@ -4677,7 +4707,7 @@ private fun GroupManagementScreen(
                         color = healthColors.onInfoContainer,
                     )
                     Text(
-                        "可统一设置共享每日额度、单次打开、可用时段和共享冷却；加入后个人规则暂停，移出后恢复。",
+                        "可统一设置共享每日额度、每轮使用上限、可用时段和共享冷却；加入后个人规则暂停，移出后恢复。",
                         style = MaterialTheme.typography.bodyMedium,
                         color = healthColors.onInfoContainer.copy(alpha = 0.82f),
                     )
@@ -4899,7 +4929,7 @@ private fun GroupEditorDialog(
                 item { HorizontalDivider() }
                 item {
                     ThresholdEditor(
-                        title = "单次打开",
+                        title = "每轮使用上限",
                         description = "统一限制每个成员应用的单次前台使用时长",
                         enabled = perLaunchEnabled,
                         minutes = perLaunchMinutes,
@@ -4925,7 +4955,7 @@ private fun GroupEditorDialog(
                 item { HorizontalDivider() }
                 item {
                     ThresholdEditor(
-                        title = "退出后冷却",
+                        title = "到限后冷却",
                         description = "任一成员达到分组额度后，整个分组共同进入冷却",
                         enabled = cooldownEnabled,
                         toggleAvailable = cooldownAvailable,
@@ -4940,7 +4970,7 @@ private fun GroupEditorDialog(
                 if (!cooldownAvailable) {
                     item {
                         Text(
-                            "需先开启每日累计或单次打开，才能启用退出后冷却。",
+                            "需先开启每日累计或每轮使用上限，才能启用到限后冷却。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -5250,7 +5280,7 @@ private fun FeatureIntroDialog(onClose: (doNotShowAgain: Boolean) -> Unit) {
             FeatureIntroPage(
                 eyebrow = "精细管控",
                 title = "把使用边界设清楚",
-                description = "每日累计、单次打开、可用时段和退出后冷却可以独立开启，也可以组合生效。",
+                description = "每日累计、每轮使用上限、可用时段和到限后冷却可以独立开启，也可以组合生效。",
                 highlights = listOf("任一规则先到即执行退出", "管理应用被清理后规则仍可继续执行"),
             ),
             FeatureIntroPage(
@@ -5262,7 +5292,7 @@ private fun FeatureIntroDialog(onClose: (doNotShowAgain: Boolean) -> Unit) {
             FeatureIntroPage(
                 eyebrow = "应用分组",
                 title = "一组应用，共享一套规则",
-                description = "将短视频、游戏等应用归入同一组，统一配置共享每日额度、单次打开、时段和冷却。",
+                description = "将短视频、游戏等应用归入同一组，统一配置共享每日额度、每轮使用上限、时段和冷却。",
                 highlights = listOf("已选应用自动置顶，便于维护", "任一成员触发后全组共用同一冷却"),
             ),
             FeatureIntroPage(
@@ -5509,7 +5539,7 @@ private fun SetupGuideDialog(
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (nonRootModeEnabled) {
                     Text("普通保护需要启用时停无障碍服务，并授予使用情况访问权限。")
-                    Text("Shizuku 是可选增强，仅负责到限后强停第三方应用；不可用时自动回退独立限制页。")
+                    Text("Shizuku 是可选增强，仅负责到限后强停第三方应用；不可用时自动回退管控页。")
                 } else {
                     Text("启用时停模块，将目标应用加入作用域，保存规则后强停并重开目标应用。")
                     Text("只有检测到应用未加入作用域或运行异常时，时停才会显示修复提示。")
@@ -5577,6 +5607,7 @@ private fun SettingsDialog(
     onSave: (GlobalSettings) -> Unit,
 ) {
     val context = LocalContext.current
+    var settingsCategory by rememberSaveable { mutableIntStateOf(1) }
     var protectionMode by remember { mutableStateOf(initialSettings.protectionMode) }
     var nonRootCompatibilityMode by remember {
         mutableStateOf(initialSettings.nonRootCompatibilityMode)
@@ -5659,7 +5690,9 @@ private fun SettingsDialog(
     var extensionSessionLimitText by remember {
         mutableStateOf(initialSettings.extensionSessionLimit.toString())
     }
-    val parsedMinutes = extensionMinutes.toLongOrNull()?.takeIf { it in 1L..60L }
+    val parsedMinutes = extensionMinutes.toLongOrNull()?.takeIf {
+        it in (RuleRepository.MIN_EXTENSION_SECONDS / 60L)..(RuleRepository.MAX_EXTENSION_SECONDS / 60L)
+    }
     val parsedExtensionDailyLimit = extensionDailyLimitText.toIntOrNull()
         ?.takeIf { it in 1..ExtensionQuotaPolicy.MAX_DAILY_LIMIT }
     val parsedExtensionSessionLimit = extensionSessionLimitText.toIntOrNull()
@@ -5701,14 +5734,56 @@ private fun SettingsDialog(
         it.scopeState == ScopeState.NOT_IN_SCOPE
     }.mapTo(linkedSetOf(), TargetProtectionStatus::packageName)
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
+    val draftSettings = initialSettings.copy(
+                            exitWarningEnabled = warningEnabled,
+                            fullScreenExitWarningEnabled = fullScreenWarningEnabled,
+                            exitWarningVibrationEnabled = vibrationEnabled,
+                            usageMilestoneReminderEnabled = usageMilestoneReminderEnabled,
+                            openUsageTipEnabled = openUsageTipEnabled,
+                            languageMode = languageMode,
+                            themeMode = themeMode,
+                            themeColor = themeColor,
+                            timeQuotesEnabled = timeQuotesEnabled,
+                            builtInTimeQuotesEnabled = builtInTimeQuotesEnabled,
+                            customTimeQuotes = TimeQuotePolicy.parseCustomQuotes(
+                                customTimeQuotesText,
+                            ),
+                            automaticUpdateCheckEnabled = automaticUpdateCheckEnabled,
+                            protectionMode = protectionMode,
+                            nonRootCompatibilityMode = nonRootCompatibilityMode,
+                            extensionEnabled = extensionEnabled,
+                            extensionSeconds = (parsedMinutes ?: 5L) * 60L,
+                            extensionDailyLimit = parsedExtensionDailyLimit
+                                ?: ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT,
+                            extensionSessionLimit = parsedExtensionSessionLimit
+                                ?: ExtensionQuotaPolicy.DEFAULT_SESSION_LIMIT,
+                            extensionFreeDailyLimit = initialSettings.extensionFreeDailyLimit,
+                            limitEnforcementMode = limitEnforcementMode,
+                            xposedRootEnhancementEnabled = rootEnhancementEnabled,
+                            accessibilityForceStopEnhancement = accessibilityEnhancement,
+                            diagnosticsEnabled = diagnosticsEnabled,
+                            launcherIconHidden = launcherIconHidden,
+                            usageStatsEnabled = usageStatsEnabled,
+                        )
+    var confirmDiscard by remember { mutableStateOf(false) }
+    val settingsListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    LaunchedEffect(settingsCategory) { settingsListState.scrollToItem(0) }
+    val dismissSettings: () -> Unit = {
+        if (draftSettings != initialSettings) confirmDiscard = true else onDismiss()
+    }
+    SettingsPageShell(
+        onDismissRequest = dismissSettings,
+        selectedCategory = settingsCategory,
+        onCategoryChange = { settingsCategory = it },
         title = { Text("设置") },
         text = {
             LazyColumn(
-                modifier = Modifier.heightIn(max = 520.dp),
+                state = settingsListState,
+                modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
+                if (settingsCategory == 0) {
+                    item { Text(localizedText(context, "本页安全操作单独确认后立即生效，不受“放弃未保存修改”影响。", "Security actions take effect immediately after their own confirmation and are not reverted by discarding unsaved changes."), style = MaterialTheme.typography.bodySmall) }
                 item {
                     SettingsSectionTitle(
                         localizedText(context, "安全与管控锁", "Security and Control Lock"),
@@ -5737,7 +5812,7 @@ private fun SettingsDialog(
                                         if (childLockSnapshot.enabled) {
                                             localizedText(
                                                 context,
-                                                "已保护规则、分组、设置及 1–60 分钟家长临时放行",
+                                                "已保护规则、分组、设置及 1–60 分钟PIN 临时放行",
                                                 "Protects rules, groups, settings, and 1-60 minute parent overrides",
                                             )
                                         } else {
@@ -5758,6 +5833,7 @@ private fun SettingsDialog(
                                 )
                             }
                             if (childLockSnapshot.enabled) {
+                                PinDailyLimitSetting()
                                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     OutlinedButton(onClick = onChangeChildPin) {
                                         Text(localizedText(context, "修改 PIN", "Change PIN"))
@@ -5789,8 +5865,8 @@ private fun SettingsDialog(
                                 Text(
                                     localizedText(
                                         context,
-                                        "每次验证可选择 1–60 分钟，默认 5 分钟且不记忆上次选择；时间到期、目标应用真正进入后台、息屏或进程结束时立即撤销。清除时停数据、撤销权限或关闭模块仍可绕过，本功能不是设备所有者级家长控制。",
-                                        "Each verification allows 1-60 minutes, defaults to 5 minutes, and does not remember the previous choice. The override ends when time expires, the target app truly enters the background, the screen locks, or the process ends. Clearing Time Stop data, revoking permissions, or disabling the module can bypass it; this is not device-owner parental control.",
+                                        "每次验证可选择 1–60 分钟，默认 5 分钟且不记忆上次选择；授权在固定截止时间前有效，退出重进、息屏或应用进程结束不会延长或撤销授权。清除时停数据、撤销权限或关闭模块仍可绕过，本功能不是设备所有者级家长控制。",
+                                        "Each verification allows 1-60 minutes, defaults to 5 minutes, and does not remember the previous choice. The allowance keeps its fixed deadline across re-entry, screen lock and app process restarts. Clearing Time Stop data, revoking permissions, or disabling the module can bypass it; this is not device-owner parental control.",
                                     ),
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -5848,6 +5924,9 @@ private fun SettingsDialog(
                     }
                 }
                 item { HorizontalDivider() }
+
+                }
+                if (settingsCategory == 1) {
                 item {
                     SettingsSectionTitle("保护方式")
                 }
@@ -5869,7 +5948,7 @@ private fun SettingsDialog(
                             val description = when (mode) {
                                 ProtectionMode.XPOSED -> "由目标应用内 Hook 精确计时并执行限制"
                                 ProtectionMode.ACCESSIBILITY ->
-                                    "无障碍识别前台，UsageStats 校准，到限显示独立限制页"
+                                    "无障碍识别前台，UsageStats 校准，到限显示管控页"
                             }
                             Surface(
                                 modifier = Modifier.fillMaxWidth().clickable {
@@ -6013,6 +6092,14 @@ private fun SettingsDialog(
                                     overflow = TextOverflow.Ellipsis,
                                 )
                             }
+                            if (protectionMode == ProtectionMode.XPOSED) {
+                                HookReloadControls(
+                                    packages = com.liuml.apptimelimiter.core.HookReloadTargetPolicy.packages(xposedTargets),
+                                    targets = xposedTargets,
+                                    onRequestScope = onRequestScope,
+                                    onRefreshStatus = onRefreshProtectionStatus,
+                                )
+                            }
                         }
                     }
                 }
@@ -6035,7 +6122,7 @@ private fun SettingsDialog(
                                             if (protectionMode == ProtectionMode.XPOSED) {
                                                 "LSPosed 无法完全停止时，可用 Root 强停整个应用包；失败仍执行原有退出逻辑。"
                                             } else {
-                                                "普通保护可用。首次达到限制时请求 Root；失败会回退独立限制页。"
+                                                "普通保护可用。首次达到限制时请求 Root；失败会回退管控页。"
                                             },
                                             if (protectionMode == ProtectionMode.XPOSED) {
                                                 "Use Root to stop the whole package when LSPosed cannot fully stop it; failures keep the existing exit behavior."
@@ -6073,7 +6160,7 @@ private fun SettingsDialog(
                                 Text(
                                     localizedText(
                                         context,
-                                        "无障碍始终负责识别和计时；强停失败会回退独立限制页。",
+                                        "无障碍始终负责识别和计时；强停失败会回退管控页。",
                                         "Accessibility always owns detection and timing. Failed force-stops fall back to the restriction page.",
                                     ),
                                     style = MaterialTheme.typography.bodySmall,
@@ -6094,7 +6181,7 @@ private fun SettingsDialog(
                                             label = {
                                                 Text(
                                                     when (enhancement) {
-                                                        ForceStopEnhancement.NONE -> localizedText(context, "独立管控页", "Restriction page")
+                                                        ForceStopEnhancement.NONE -> localizedText(context, "管控页", "Restriction page")
                                                         ForceStopEnhancement.ROOT -> "Root"
                                                         ForceStopEnhancement.SHIZUKU -> "Shizuku"
                                                     },
@@ -6188,7 +6275,7 @@ private fun SettingsDialog(
                                 Text(
                                     localizedText(
                                         context,
-                                        "只读取当前前台应用包名，不读取页面节点、文字或输入内容；达到限制时显示独立限制页，启动失败才返回桌面。",
+                                        "只读取当前前台应用包名，不读取页面节点、文字或输入内容；达到限制时显示管控页，启动失败才返回桌面。",
                                         "Only the foreground package name is used. Page nodes, text, and input are never read. Limits use the standalone restriction page and return Home only if it cannot open.",
                                     ),
                                     style = MaterialTheme.typography.bodySmall,
@@ -6278,7 +6365,7 @@ private fun SettingsDialog(
                                 modifier = Modifier.fillMaxWidth().padding(12.dp),
                                 verticalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
-                                Text("独立限制页兼容性", fontWeight = FontWeight.Medium)
+                                Text("管控页兼容性", fontWeight = FontWeight.Medium)
                                 Text(
                                     if (compatibility.lastFailureAtMillis > 0L) {
                                         localizedText(
@@ -6376,6 +6463,9 @@ private fun SettingsDialog(
                     }
                 }
                 item { HorizontalDivider() }
+
+                }
+                if (settingsCategory == 2) {
                 item {
                     SettingsSectionTitle("外观")
                 }
@@ -6453,7 +6543,7 @@ private fun SettingsDialog(
                             Column(Modifier.weight(1f)) {
                                 Text("时间短句", fontWeight = FontWeight.Medium)
                                 Text(
-                                    "在计划、全屏提醒和独立限制页显示",
+                                    "在计划、全屏提醒和管控页显示",
                                     style = MaterialTheme.typography.bodySmall,
                                 )
                             }
@@ -6509,6 +6599,10 @@ private fun SettingsDialog(
                         }
                     }
                 }
+
+                }
+                if (settingsCategory == 3) {
+                    item { SettingsSectionTitle(localizedText(context, "提醒与延时", "Reminders and extensions")) }
                 if (settingsVisibility.showXposedExecution) {
                     item { HorizontalDivider() }
                     item {
@@ -6538,7 +6632,7 @@ private fun SettingsDialog(
                                         limitEnforcementMode =
                                             LimitEnforcementMode.EXTERNAL_BREAK_PAGE
                                     },
-                                    label = { Text("独立休息页") },
+                                    label = { Text("管控页") },
                                 )
                             }
                             if (
@@ -6546,13 +6640,13 @@ private fun SettingsDialog(
                                 LimitEnforcementMode.EXTERNAL_BREAK_PAGE
                             ) {
                                 Text(
-                                    "达到限制后打开独立休息页，使目标界面自然暂停，并尽力暂停常见媒体。休息页不提供延时；单次额度配合冷却时，结束后可继续原页面。切换方式后请强停并重开目标应用。",
+                                    "达到限制后打开管控页，使目标界面自然暂停，并尽力暂停常见媒体。是否可以延时取决于当前规则和剩余次数；单次额度配合冷却时，结束后可继续原页面。切换方式后请强停并重开目标应用。",
                                     color = MaterialTheme.colorScheme.primary,
                                     style = MaterialTheme.typography.bodySmall,
                                 )
                             } else {
                                 Text(
-                                    "强制退出会关闭目标任务并结束当前 Hook 进程；多进程应用的独立后台服务可能继续运行，需整包强停时请使用普通保护 + Shizuku。",
+                                    "强制退出会关闭目标任务并结束当前 Hook 进程；多进程应用的独立后台服务可能继续运行，需要停止整个应用时可开启本模式的 Root 强停增强，失败保留基础限制。",
                                     color = MaterialTheme.colorScheme.primary,
                                     style = MaterialTheme.typography.bodySmall,
                                 )
@@ -6620,6 +6714,8 @@ private fun SettingsDialog(
                             )
                         }
                     }
+                }
+                run {
                     item {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -6627,7 +6723,7 @@ private fun SettingsDialog(
                             horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
                             Column(Modifier.weight(1f)) {
-                                Text(localizedText(context, "开屏使用时间提示", "Usage tip on app entry"), fontWeight = FontWeight.Medium)
+                                Text(localizedText(context, "进入应用时提示用时", "Usage tip on app entry"), fontWeight = FontWeight.Medium)
                                 Text(localizedText(context, "进入管控应用时短暂显示今日使用与剩余时间。", "Briefly show today's usage and remaining time on entry."), style = MaterialTheme.typography.bodySmall)
                             }
                             Switch(checked = openUsageTipEnabled, onCheckedChange = { openUsageTipEnabled = it })
@@ -6637,7 +6733,7 @@ private fun SettingsDialog(
                         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween) {
                             Column(Modifier.weight(1f)) {
-                                Text(localizedText(context, "使用时长提醒", "Usage duration reminder"), fontWeight = FontWeight.Medium)
+                                Text(localizedText(context, "每 30 分钟提醒", "Usage duration reminder"), fontWeight = FontWeight.Medium)
                                 Text(
                                     localizedText(
                                         context,
@@ -6676,14 +6772,13 @@ private fun SettingsDialog(
                             Column(Modifier.weight(1f)) {
                                 Text("延时功能", fontWeight = FontWeight.Medium)
                                 Text(
-                                    "到达限制提醒时允许临时延长使用；关闭后不显示延时和广告延时入口。",
+                                    "到达限制提醒时允许免费延长使用，仍受每日和每轮次数限制；关闭后不显示延时入口。",
                                     style = MaterialTheme.typography.bodySmall,
                                 )
                             }
                             Switch(
                                 checked = extensionEnabled,
                                 onCheckedChange = { extensionEnabled = it },
-                                enabled = warningEnabled,
                             )
                         }
                     }
@@ -6701,7 +6796,7 @@ private fun SettingsDialog(
                                 KeyboardOptions(keyboardType = KeyboardType.Number),
                             isError = extensionMinutes.isNotEmpty() &&
                                 parsedMinutes == null,
-                            enabled = warningEnabled && extensionEnabled,
+                            enabled = extensionEnabled,
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
@@ -6719,7 +6814,7 @@ private fun SettingsDialog(
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             isError = extensionDailyLimitText.isNotEmpty() &&
                                 parsedExtensionDailyLimit == null,
-                            enabled = warningEnabled && extensionEnabled,
+                            enabled = extensionEnabled,
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
@@ -6737,13 +6832,16 @@ private fun SettingsDialog(
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             isError = extensionSessionLimitText.isNotEmpty() &&
                                 parsedExtensionSessionLimit == null,
-                            enabled = warningEnabled && extensionEnabled,
+                            enabled = extensionEnabled,
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
                     }
                 }
                 item { HorizontalDivider() }
+
+                }
+                if (settingsCategory == 4) {
                 item {
                     SettingsSectionTitle("统计与诊断")
                 }
@@ -6823,6 +6921,9 @@ private fun SettingsDialog(
                     }
                 }
                 item { HorizontalDivider() }
+
+                }
+                if (settingsCategory == 5) {
                 item {
                     SettingsSectionTitle("应用设置")
                 }
@@ -6946,6 +7047,9 @@ private fun SettingsDialog(
                     }
                 }
                 item { HorizontalDivider() }
+
+                }
+                if (settingsCategory == 6) {
                 item {
                     SettingsSectionTitle(
                         localizedText(context, "数据与备份", "Data and backup"),
@@ -7039,6 +7143,9 @@ private fun SettingsDialog(
                     )
                 }
                 item { HorizontalDivider() }
+
+                }
+                if (settingsCategory == 7) {
                 item {
                     SettingsSectionTitle("维护与支持")
                 }
@@ -7072,7 +7179,7 @@ private fun SettingsDialog(
                 item {
                     SettingsEntry(
                         title = "加入内测",
-                        description = "加入 QQ 群获取测试版本并反馈问题",
+                        description = "加入 QQ 群交流使用体验；问题反馈请使用下方日志文件入口",
                         action = "加群 ›",
                         onClick = onJoinBeta,
                     )
@@ -7102,53 +7209,33 @@ private fun SettingsDialog(
                         onClick = onDonate,
                     )
                 }
+                }
+
             }
         },
         confirmButton = {
             Button(
                 onClick = {
-                    onSave(
-                        initialSettings.copy(
-                            exitWarningEnabled = warningEnabled,
-                            fullScreenExitWarningEnabled = fullScreenWarningEnabled,
-                            exitWarningVibrationEnabled = vibrationEnabled,
-                            usageMilestoneReminderEnabled = usageMilestoneReminderEnabled,
-                            openUsageTipEnabled = openUsageTipEnabled,
-                            languageMode = languageMode,
-                            themeMode = themeMode,
-                            themeColor = themeColor,
-                            timeQuotesEnabled = timeQuotesEnabled,
-                            builtInTimeQuotesEnabled = builtInTimeQuotesEnabled,
-                            customTimeQuotes = TimeQuotePolicy.parseCustomQuotes(
-                                customTimeQuotesText,
-                            ),
-                            automaticUpdateCheckEnabled = automaticUpdateCheckEnabled,
-                            protectionMode = protectionMode,
-                            nonRootCompatibilityMode = nonRootCompatibilityMode,
-                            extensionEnabled = extensionEnabled,
-                            extensionSeconds = (parsedMinutes ?: 5L) * 60L,
-                            extensionDailyLimit = parsedExtensionDailyLimit
-                                ?: ExtensionQuotaPolicy.DEFAULT_DAILY_LIMIT,
-                            extensionSessionLimit = parsedExtensionSessionLimit
-                                ?: ExtensionQuotaPolicy.DEFAULT_SESSION_LIMIT,
-                            extensionFreeDailyLimit = ExtensionQuotaPolicy.DEFAULT_FREE_DAILY_LIMIT,
-                            limitEnforcementMode = limitEnforcementMode,
-                            xposedRootEnhancementEnabled = rootEnhancementEnabled,
-                            accessibilityForceStopEnhancement = accessibilityEnhancement,
-                            diagnosticsEnabled = diagnosticsEnabled,
-                            launcherIconHidden = launcherIconHidden,
-                            usageStatsEnabled = usageStatsEnabled,
-                        ),
-                    )
+                    onSave(draftSettings)
                 },
-                enabled = !rootAuthorizationPending && (!warningEnabled || !extensionEnabled || parsedMinutes != null) &&
-                    (!warningEnabled || !extensionEnabled ||
+                enabled = !rootAuthorizationPending && (!extensionEnabled || parsedMinutes != null) &&
+                    (!extensionEnabled ||
                         (parsedExtensionDailyLimit != null &&
                             parsedExtensionSessionLimit != null)),
-            ) { Text("保存") }
+            ) { Text(localizedText(context, "保存并返回", "Save and return")) }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+        dismissButton = { TextButton(onClick = dismissSettings) { Text(localizedText(context, "返回", "Back")) } },
     )
+
+    if (confirmDiscard) {
+        AlertDialog(
+            onDismissRequest = { confirmDiscard = false },
+            title = { Text(localizedText(context, "放弃未保存的修改？", "Discard unsaved changes?")) },
+            text = { Text(localizedText(context, "普通设置尚未保存；已单独确认的 PIN、安全和系统授权操作不会撤销。", "Setting changes have not been saved. PIN, security and system permission actions already confirmed separately will remain in effect.")) },
+            confirmButton = { TextButton(onClick = { confirmDiscard = false; onDismiss() }) { Text(localizedText(context, "放弃修改", "Discard changes")) } },
+            dismissButton = { TextButton(onClick = { confirmDiscard = false }) { Text(localizedText(context, "继续编辑", "Keep editing")) } },
+        )
+    }
 
     if (showAccessibilityDisclosure) {
         AlertDialog(
@@ -7170,7 +7257,7 @@ private fun SettingsDialog(
                     Text(
                         localizedText(
                             context,
-                            "时停使用无障碍服务识别当前前台应用，并在用户保存的时间规则触发时显示计划选择浮层或独立限制页；限制页启动失败时返回桌面。",
+                            "时停使用无障碍服务识别当前前台应用，并在用户保存的时间规则触发时显示计划选择浮层或管控页；限制页启动失败时返回桌面。",
                             "Time Stop uses accessibility events to identify the foreground app and show the saved session-plan picker or restriction page. It returns Home only if the restriction page cannot open.",
                         ),
                     )
@@ -7383,8 +7470,8 @@ private fun DonationPromptDialog(
                 Text(
                     localizedText(
                         context,
-                        "时停仅提供用户主动触发的激励广告，并持续适配新的 Android 与 LSPosed 版本。",
-                        "Time Stop only offers user-initiated rewarded ads and keeps adapting to new Android and LSPosed versions.",
+                        "时停不包含广告，并持续适配新的 Android 与 LSPosed 版本。",
+                        "Time Stop contains no ads and keeps adapting to new Android and LSPosed versions.",
                     ),
                 )
                 Text(
@@ -7609,7 +7696,7 @@ private fun AboutDialog(
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("版本 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
                 Text("Android / LSPosed 应用前台使用时长限制模块。")
-                Text("单次打开、每日累计、每周可用时段和退出后冷却可以组合使用。")
+                Text("每轮使用上限、每日累计、每周可用时段和到限后冷却可以组合使用。")
                 Text("反馈邮箱：${FeedbackSender.EMAIL}")
                 TextButton(onClick = onOpenRepository) { Text("打开 GitHub 项目主页") }
                 TextButton(onClick = onJoinQqGroup) { Text("加入 QQ 群：$QQ_GROUP_NUMBER") }
@@ -7959,8 +8046,8 @@ private fun RuleDialog(
                 item { HorizontalDivider() }
                 item {
                     ThresholdEditor(
-                        title = "单次打开",
-                        description = "每次目标应用进程启动后重新计时",
+                        title = "每轮使用上限",
+                        description = "短暂切换页面或离开后返回可能延续本轮；完成规定休息后开始新一轮",
                         enabled = perLaunchEnabled,
                         minutes = perLaunchMinutes,
                         parsedMinutes = parsedPerLaunchMinutes,
@@ -7973,7 +8060,7 @@ private fun RuleDialog(
                 }
                 item {
                     Text(
-                        "两个限制可同时开启，任何一个先到期都会退出应用。",
+                        "两个限制可同时开启，任一达到上限即执行当前模式的管控方式。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary,
                     )
@@ -7992,7 +8079,7 @@ private fun RuleDialog(
                 item { HorizontalDivider() }
                 item {
                     ThresholdEditor(
-                        title = "退出后冷却",
+                        title = "到限后冷却",
                         description = "达到每日或单次额度后，在设定时间内限制再次使用",
                         enabled = cooldownEnabled,
                         toggleAvailable = cooldownAvailable,
@@ -8007,7 +8094,7 @@ private fun RuleDialog(
                 if (!cooldownAvailable) {
                     item {
                         Text(
-                            "需先开启每日累计或单次打开，才能启用退出后冷却。",
+                            "需先开启每日累计或每轮使用上限，才能启用到限后冷却。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -8483,5 +8570,46 @@ private fun currentSupportedLanguage(): SupportedLanguage {
         SupportedLanguage.CHINESE
     } else {
         SupportedLanguage.ENGLISH
+    }
+}
+
+@Composable
+private fun PinDailyLimitSetting() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var value by remember { mutableStateOf(
+        com.liuml.apptimelimiter.security.ParentAuthStore.dailyLimit().toString()) }
+    var busy by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf("") }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = { value = it.filter(Char::isDigit).take(2); message = "" },
+            label = { Text(localizedText(context, "每日 PIN 解锁总次数", "Daily PIN unlock limit")) },
+            supportingText = { Text(localizedText(context,
+                "所有应用共享，0–50 次；0 禁止新的临时解锁，已有授权不受影响。",
+                "Shared by all apps, 0–50. Zero blocks new unlocks; active allowances stay valid.")) },
+            modifier = Modifier.fillMaxWidth(),
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+            singleLine = true,
+            enabled = !busy,
+        )
+        OutlinedButton(
+            enabled = !busy && value.toIntOrNull()?.let { it in 0..50 } == true,
+            onClick = {
+                val limit = value.toIntOrNull() ?: return@OutlinedButton
+                busy = true
+                scope.launch {
+                    val saved = withContext(Dispatchers.IO) {
+                        com.liuml.apptimelimiter.security.ParentAuthStore.setDailyLimit(limit)
+                    }
+                    busy = false
+                    message = if (saved) localizedText(context, "已保存；今日已用次数保持不变", "Saved; today's used count is unchanged")
+                        else localizedText(context, "保存失败，请重试", "Unable to save. Try again.")
+                }
+            },
+        ) { Text(localizedText(context, "保存次数", "Save limit")) }
+        if (message.isNotBlank()) Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }

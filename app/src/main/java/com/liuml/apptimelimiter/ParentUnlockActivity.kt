@@ -19,9 +19,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.Button
+import com.liuml.apptimelimiter.ui.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
@@ -61,7 +66,6 @@ class ParentUnlockActivity : FragmentActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var token: String
     private var targetPackage = ""
-    private var deferGrantForAd = false
     private var reason = ""
     private var authorized = false
     private var expiresAtMillis = 0L
@@ -87,7 +91,7 @@ class ParentUnlockActivity : FragmentActivity() {
             if (resources.configuration.locales[0]?.language == "en") {
                 "Parent verification timed out. The restriction will continue."
             } else {
-                "家长验证已超时，将继续执行限制"
+                "PIN 验证已超时，将继续执行限制"
             },
             Toast.LENGTH_LONG,
         ).show()
@@ -131,12 +135,10 @@ class ParentUnlockActivity : FragmentActivity() {
                     ParentOverrideDurationPolicy.DEFAULT_MINUTES,
                 ) ?: ParentOverrideDurationPolicy.DEFAULT_MINUTES,
             )
-            deferGrantForAd = savedInstanceState?.getBoolean(STATE_DEFER_GRANT_FOR_AD, false) == true
             authorized = token.isNotBlank() && targetPackage.isNotBlank() &&
                 expiresAtMillis > System.currentTimeMillis()
         } else {
             token = intent.getStringExtra(EXTRA_TOKEN).orEmpty()
-            deferGrantForAd = intent.getBooleanExtra(EXTRA_DEFER_GRANT_FOR_AD, false)
             val consumed = consumeChallenge(token)
             if (consumed != null) {
                 targetPackage = consumed.getString(EXTRA_TARGET_PACKAGE).orEmpty()
@@ -156,7 +158,7 @@ class ParentUnlockActivity : FragmentActivity() {
                 if (resources.configuration.locales[0]?.language == "en") {
                     "Parent verification expired. Try again."
                 } else {
-                    "家长验证已失效，请重新点击解锁"
+                    "PIN 验证已失效，请重新点击解锁"
                 },
                 Toast.LENGTH_LONG,
             ).show()
@@ -193,36 +195,41 @@ class ParentUnlockActivity : FragmentActivity() {
                     val keyboard = LocalSoftwareKeyboardController.current
                     var pin by androidx.compose.runtime.remember { mutableStateOf("") }
                     Column(
-                        modifier = Modifier.fillMaxSize().padding(28.dp),
+                        modifier = Modifier.fillMaxSize().safeDrawingPadding().imePadding()
+                            .verticalScroll(rememberScrollState()).padding(24.dp),
                         verticalArrangement = Arrangement.Center,
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
+                        com.liuml.apptimelimiter.ui.FunctionIcon("lock", Modifier.size(44.dp))
+                        Spacer(Modifier.height(18.dp))
                         Text(
-                            if (english) "Parent temporary unlock" else "家长临时解锁",
+                            if (english) "Temporary PIN access" else "PIN 临时放行",
                             style = MaterialTheme.typography.headlineMedium,
                             fontWeight = FontWeight.Bold,
                         )
                         Spacer(Modifier.height(10.dp))
                         Text(
                             if (english) {
-                                "Enter the Time Stop PIN to temporarily allow $appLabel for this foreground session."
+                                "Enter the Time Stop PIN to temporarily allow $appLabel until its fixed expiry time."
                             } else {
-                                "输入时停 PIN，临时放行“$appLabel”的本次前台会话。"
+                                "输入时停 PIN，临时放行“$appLabel”，有效期内退出重进仍可使用。"
                             },
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         Spacer(Modifier.height(8.dp))
                         Text(
-                            if (english) "$remainingSeconds seconds remaining" else "剩余 $remainingSeconds 秒",
+                            if (english) "Complete verification within $remainingSeconds seconds" else "请在 $remainingSeconds 秒内完成验证",
                             color = MaterialTheme.colorScheme.primary,
                         )
                         Spacer(Modifier.height(18.dp))
                         Text(
-                            if (com.liuml.apptimelimiter.security.ParentAuthStore.isAdRequired(System.currentTimeMillis())) {
-                                if (english) "After PIN verification, watch an ad to allow access." else "验证 PIN 后需观看广告，成功后开始放行计时。"
-                            } else {
-                                if (english) "Today's first PIN allowance is free." else "今日首次 PIN 放行免费。"
-                            },
+                            if (english) "Daily PIN unlocks are shared across all apps. The allowance starts when you return to the app."
+                            else "每日 PIN 解锁次数由所有应用共享；返回目标应用后开始放行计时。",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Text(
+                            if (english) "PIN unlocks today: ${com.liuml.apptimelimiter.security.ParentAuthStore.usedToday(System.currentTimeMillis())}/${com.liuml.apptimelimiter.security.ParentAuthStore.dailyLimit()}"
+                            else "今日 PIN 放行已用 ${com.liuml.apptimelimiter.security.ParentAuthStore.usedToday(System.currentTimeMillis())}/${com.liuml.apptimelimiter.security.ParentAuthStore.dailyLimit()} 次",
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         OutlinedTextField(
@@ -345,7 +352,6 @@ class ParentUnlockActivity : FragmentActivity() {
         outState.putString(STATE_REASON, reason)
         outState.putLong(STATE_EXPIRES_AT, expiresAtMillis)
         outState.putInt(STATE_DURATION_MINUTES, selectedDurationMinutes)
-        outState.putBoolean(STATE_DEFER_GRANT_FOR_AD, deferGrantForAd)
     }
 
     override fun onDestroy() {
@@ -437,34 +443,7 @@ class ParentUnlockActivity : FragmentActivity() {
     }
 
     private fun completeAfterSuccessfulPin(durationMinutes: Int) {
-        val adRequired = com.liuml.apptimelimiter.security.ParentAuthStore.isAdRequired(System.currentTimeMillis())
-        if (!adRequired) {
-            complete(granted = true, event = "PARENT_AUTH_SUCCEEDED", durationMinutes = durationMinutes)
-            return
-        }
-        val marked = runCatching {
-            contentResolver.call(
-                RuleContract.CONTENT_URI,
-                RuleContract.METHOD_MARK_PARENT_AUTH_VERIFIED_FOR_AD,
-                null,
-                Bundle().apply { putString(RuleContract.KEY_PARENT_AUTH_TOKEN, token) },
-            )
-        }.getOrNull()?.getBoolean(RuleContract.KEY_OK, false) == true
-        if (!marked) {
-            // Do not downgrade an ad-gated challenge into a free override when the handoff fails.
-            complete(granted = false, event = "PARENT_AUTH_AD_HANDOFF_FAILED")
-            return
-        }
-        completed = true
-        handler.removeCallbacksAndMessages(null)
-        diagnostic("PARENT_AUTH_VERIFIED_WAITING_AD", "reason=${reason.take(60)}")
-        setResult(
-            RESULT_PIN_VERIFIED_FOR_AD,
-            Intent().putExtra(EXTRA_DURATION_MINUTES, ParentOverrideDurationPolicy.normalizeMinutes(durationMinutes)),
-        )
-        finish()
-        @Suppress("DEPRECATION")
-        overridePendingTransition(0, 0)
+        complete(granted = true, event = "PARENT_AUTH_SUCCEEDED", durationMinutes = durationMinutes)
     }
 
     private fun consumeChallenge(value: String): Bundle? = runCatching {
@@ -501,19 +480,16 @@ class ParentUnlockActivity : FragmentActivity() {
                 },
             )
         }.getOrNull()
-        if (granted && response?.getString(RuleContract.KEY_MESSAGE) == "parent_ad_required") {
+        if (granted && response?.getString(RuleContract.KEY_MESSAGE) == "parent_daily_limit_reached") {
             completed = false
-            completeAfterSuccessfulPin(durationMinutes)
+            errorText = if (resources.configuration.locales[0]?.language == "en")
+                "Today's PIN unlock limit has been reached" else "今日 PIN 解锁次数已用完"
+            handler.postDelayed(countdown, 1_000L)
             return
         }
         val persisted = response?.getBoolean(RuleContract.KEY_OK, false) == true
         val effectiveGrant = granted && persisted
         if (effectiveGrant) {
-            UsageStatsRepository(this).recordParentUnlockEvent(
-                packageName = targetPackage,
-                day = java.time.LocalDate.now(),
-                eventId = token.hashCode().toString(),
-            )
             // A successful PIN handoff owns the whole restriction UI flow. Close any stale
             // standalone page before returning to the target app; failed/cancelled auth keeps it.
             LimitBlockActivity.finishAuthorizedPageForTarget(
@@ -544,9 +520,7 @@ class ParentUnlockActivity : FragmentActivity() {
         private const val TAG = "TimeStopParentAuth"
         const val EXTRA_TOKEN = "parent_auth_token"
         const val EXTRA_TARGET_PACKAGE = "target_package"
-        const val EXTRA_DEFER_GRANT_FOR_AD = "defer_parent_grant_for_ad"
         const val EXTRA_DURATION_MINUTES = "parent_override_duration_minutes"
-        const val RESULT_PIN_VERIFIED_FOR_AD = RESULT_FIRST_USER + 41
         const val MAX_WAIT_MILLIS = 30_000L
         private const val STATE_AUTHORIZED = "state_authorized"
         private const val STATE_TOKEN = "state_token"
@@ -554,6 +528,5 @@ class ParentUnlockActivity : FragmentActivity() {
         private const val STATE_REASON = "state_reason"
         private const val STATE_EXPIRES_AT = "state_expires_at"
         private const val STATE_DURATION_MINUTES = "state_duration_minutes"
-        private const val STATE_DEFER_GRANT_FOR_AD = "state_defer_grant_for_ad"
     }
 }

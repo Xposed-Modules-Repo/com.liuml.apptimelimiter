@@ -38,12 +38,22 @@ object ExtensionQuotaPolicy {
     fun normalizeSessionLimit(value: Int): Int =
         if (value <= 0) DEFAULT_SESSION_LIMIT else value.coerceAtMost(MAX_SESSION_LIMIT)
 
+    /** Read-only presentation of the same decision used when consuming a slot. */
+    fun preview(state: ExtensionQuotaState, day: String, session: String, dailyLimit: Int, sessionLimit: Int): ExtensionQuotaDecision {
+        val result = claimFree(state, day, session, dailyLimit, sessionLimit, dailyLimit)
+        return if (!result.allowed) result else result.copy(
+            remainingCount = result.remainingCount + 1,
+            remainingSessionCount = result.remainingSessionCount + 1,
+            remainingFreeCount = result.remainingFreeCount + 1,
+        )
+    }
+
     /**
      * Free extensions are a fixed product rule, not a user preference. Retain the old
      * parameter only so restored backups and still-running Hook processes remain compatible.
      */
     fun normalizeFreeDailyLimit(@Suppress("UNUSED_PARAMETER") value: Int, dailyLimit: Int): Int =
-        DEFAULT_FREE_DAILY_LIMIT.coerceAtMost(normalizeDailyLimit(dailyLimit))
+        normalizeDailyLimit(dailyLimit)
 
     fun claimFree(
         state: ExtensionQuotaState,
@@ -104,9 +114,8 @@ object ExtensionQuotaPolicy {
         if (current.dailyUsedCount >= daily || current.sessionUsedCount >= session) {
             return decision(false, false, current, daily, session, free)
         }
-        if (!rewarded && current.freeUsedCount >= free) {
-            return decision(false, true, current, daily, session, free)
-        }
+        // Legacy rewarded claims cannot create new allowances.
+        if (rewarded) return decision(false, false, current, daily, session, free)
         val next = current.copy(
             dailyUsedCount = current.dailyUsedCount + 1,
             freeUsedCount = current.freeUsedCount + if (rewarded) 0 else 1,

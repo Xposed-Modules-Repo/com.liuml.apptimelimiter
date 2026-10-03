@@ -19,7 +19,6 @@ import androidx.core.view.WindowCompat
 import com.liuml.apptimelimiter.core.BreakSessionPolicy
 import com.liuml.apptimelimiter.core.QuotaKind
 import com.liuml.apptimelimiter.core.RestrictionPagePresentationPolicy
-import com.liuml.apptimelimiter.core.RewardedAdLoadPolicy
 import com.liuml.apptimelimiter.core.LimitEnforcementPolicy
 import com.liuml.apptimelimiter.core.RuleDecisionSnapshot
 import com.liuml.apptimelimiter.core.RuleUsageMeasurement
@@ -30,10 +29,6 @@ import com.liuml.apptimelimiter.core.ParentOverrideDurationPolicy
 import com.liuml.apptimelimiter.core.ScheduleConstraint
 import com.liuml.apptimelimiter.core.ScheduleEvaluator
 import com.liuml.apptimelimiter.core.TimeQuotePolicy
-import com.liuml.apptimelimiter.ads.RewardedAdStateRepository
-import com.liuml.apptimelimiter.ads.RewardedAdProvider
-import com.liuml.apptimelimiter.ads.RewardedAdLoadStatus
-import com.liuml.apptimelimiter.ads.TopOnRewardedAdProvider
 import com.liuml.apptimelimiter.data.GlobalSettings
 import com.liuml.apptimelimiter.data.LimitEnforcementMode
 import com.liuml.apptimelimiter.data.RuleRepository
@@ -72,10 +67,9 @@ class LimitBlockActivity : Activity() {
     private lateinit var temporaryAccessTitleView: TextView
     private lateinit var actionFeedbackView: TextView
     private lateinit var exitView: TextView
+    private lateinit var extensionView: TextView
+    private var extensionRequestId = UUID.randomUUID().toString()
     private lateinit var parentUnlockView: TextView
-    private lateinit var rewardedAdView: TextView
-    private var rewardedAdEligibilityFailureReason: String? = null
-    private var rewardedAdEligibilitySessionId = ""
     private var targetPackage = ""
     private var launchAttemptId = ""
     private var confirmedAttemptId = ""
@@ -99,11 +93,6 @@ class LimitBlockActivity : Activity() {
     private var parentAuthPoll: Runnable? = null
     private var runtimeIdentity: Bundle? = null
     private var runtimeRenewedAt = 0L
-    private var rewardedAdShowing = false
-    private var rewardedAdTransactionId = ""
-    private var rewardedAdDailyIdentity = ""
-    private var rewardedAdProvider: RewardedAdProvider? = null
-    private var rewardedAdReadyPoll: Runnable? = null
     private val deviceUsageStatsRepository by lazy {
         DeviceUsageStatsRepository(applicationContext)
     }
@@ -119,6 +108,7 @@ class LimitBlockActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        extensionRequestId = savedInstanceState?.getString("free_extension_request_id") ?: extensionRequestId
         runtimeIdentity = savedInstanceState?.getBundle("control_runtime_identity")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             onBackInvokedDispatcher.registerOnBackInvokedCallback(
@@ -161,9 +151,6 @@ class LimitBlockActivity : Activity() {
             finishWithoutAnimation("duplicate_restriction_ui")
             return
         }
-        if (RewardedAdStateRepository(this).isPrivacyConsentGranted()) {
-            ensureRewardedAdProvider()?.preload()
-        }
         diagnostic(
             "INFO",
             targetPackage,
@@ -174,6 +161,7 @@ class LimitBlockActivity : Activity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
+        outState.putString("free_extension_request_id", extensionRequestId)
         outState.putBundle("control_runtime_identity", runtimeIdentity)
         if (!BreakSessionPolicy.mayRestoreAuthorizedActivity(authorized, targetPackage)) return
         outState.putBoolean(STATE_AUTHORIZED, true)
@@ -271,7 +259,6 @@ class LimitBlockActivity : Activity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
-        rewardedAdProvider?.destroy()
         parentAuthPoll = null
         clearActiveRestrictionTarget()
         releaseActivePage()
@@ -373,18 +360,17 @@ class LimitBlockActivity : Activity() {
             setPadding(dp(28), dp(30), dp(28), dp(26))
             background = GradientDrawable().apply {
                 setColor(colors.surface)
-                cornerRadius = dp(28).toFloat()
-                setStroke(dp(1), colors.outline)
+                cornerRadius = dp(24).toFloat()
             }
         }
         card.addView(text(12f, colors.primary, true).apply {
             this.text = "TIME STOP"
             letterSpacing = 0.14f
         })
-        card.addView(text(36f, colors.primary, true).apply {
-            this.text = "T◷"
-            setPadding(0, dp(12), 0, 0)
-        })
+        card.addView(android.widget.ImageView(this).apply {
+            setImageDrawable(com.liuml.apptimelimiter.ui.FunctionIconDrawable("shield", colors.primary))
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }, LinearLayout.LayoutParams(dp(48), dp(48)).apply { topMargin = dp(16) })
         titleView = text(26f, colors.textPrimary, true).apply {
             setPadding(0, dp(16), 0, 0)
         }
@@ -430,7 +416,7 @@ class LimitBlockActivity : Activity() {
             setPadding(dp(28), dp(10), dp(28), dp(10))
             background = GradientDrawable().apply {
                 setColor(colors.primary)
-                cornerRadius = dp(17).toFloat()
+                cornerRadius = dp(14).toFloat()
             }
             isClickable = true
             isFocusable = true
@@ -442,26 +428,16 @@ class LimitBlockActivity : Activity() {
             setPadding(dp(28), dp(10), dp(28), dp(10))
             background = GradientDrawable().apply {
                 setColor(colors.primaryContainer)
-                cornerRadius = dp(17).toFloat()
-                setStroke(dp(1), colors.outline)
+                cornerRadius = dp(14).toFloat()
             }
             isClickable = true
             isFocusable = true
             setOnClickListener { startParentUnlock() }
         }
-        rewardedAdView = text(14f, colors.primary, true).apply {
-            gravity = Gravity.CENTER
-            minHeight = dp(50)
-            setPadding(dp(16), dp(10), dp(16), dp(10))
-            background = GradientDrawable().apply {
-                setColor(colors.primaryContainer)
-                cornerRadius = dp(17).toFloat()
-                setStroke(dp(1), colors.outline)
-            }
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { startRewardedAd() }
-            visibility = View.GONE
+        extensionView = text(16f, colors.primary, true).apply {
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            text = if (english) "Extend use" else "延长使用"
+            setOnClickListener { requestFreeExtension() }
         }
         card.addView(titleView)
         card.addView(messageView)
@@ -476,19 +452,13 @@ class LimitBlockActivity : Activity() {
         card.addView(hintView)
         card.addView(temporaryAccessTitleView)
         card.addView(
-            rewardedAdView,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(52),
-            ).apply { topMargin = dp(12) },
-        )
-        card.addView(
             parentUnlockView,
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(52),
             ).apply { topMargin = dp(10) },
         )
+        card.addView(extensionView)
         card.addView(actionFeedbackView)
         card.addView(
             exitView,
@@ -637,17 +607,16 @@ class LimitBlockActivity : Activity() {
             else -> baseHint
         }
         exitView.text = if (english) "Exit app" else "退出应用"
-        parentUnlockView.text = if (english) "Parent temporary unlock" else "家长临时解锁"
+        parentUnlockView.text = if (english) "Temporary PIN access" else "PIN 临时放行"
         parentUnlockView.visibility = if (
             settings.childLockEnabled && privatePinReady && sessionReady
         ) View.VISIBLE else View.GONE
-        rewardedAdView.text = if (english) "Watch ad for a temporary extension" else "观看广告获得临时延时"
         updateTemporaryAccessSection()
     }
 
     private fun refreshRestriction() {
         val nowElapsed = android.os.SystemClock.elapsedRealtime()
-        if (!parentAuthInFlight && !rewardedAdShowing && nowElapsed - runtimeRenewedAt >= 30_000L) {
+        if (!parentAuthInFlight && true && nowElapsed - runtimeRenewedAt >= 30_000L) {
             if (!claimRestrictionUi()) {
                 leaveToHomeAndFinish("runtime_lease_expired")
                 return
@@ -699,11 +668,6 @@ class LimitBlockActivity : Activity() {
         }
         ruleReadFailures = 0
         val ruleGroupId = rule.getString(RuleContract.KEY_GROUP_ID).orEmpty()
-        rewardedAdDailyIdentity = if (ruleGroupId.isBlank()) {
-            "package:$targetPackage"
-        } else {
-            "group:$ruleGroupId"
-        }
         if (!adOnly && !rule.getBoolean(RuleContract.KEY_ENABLED, false)) {
             finishWithoutAnimation("rule_disabled")
             return
@@ -723,31 +687,7 @@ class LimitBlockActivity : Activity() {
         val ruleVersionUnchanged = currentRuleVersion == initialRuleVersion
         val groupVersionUnchanged = currentGroupVersion == initialGroupVersion
         if (adOnly) {
-            restrictionSnapshot = null
-            renderRestrictionDetails()
-            // A pre-limit warning enters the same restriction surface, with the same action
-            // hierarchy as a reached limit. It is not a separate ad-only page.
-            if (!rule.getBoolean(RuleContract.KEY_ENABLED, false) ||
-                !ruleVersionUnchanged || !groupVersionUnchanged
-            ) {
-                diagnostic(
-                    "INFO",
-                    targetPackage,
-                    "REWARDED_AD_PAGE_STALE",
-                    "ruleVersionUnchanged=$ruleVersionUnchanged groupVersionUnchanged=$groupVersionUnchanged",
-                )
-                finishWithoutAnimation("rewarded_ad_page_stale")
-                return
-            }
-            updateRestrictionState(
-                "REWARDED_AD",
-                if (english) "Get a temporary extension" else "获取临时延时",
-                if (english) {
-                    "Watch one rewarded ad to continue this session."
-                } else {
-                    "观看一段激励广告后可继续本次使用。"
-                },
-            )
+            leaveToHomeAndFinish("legacy_ad_request_rejected")
             return
         }
         val grouped = !rule.getString(RuleContract.KEY_GROUP_ID).isNullOrBlank()
@@ -1045,7 +985,6 @@ class LimitBlockActivity : Activity() {
         parentAuthToken = token
         val intent = Intent(this, ParentUnlockActivity::class.java).apply {
             putExtra(ParentUnlockActivity.EXTRA_TOKEN, token)
-            putExtra(ParentUnlockActivity.EXTRA_DEFER_GRANT_FOR_AD, true)
             addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
         }
         runCatching {
@@ -1073,290 +1012,11 @@ class LimitBlockActivity : Activity() {
         }
     }
 
-    private fun startRewardedAd() {
-        if (rewardedAdShowing) {
-            diagnostic("INFO", targetPackage, "REWARDED_AD_ENTRY_REJECTED", "reason=already_showing")
-            return
-        }
-        if (!RuleRepository(this).getGlobalSettings().extensionEnabled) {
-            diagnostic("INFO", targetPackage, "REWARDED_AD_ENTRY_REJECTED", "reason=extension_disabled")
-            showActionFeedback("extension_disabled")
-            return
-        }
-        if (targetPackage.isBlank() || controlSessionId.isBlank()) {
-            diagnostic("WARN", targetPackage, "REWARDED_AD_ENTRY_REJECTED", "reason=missing_control_identity")
-            Toast.makeText(
-                this,
-                if (english) "The extension session expired. Reopen the target app." else "延时会话已过期，请重新打开应用",
-                Toast.LENGTH_SHORT,
-            ).show()
-            return
-        }
-        diagnostic(
-            "INFO",
-            targetPackage,
-            "REWARDED_AD_ENTRY_TAPPED",
-            "adOnly=$adOnly session=${controlSessionId.take(24)}",
-        )
-        val consentRepository = RewardedAdStateRepository(this)
-        if (!consentRepository.isPrivacyConsentGranted()) {
-            AlertDialog.Builder(this)
-                .setTitle(if (english) "Advertising privacy" else "广告隐私说明")
-                .setMessage(if (english) {
-                    "A rewarded ad is provided by a third-party SDK. Only this Time Stop page shows the ad. No ad content or identifier is written to Time Stop rules, logs, or backups."
-                } else {
-                    "激励广告由第三方广告 SDK 提供，仅在时停自己的页面中展示。广告内容和标识不会写入规则、诊断日志或备份。"
-                })
-                .setNegativeButton(if (english) "Cancel" else "取消", null)
-                .setPositiveButton(if (english) "Agree and continue" else "同意并继续") { _, _ ->
-                    if (consentRepository.setPrivacyConsentGranted(true)) {
-                        showRewardedAd()
-                    } else {
-                        finishRewardedAdFailure("privacy_consent_persist_failed")
-                    }
-                }
-                .show()
-            return
-        }
-        if (RestrictionPagePresentationPolicy.shouldRequestAdImmediately(true)) {
-            // Privacy was already accepted. A second confirmation adds another modal layer
-            // without improving safety, so the user's tap directly starts the ad request.
-            showRewardedAd()
-        }
-    }
-
-    private fun showRewardedAd() {
-        if (rewardedAdShowing || targetPackage.isBlank() || controlSessionId.isBlank()) return
-        val settings = RuleRepository(this).getGlobalSettings()
-        if (!settings.protectionMode.usesNonRoot && nonRoot) return
-        val rewardPreview = settings.extensionSeconds
-            .coerceIn(RuleRepository.MIN_LIMIT_SECONDS, RuleRepository.MAX_LIMIT_SECONDS) * 1_000L
-        rewardedAdTransactionId = UUID.randomUUID().toString()
-        val eligibilityFailure = rewardedAdEligibilityFailure()
-        if (eligibilityFailure != null) {
-            rewardedAdEligibilityFailureReason = eligibilityFailure.takeIf(
-                RestrictionPagePresentationPolicy::isPersistentRewardedAdEligibilityFailure,
-            )
-            rewardedAdEligibilitySessionId = controlSessionId
-            diagnostic("INFO", targetPackage, "REWARDED_AD_PRECHECK_REJECTED", "reason=${eligibilityFailure.take(80)}")
-            showActionFeedback(eligibilityFailure)
-            updateRewardedAdAction()
-            return
-        }
-        rewardedAdEligibilityFailureReason = null
-        rewardedAdEligibilitySessionId = controlSessionId
-        val provider = ensureRewardedAdProvider() ?: run {
-            finishRewardedAdFailure("privacy_consent_required")
-            return
-        }
-        if (!transitionRuntime("WAITING_AD")) {
-            leaveToHomeAndFinish("runtime_ad_rejected")
-            return
-        }
-        rewardedAdShowing = true
-        rewardedAdView.isEnabled = false
-        actionFeedbackView.visibility = View.VISIBLE
-        actionFeedbackView.text = if (english) "Preparing the rewarded ad…" else "正在准备广告，请稍候…"
-        diagnostic("INFO", targetPackage, "REWARDED_AD_CONFIRMED", "transaction=${rewardedAdTransactionId.take(12)}")
-        val finishFailure = { reason: String ->
-            restoreRuntimeRestriction()
-            rewardedAdReadyPoll?.let(handler::removeCallbacks)
-            rewardedAdReadyPoll = null
-            rewardedAdShowing = false
-            rewardedAdView.isEnabled = true
-            diagnostic("WARN", targetPackage, "REWARDED_AD_FAILED", "reason=${reason.take(80)}")
-            showActionFeedback(reason)
-        }
-        waitForRewardedAd(provider, rewardPreview, finishFailure)
-    }
-
-    private fun rewardedAdEligibilityFailure(): String? {
-        val rule = runCatching {
-            contentResolver.call(RuleContract.CONTENT_URI, RuleContract.METHOD_GET_RULE, targetPackage, null)
-        }.getOrNull()?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) } ?: return "rule_unavailable"
-        val response = runCatching {
-            contentResolver.call(
-                RuleContract.CONTENT_URI,
-                RuleContract.METHOD_CHECK_REWARDED_AD_ELIGIBILITY,
-                targetPackage,
-                Bundle().apply {
-                    putString(RuleContract.KEY_AD_TRANSACTION_ID, rewardedAdTransactionId)
-                    putString(RuleContract.KEY_AD_SESSION_ID, controlSessionId)
-                    putLong(RuleContract.KEY_AD_RULE_VERSION, rule.getLong(RuleContract.KEY_VERSION, Long.MIN_VALUE))
-                    putLong(RuleContract.KEY_AD_GROUP_VERSION, rule.getLong(RuleContract.KEY_GROUP_VERSION, 0L))
-                    putLong(
-                        RuleContract.KEY_AD_MODE_GENERATION,
-                        rule.getLong(RuleContract.KEY_PROTECTION_MODE_GENERATION, Long.MIN_VALUE),
-                    )
-                },
-            )
-        }.getOrNull() ?: return "ad_eligibility_provider_failed"
-        return if (response.getBoolean(RuleContract.KEY_OK, false)) {
-            null
-        } else {
-            response.getString(RuleContract.KEY_MESSAGE).orEmpty().ifBlank { "quota_or_stale" }
-        }
-    }
-
-    private fun waitForRewardedAd(
-        provider: RewardedAdProvider,
-        rewardPreview: Long,
-        finishFailure: (String) -> Unit,
-        onReady: (() -> Unit)? = null,
-    ) {
-        val startedAt = android.os.SystemClock.elapsedRealtime()
-        provider.preload()
-        val poll = object : Runnable {
-            override fun run() {
-                if (!rewardedAdShowing) return
-                if (isFinishing || isDestroyed) {
-                    finishFailure("ad_page_closed")
-                    return
-                }
-                val loadState = provider.loadState()
-                when (loadState.status) {
-                    RewardedAdLoadStatus.READY -> {
-                        rewardedAdReadyPoll = null
-                        onReady?.invoke() ?: presentRewardedAd(provider, rewardPreview, finishFailure)
-                        return
-                    }
-                    RewardedAdLoadStatus.FAILED -> {
-                        finishFailure(loadState.failureReason.ifBlank { "ad_load_failed" })
-                        return
-                    }
-                    RewardedAdLoadStatus.NOT_STARTED -> provider.preload()
-                    RewardedAdLoadStatus.LOADING -> Unit
-                }
-                if (!RewardedAdLoadPolicy.shouldKeepWaiting(
-                        startedAt,
-                        android.os.SystemClock.elapsedRealtime(),
-                    )
-                ) {
-                    provider.destroy()
-                    if (rewardedAdProvider === provider) rewardedAdProvider = null
-                    finishFailure("ad_load_timeout")
-                    return
-                }
-                handler.postDelayed(this, RewardedAdLoadPolicy.POLL_INTERVAL_MILLIS)
-            }
-        }
-        rewardedAdReadyPoll = poll
-        diagnostic("INFO", targetPackage, "REWARDED_AD_WAITING_FOR_LOAD", "timeout=${RewardedAdLoadPolicy.LOAD_TIMEOUT_MILLIS}")
-        handler.post(poll)
-    }
-
-    private fun presentRewardedAd(
-        provider: RewardedAdProvider,
-        rewardPreview: Long,
-        finishFailure: (String) -> Unit,
-    ) {
-        var rewardEarned = false
-
-        fun grantRewardAfterAdClosed() {
-            if (!rewardedAdShowing || !rewardEarned) return
-            if (!transitionRuntime("WAITING_AD")) {
-                finishFailure("stale_control_callback")
-                return
-            }
-            val rule = runCatching {
-                contentResolver.call(RuleContract.CONTENT_URI, RuleContract.METHOD_GET_RULE, targetPackage, null)
-            }.getOrNull()?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) }
-            var claimFailureReason = "rule_unavailable"
-            val accepted = rule?.let {
-                runCatching {
-                    contentResolver.call(
-                        RuleContract.CONTENT_URI,
-                        RuleContract.METHOD_CLAIM_REWARDED_AD,
-                        targetPackage,
-                        Bundle().apply {
-                            putString(RuleContract.KEY_INCIDENT_ID, restrictionIncidentId)
-                            putString(RuleContract.KEY_AD_TRANSACTION_ID, rewardedAdTransactionId)
-                            putString(RuleContract.KEY_AD_SESSION_ID, controlSessionId)
-                            putLong(RuleContract.KEY_AD_RULE_VERSION, it.getLong(RuleContract.KEY_VERSION, Long.MIN_VALUE))
-                            putLong(RuleContract.KEY_AD_GROUP_VERSION, it.getLong(RuleContract.KEY_GROUP_VERSION, 0L))
-                            putLong(RuleContract.KEY_AD_MODE_GENERATION, it.getLong(RuleContract.KEY_PROTECTION_MODE_GENERATION, Long.MIN_VALUE))
-                            putLong(RuleContract.KEY_AD_REWARD_MILLIS, rewardPreview)
-                        },
-                    )
-                }.getOrNull()?.let { response ->
-                    if (!response.getBoolean(RuleContract.KEY_OK, false)) {
-                        claimFailureReason = response.getString(RuleContract.KEY_MESSAGE)
-                            .orEmpty().ifBlank { "quota_or_stale" }
-                    }
-                    response.getBoolean(RuleContract.KEY_OK, false)
-                } ?: run {
-                    claimFailureReason = "provider_call_failed"
-                    false
-                }
-            } == true
-            rewardedAdReadyPoll?.let(handler::removeCallbacks)
-            rewardedAdReadyPoll = null
-            rewardedAdShowing = false
-            rewardedAdView.isEnabled = true
-            if (accepted) {
-                diagnostic("INFO", targetPackage, "REWARDED_AD_REWARD_PENDING", "transaction=${rewardedAdTransactionId.take(12)}")
-                finishWithoutAnimation("rewarded_ad_granted")
-            } else {
-                diagnostic("WARN", targetPackage, "REWARDED_AD_REWARD_REJECTED", "reason=${claimFailureReason.take(120)}")
-                restoreRuntimeRestriction()
-                showActionFeedback(claimFailureReason)
-            }
-        }
-
-        provider.show(
-            this,
-            onReward = {
-                if (!rewardedAdShowing || rewardEarned) return@show
-                rewardEarned = true
-                diagnostic("INFO", targetPackage, "REWARDED_AD_EARNED_WAITING_CLOSE", "transaction=${rewardedAdTransactionId.take(12)}")
-            },
-            onClosed = {
-                rewardedAdReadyPoll?.let(handler::removeCallbacks)
-                rewardedAdReadyPoll = null
-                if (rewardEarned) grantRewardAfterAdClosed()
-                else if (rewardedAdShowing) finishFailure("ad_closed_without_reward")
-                provider.preload()
-            },
-            onFailed = finishFailure,
-        )
-    }
-
-    private fun ensureRewardedAdProvider(): RewardedAdProvider? {
-        val consent = RewardedAdStateRepository(this)
-        if (!consent.isPrivacyConsentGranted()) return null
-        return rewardedAdProvider ?: TopOnRewardedAdProvider(
-            applicationContext,
-            BuildConfig.TOPON_APP_ID,
-            BuildConfig.TOPON_APP_KEY,
-            BuildConfig.TOPON_PLACEMENT_ID,
-            BuildConfig.TOPON_TEST_MODE,
-            privacyConsentGranted = true,
-        ).also { rewardedAdProvider = it }
-    }
-
-    private fun finishRewardedAdFailure(reason: String) {
-        restoreRuntimeRestriction()
-        rewardedAdShowing = false
-        if (::rewardedAdView.isInitialized) rewardedAdView.isEnabled = true
-        diagnostic("WARN", targetPackage, "REWARDED_AD_FAILED", "reason=${reason.take(80)}")
-        showActionFeedback(reason)
-    }
-
     @Deprecated("Legacy result callback is sufficient for this private activity flow.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != REQUEST_PARENT_UNLOCK) return
-        if (resultCode == ParentUnlockActivity.RESULT_PIN_VERIFIED_FOR_AD) {
-            parentAuthPoll?.let(handler::removeCallbacks)
-            parentAuthPoll = null
-            startParentUnlockAd(
-                token = parentAuthToken,
-                durationMinutes = data?.getIntExtra(
-                    ParentUnlockActivity.EXTRA_DURATION_MINUTES,
-                    ParentOverrideDurationPolicy.DEFAULT_MINUTES,
-                ) ?: ParentOverrideDurationPolicy.DEFAULT_MINUTES,
-            )
-        } else if (resultCode == RESULT_OK) {
+        if (resultCode == RESULT_OK) {
             completeParentOverride()
         } else {
             pollParentAuthStatus(parentAuthToken, allowRetry = true)
@@ -1402,7 +1062,7 @@ class LimitBlockActivity : Activity() {
                 completeParentOverride()
                 true
             }
-            "VERIFIED_WAITING_AD" -> false
+            "VERIFIED_WAITING_AD", "AD_REWARDED" -> { setParentAuthBusy(false); true }
             "DENIED", "TIMED_OUT", "INVALID" -> {
                 diagnostic(
                     "WARN",
@@ -1442,142 +1102,6 @@ class LimitBlockActivity : Activity() {
         finishWithoutAnimation("parent_override_granted")
     }
 
-    private fun startParentUnlockAd(token: String, durationMinutes: Int) {
-        if (token.isBlank()) {
-            setParentAuthBusy(false)
-            showParentAuthFeedback(if (english) "Parent verification expired" else "家长验证已失效")
-            return
-        }
-        val consent = RewardedAdStateRepository(this)
-        if (!consent.isPrivacyConsentGranted()) {
-            AlertDialog.Builder(this)
-                .setTitle(if (english) "Advertising privacy" else "广告隐私说明")
-                .setMessage(if (english) {
-                    "This temporary unlock requires a rewarded ad after PIN verification. No extension is granted unless the reward is received."
-                } else {
-                    "本次家长临时解锁需在 PIN 验证后完成激励广告；未获得奖励不会放行。"
-                })
-                .setNegativeButton(if (english) "Cancel" else "取消") { _, _ ->
-                    rejectParentUnlockForAd(token, "parent_auth_ad_consent_declined")
-                }
-                .setPositiveButton(if (english) "Agree and continue" else "同意并继续") { _, _ ->
-                    if (consent.setPrivacyConsentGranted(true)) showParentUnlockAd(token, durationMinutes)
-                    else rejectParentUnlockForAd(token, "parent_auth_ad_consent_persist_failed")
-                }
-                .show()
-            return
-        }
-        showParentUnlockAd(token, durationMinutes)
-    }
-
-    private fun showParentUnlockAd(token: String, durationMinutes: Int) {
-        if (rewardedAdShowing) return
-        val provider = ensureRewardedAdProvider()
-        if (provider == null) {
-            rejectParentUnlockForAd(token, "parent_auth_ad_unavailable")
-            return
-        }
-        rewardedAdShowing = true
-        rewardedAdView.isEnabled = false
-        parentUnlockView.isEnabled = false
-        actionFeedbackView.visibility = View.VISIBLE
-        actionFeedbackView.text = if (english) "Preparing the rewarded ad…" else "正在准备广告，请稍候…"
-        var rewardAccepted = false
-        val finishAd = { reason: String ->
-            rewardedAdReadyPoll?.let(handler::removeCallbacks)
-            rewardedAdReadyPoll = null
-            rewardedAdShowing = false
-            diagnostic("INFO", targetPackage, "PARENT_AUTH_AD_FINISHED", "reason=${reason.take(80)}")
-            if (rewardAccepted) completeVerifiedParentOverride(token, durationMinutes, reason)
-            else rejectParentUnlockForAd(token, reason)
-        }
-        waitForRewardedAd(
-            provider = provider,
-            rewardPreview = 0L,
-            finishFailure = finishAd,
-            onReady = {
-                provider.show(
-                    this,
-                    onReward = {
-                        rewardAccepted = markParentUnlockAdRewarded(token)
-                        diagnostic(
-                            if (rewardAccepted) "INFO" else "WARN",
-                            targetPackage,
-                            if (rewardAccepted) "PARENT_AUTH_AD_REWARDED" else "PARENT_AUTH_AD_REWARD_REJECTED",
-                            "verified_pin=true",
-                        )
-                    },
-                    onClosed = {
-                        provider.preload()
-                        finishAd(if (rewardAccepted) "parent_auth_ad_rewarded" else "parent_auth_ad_closed_without_reward")
-                    },
-                    onFailed = finishAd,
-                )
-            },
-        )
-    }
-
-    private fun markParentUnlockAdRewarded(token: String): Boolean = runCatching {
-        contentResolver.call(
-            RuleContract.CONTENT_URI,
-            RuleContract.METHOD_MARK_PARENT_AUTH_AD_REWARDED,
-            null,
-            Bundle().apply { putString(RuleContract.KEY_PARENT_AUTH_TOKEN, token) },
-        )
-    }.getOrNull()?.getBoolean(RuleContract.KEY_OK, false) == true
-
-    private fun rejectParentUnlockForAd(token: String, reason: String) {
-        runCatching {
-            contentResolver.call(
-                RuleContract.CONTENT_URI,
-                RuleContract.METHOD_COMPLETE_PARENT_AUTH_CHALLENGE,
-                null,
-                Bundle().apply {
-                    putString(RuleContract.KEY_PARENT_AUTH_TOKEN, token)
-                    putBoolean(RuleContract.KEY_PARENT_AUTH_GRANTED, false)
-                },
-            )
-        }
-        diagnostic("WARN", targetPackage, "PARENT_AUTH_AD_NOT_GRANTED", "reason=${reason.take(80)}")
-        setParentAuthBusy(false)
-        showParentAuthFeedback(
-            if (english) "Ad reward was not received. Verify PIN again to retry." else "未获得广告奖励，请重新验证 PIN 后再试",
-        )
-    }
-
-    private fun completeVerifiedParentOverride(
-        token: String,
-        durationMinutes: Int,
-        completionReason: String,
-    ) {
-        val normalizedDuration = ParentOverrideDurationPolicy.normalizeMinutes(durationMinutes)
-        val granted = runCatching {
-            contentResolver.call(
-                RuleContract.CONTENT_URI,
-                RuleContract.METHOD_COMPLETE_PARENT_AUTH_CHALLENGE,
-                null,
-                Bundle().apply {
-                    putString(RuleContract.KEY_PARENT_AUTH_TOKEN, token)
-                    putBoolean(RuleContract.KEY_PARENT_AUTH_GRANTED, true)
-                    putInt(RuleContract.KEY_PARENT_OVERRIDE_DURATION_MINUTES, normalizedDuration)
-                },
-            )
-        }.getOrNull()?.getBoolean(RuleContract.KEY_OK, false) == true
-        if (!granted) {
-            diagnostic("WARN", targetPackage, "PARENT_AUTH_AD_GRANT_FAILED", "reason=${completionReason.take(80)}")
-            setParentAuthBusy(false)
-            showParentAuthFeedback(if (english) "Parent unlock expired. Try again." else "家长解锁已失效，请重新验证")
-            return
-        }
-        UsageStatsRepository(this).recordParentUnlockEvent(
-            packageName = targetPackage,
-            day = java.time.LocalDate.now(),
-            eventId = token.hashCode().toString(),
-        )
-        diagnostic("INFO", targetPackage, "PARENT_AUTH_AD_GRANT_SUCCEEDED", "reason=${completionReason.take(80)}")
-        completeParentOverride()
-    }
-
     private fun setParentAuthBusy(busy: Boolean, preservePending: Boolean = false) {
         if (!busy && !preservePending) restoreRuntimeRestriction()
         parentAuthInFlight = busy
@@ -1591,8 +1115,8 @@ class LimitBlockActivity : Activity() {
         parentUnlockView.text = when {
             busy && english -> "Opening verification…"
             busy -> "正在打开验证…"
-            english -> "Parent temporary unlock"
-            else -> "家长临时解锁"
+            english -> "Temporary PIN access"
+            else -> "PIN 临时放行"
         }
         if (::actionFeedbackView.isInitialized) {
             actionFeedbackView.visibility = if (busy) View.VISIBLE else actionFeedbackView.visibility
@@ -1638,7 +1162,7 @@ class LimitBlockActivity : Activity() {
         else -> if (english) {
             "Could not open parent verification. Check Control Lock settings."
         } else {
-            "无法打开家长验证，请检查管控锁设置"
+            "无法打开PIN 验证，请检查管控锁设置"
         }
     }
 
@@ -1674,156 +1198,58 @@ class LimitBlockActivity : Activity() {
             else -> message
         }
         updateText(primary?.let { RestrictionReasonText.label(it, english) } ?: title, authoritativeMessage)
-        val adEligible = adOnly || state.startsWith("APP_DAILY") ||
-            state.startsWith("GROUP_DAILY") || state == "PER_SESSION" ||
-            state.startsWith("SESSION_GRACE")
-        val extensionEnabled = RuleRepository(this).getGlobalSettings().extensionEnabled
-        rewardedAdView.visibility = if (adEligible && extensionEnabled) View.VISIBLE else View.GONE
-        if (adEligible && extensionEnabled) {
-            if (rewardedAdEligibilitySessionId != controlSessionId) {
-                rewardedAdEligibilitySessionId = controlSessionId
-                rewardedAdEligibilityFailureReason = null
-            }
-            updateRewardedAdAction()
+        val settings = RuleRepository(this).getGlobalSettings()
+        extensionView.visibility = if (settings.extensionEnabled &&
+            (state.startsWith("APP_DAILY") || state.startsWith("APP_SESSION") || state.startsWith("GROUP_") ||
+                state.contains("PLAN") || state.contains("PER_SESSION") || state.contains("SESSION_GRACE")) &&
+            !state.contains("COOLDOWN") && !state.contains("SCHEDULE")) View.VISIBLE else View.GONE
+        val quota = runCatching { RuleRepository(this).previewExtension(targetPackage, controlSessionId) }.getOrNull()
+        val needsCooldown = RuleRepository(this).extensionRequiresCooldown(targetPackage)
+        extensionView.isEnabled = quota?.allowed == true && !needsCooldown
+        extensionView.text = when {
+            needsCooldown -> if (english) "This rule requires a cooling-off period; extensions are unavailable" else "当前规则要求到限后冷却，不可延时"
+            quota == null -> if (english) "Extension status unavailable; reopen this page to retry" else "暂时无法读取延时次数，请重新进入管控页"
+            quota.remainingCount == 0 -> if (english) "Today's extensions used up" else "今日延时次数已用完"
+            quota.remainingSessionCount == 0 -> if (english) "This session's extensions used up" else "本轮延时次数已用完"
+            else -> if (english) "Extend ${settings.extensionSeconds / 60} min · ${quota.remainingCount} left today / ${quota.remainingSessionCount} this session"
+                else "延时 ${settings.extensionSeconds / 60} 分钟 · 今日剩 ${quota.remainingCount} 次 / 本轮剩 ${quota.remainingSessionCount} 次"
         }
         updateTemporaryAccessSection()
     }
 
-    private fun updateRewardedAdAction() {
-        if (!::rewardedAdView.isInitialized || rewardedAdView.visibility != View.VISIBLE) return
-        val settings = RuleRepository(this).getGlobalSettings()
-        val rewardMinutes = settings.extensionSeconds
-            .coerceIn(RuleRepository.MIN_LIMIT_SECONDS, RuleRepository.MAX_LIMIT_SECONDS) / 60L
-        val failure = rewardedAdEligibilityFailureReason
-        val enabled = RestrictionPagePresentationPolicy.canRequestRewardedAd(
-            isVisibleForRestriction = true,
-            extensionEnabled = settings.extensionEnabled,
-            requestInFlight = rewardedAdShowing,
-            eligibilityFailure = failure,
-        )
-        rewardedAdView.text = when (failure) {
-            "extension_session_limit_reached" -> if (english) {
-                "Extension limit reached for this usage round"
-            } else {
-                "本轮延时次数已达上限"
-            }
-            "extension_daily_limit_reached", "rewarded_ad_quota_reached" -> if (english) {
-                "Today's extension limit reached"
-            } else {
-                "今日延时次数已达上限"
-            }
-            else -> if (english) {
-                "Watch ad +${rewardMinutes} min"
-            } else {
-                "观看广告延时 ${rewardMinutes} 分钟"
+    private fun requestFreeExtension() {
+        extensionView.isEnabled = false
+        val response = runCatching {
+            contentResolver.call(RuleContract.CONTENT_URI, "request_free_extension", targetPackage, Bundle().apply {
+                putString(RuleContract.KEY_PROCESS_SESSION_ID, controlSessionId)
+                putString(RuleContract.KEY_INCIDENT_ID, restrictionIncidentId)
+                putString("extension_request_id", extensionRequestId)
+            })
+        }.getOrNull()
+        if (response?.getBoolean(RuleContract.KEY_OK, false) == true) {
+            finishWithoutAnimation("free_extension_granted")
+        } else {
+            extensionView.isEnabled = true
+            actionFeedbackView.visibility = View.VISIBLE
+            actionFeedbackView.text = when (response?.getString(RuleContract.KEY_MESSAGE)) {
+                "extension_limit_reached" -> if (english) "Daily or session extension limit reached" else "每日或本轮延时次数已用完"
+                "cooldown_required" -> if (english) "Please wait for the cooling-off period" else "当前需完成冷却后才能继续使用"
+                "schedule_blocked" -> if (english) "Extensions are unavailable during a blocked period" else "禁止时段不可延时"
+                "stale_session" -> if (english) "This control session has changed. Reopen the target app." else "本次管控状态已变化，请重新打开目标应用"
+                "rule_not_configured" -> if (english) "The controlling rule has changed." else "管控规则已变化，请重新打开目标应用"
+                else -> if (english) "Extension not granted. No time has been added; try again later." else "延时未成功，未增加使用时间，请稍后重试"
             }
         }
-        rewardedAdView.isEnabled = enabled
-        rewardedAdView.isClickable = enabled
-        rewardedAdView.isFocusable = enabled
-        rewardedAdView.alpha = if (enabled) 1f else 0.55f
     }
 
     private fun updateTemporaryAccessSection() {
         if (!::temporaryAccessTitleView.isInitialized) return
         val visible = RestrictionPagePresentationPolicy.showTemporaryAccess(
             allowPin = ::parentUnlockView.isInitialized && parentUnlockView.visibility == View.VISIBLE,
-            allowAd = ::rewardedAdView.isInitialized && rewardedAdView.visibility == View.VISIBLE,
+            allowExtension = ::extensionView.isInitialized && extensionView.visibility == View.VISIBLE,
         )
         temporaryAccessTitleView.visibility = if (visible) View.VISIBLE else View.GONE
         temporaryAccessTitleView.text = if (english) "Temporary access" else "临时放行"
-    }
-
-    private fun showActionFeedback(reason: String) {
-        if (!::actionFeedbackView.isInitialized) return
-        actionFeedbackView.visibility = View.VISIBLE
-        actionFeedbackView.text = when (reason) {
-            "extension_disabled" -> if (english) {
-                "Extensions are disabled in settings."
-            } else {
-                "延时功能已在设置中关闭。"
-            }
-            "topon_local_config_missing" -> if (english) {
-                "Ads are not configured in this local build. No extension was granted."
-            } else {
-                "本机构建未配置广告，未发放延时。"
-            }
-            "ad_not_ready" -> if (english) "The ad is loading. Try again shortly." else "广告正在加载，请稍后重试。"
-            "ad_retry_cooldown" -> if (english) {
-                "The ad source is refreshing. Try again in a moment."
-            } else {
-                "广告源正在刷新，请稍候两秒后再试。"
-            }
-            "ad_load_timeout" -> if (english) {
-                "The ad did not finish loading. Check the network and try again."
-            } else {
-                "广告加载超时，请检查网络后重试。"
-            }
-            "topon_initialization_failed", "ad_load_call_failed", "provider_call_failed" -> if (english) {
-                "The ad service is unavailable. Try again later."
-            } else {
-                "广告服务连接失败，请稍后重试。"
-            }
-            "ad_closed_without_reward" -> if (english) "The ad was not completed. No extension was granted." else "广告未完成，未发放延时。"
-            "extension_session_limit_reached" -> if (english) {
-                "The extension limit for this usage round has been reached."
-            } else {
-                "本轮使用的延时次数已达上限。"
-            }
-            "extension_daily_limit_reached" -> if (english) {
-                "Today's extension limit has been reached."
-            } else {
-                "今日延时次数已达上限。"
-            }
-            "rewarded_ad_quota_reached" -> if (english) {
-                "No further rewarded extensions are available today."
-            } else {
-                "今日已无可用的广告延时次数。"
-            }
-            "rewarded_extension_quota_unavailable", "rewarded_ad_quota_unavailable", "ad_eligibility_provider_failed" -> if (english) {
-                "The extension service is unavailable. Try again later."
-            } else {
-                "延时服务暂不可用，请稍后重试。"
-            }
-            "quota_or_stale", "stale_ad_request", "stale_ad_reward" -> if (english) {
-                "This extension is no longer available. The current restriction still applies."
-            } else {
-                "当前延时条件已变化，限制仍然生效。"
-            }
-            else -> when {
-                reason.contains("20003") -> if (english) {
-                    "The TopOn app key or SDK environment does not match this placement. Check the app-level key in TopOn."
-                } else {
-                    "TopOn 应用密钥或 SDK 环境与当前广告位不匹配，请检查 TopOn 应用级 App Key。"
-                }
-                reason.startsWith("load_failed:2008") -> if (english) {
-                    "The ad source is refreshing. Try again in a moment."
-                } else {
-                    "广告源正在刷新，请稍候两秒后再试。"
-                }
-                reason.contains(":category_no_fill") -> if (english) {
-                    "No rewarded ad is currently available from the ad source. Try again later."
-                } else {
-                    "广告源当前暂无可展示的激励广告，请稍后再试。"
-                }
-                reason.startsWith("load_failed:4001") -> if (english) {
-                    "The ad source returned an error (4001). No extension was consumed. Details were saved to diagnostics."
-                } else {
-                    "广告源请求失败（4001），未消耗延时次数。错误分类已记录到诊断日志。"
-                }
-                reason.startsWith("load_failed") -> if (english) {
-                    "No rewarded ad is available right now. Try again later."
-                } else {
-                    "暂时没有可展示的激励广告，请稍后重试。"
-                }
-                reason.startsWith("play_failed") -> if (english) {
-                    "The ad could not be played. No extension was granted."
-                } else {
-                    "广告播放失败，未发放延时。"
-                }
-                else -> if (english) "The ad is unavailable. Try again later." else "广告暂不可用，请稍后重试。"
-            }
-        }
     }
 
     private fun formatRemaining(totalSeconds: Long): String {

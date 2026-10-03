@@ -42,11 +42,17 @@ object TargetUiPalette {
             AppThemeMode.DARK -> true
             AppThemeMode.SYSTEM -> systemDark
         }
-        return when (color) {
+        val accent = when (color) {
             AppThemeColor.GREEN -> if (dark) GREEN_DARK else GREEN_LIGHT
             AppThemeColor.BLUE -> if (dark) BLUE_DARK else BLUE_LIGHT
             AppThemeColor.PURPLE -> if (dark) PURPLE_DARK else PURPLE_LIGHT
         }
+        val surfaces = InterfaceStyle.surfaces(dark)
+        return accent.copy(
+            background = surfaces.background, surface = surfaces.card,
+            surfaceContainer = surfaces.elevated, textPrimary = surfaces.text,
+            textSecondary = surfaces.secondaryText, outline = surfaces.separator,
+        )
     }
 
     private fun systemDarkMode(context: Context): Boolean {

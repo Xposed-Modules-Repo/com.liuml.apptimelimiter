@@ -352,11 +352,39 @@ class RuleRepository(context: Context) {
 
     fun rulesetGeneration(): Long = prefs.getLong(KEY_RULESET_GENERATION, 0L)
 
+    /** Shared by the page and Provider; presentation cannot relax the execution gate. */
+    fun extensionRequiresCooldown(packageName: String): Boolean {
+        val group = groupForPackage(packageName)?.takeIf { it.enabled }
+        val rule = getRule(packageName)
+        return if (group != null) group.cooldownEnabled else rule.enabled && rule.cooldownEnabled
+    }
+
+    /** Reads remaining quota without consuming a slot. */
+    fun previewExtension(packageName: String, sessionId: String): ExtensionQuotaDecision = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        check(prefs !in FAILED_EXTENSION_STORES) { "Extension storage unavailable" }
+        val settings = getGlobalSettings()
+        if (!settings.extensionEnabled || sessionId.isBlank()) {
+            return@synchronized ExtensionQuotaDecision(false, false, ExtensionQuotaState(), 0, 0, 0)
+        }
+        val identity = groupForPackage(packageName)?.let { "group:${it.id}" } ?: "package:$packageName"
+        val global = "runtime.extension.global.daily."
+        val session = "runtime.extension.$identity.session."
+        ExtensionQuotaPolicy.preview(
+            ExtensionQuotaState(
+                dayToken = prefs.getString(global + "day", "").orEmpty(),
+                dailyUsedCount = prefs.getInt(global + "count", 0),
+                sessionId = prefs.getString(session + "id", "").orEmpty(),
+                sessionUsedCount = prefs.getInt(session + "count", 0),
+            ), java.time.LocalDate.now().toString(), sessionId.take(160), settings.extensionDailyLimit, settings.extensionSessionLimit,
+        )
+    }
+
     /** Atomically consumes one ordinary delay for this app or its owning group's active session. */
     fun claimExtension(
         packageName: String,
         dayToken: String,
         sessionId: String = "",
+        requestId: String = "",
     ): com.liuml.apptimelimiter.core.ExtensionQuotaDecision {
         val group = groupForPackage(packageName)
         val identity = group?.let { "group:${it.id}" } ?: "package:$packageName"
@@ -369,6 +397,13 @@ class RuleRepository(context: Context) {
         val globalPrefix = "runtime.extension.global.daily."
         val sessionPrefix = "runtime.extension.$identity.session."
         synchronized(STORAGE_LIFECYCLE_LOCK) {
+            check(prefs !in FAILED_EXTENSION_STORES) { "Extension storage unavailable" }
+            val grantPrefix = "runtime.extension.grant.$packageName."
+            val grantIdentity = extensionGrantIdentity(packageName, safeSession, dayToken)
+            if (requestId.isNotBlank() && prefs.getString(grantPrefix + "identity", "") == grantIdentity &&
+                prefs.getString(grantPrefix + "request", "") == requestId) {
+                return ExtensionQuotaDecision(true, false, ExtensionQuotaState(), 0, 0, 0)
+            }
             val decision = ExtensionQuotaPolicy.claimFree(
                 state = ExtensionQuotaState(
                     dayToken = prefs.getString(globalPrefix + "day", "").orEmpty(),
@@ -384,98 +419,38 @@ class RuleRepository(context: Context) {
                 freeDailyLimit = settings.extensionFreeDailyLimit,
             )
             if (!decision.allowed) return decision
-            if (!prefs.edit()
+            val editor = prefs.edit()
+            if (requestId.isNotBlank()) {
+                val previous = if (prefs.getString(grantPrefix + "identity", "") == grantIdentity)
+                    prefs.getLong(grantPrefix + "millis", 0L).coerceAtLeast(0) else 0L
+                editor.putString(grantPrefix + "identity", grantIdentity)
+                    .putString(grantPrefix + "request", requestId)
+                    .putLong(grantPrefix + "millis", (previous + settings.extensionSeconds * 1_000L).coerceAtMost(86_400_000L))
+            }
+            if (!editor
                     .putString(globalPrefix + "day", decision.nextState.dayToken)
                     .putInt(globalPrefix + "count", decision.nextState.dailyUsedCount)
                     .putInt(globalPrefix + "free_count", decision.nextState.freeUsedCount)
                     .putString(sessionPrefix + "id", decision.nextState.sessionId)
                     .putInt(sessionPrefix + "count", decision.nextState.sessionUsedCount)
                     .commit()) {
+                FAILED_EXTENSION_STORES.add(prefs)
                 throw IllegalStateException("extension_quota_persist_failed")
             }
-            recordExtensionStatistic(packageName, decision.nextState.dayToken, identity, decision.nextState.dailyUsedCount)
+            runCatching { recordExtensionStatistic(packageName, decision.nextState.dayToken, identity, decision.nextState.dailyUsedCount) }
             return decision
         }
     }
 
-    /** Claims an extension only after a rewarded-ad callback has been verified. */
-    fun claimRewardedExtension(
-        packageName: String,
-        dayToken: String,
-        sessionId: String,
-    ): ExtensionQuotaDecision {
-        val settings = getGlobalSettings()
-        if (!settings.extensionEnabled) {
-            return ExtensionQuotaDecision(false, false, ExtensionQuotaState(), 0, 0, 0)
-        }
-        val group = groupForPackage(packageName)
-        val identity = group?.let { "group:${it.id}" } ?: "package:$packageName"
-        val safeSession = sessionId.take(160)
-        if (safeSession.isBlank()) throw IllegalArgumentException("missing_extension_session")
-        val globalPrefix = "runtime.extension.global.daily."
-        val sessionPrefix = "runtime.extension.$identity.session."
-        synchronized(STORAGE_LIFECYCLE_LOCK) {
-            val decision = ExtensionQuotaPolicy.claimRewarded(
-                state = ExtensionQuotaState(
-                    dayToken = prefs.getString(globalPrefix + "day", "").orEmpty(),
-                    dailyUsedCount = prefs.getInt(globalPrefix + "count", 0),
-                    freeUsedCount = prefs.getInt(globalPrefix + "free_count", 0),
-                    sessionId = prefs.getString(sessionPrefix + "id", "").orEmpty(),
-                    sessionUsedCount = prefs.getInt(sessionPrefix + "count", 0),
-                ),
-                dayToken = dayToken.take(32),
-                sessionId = safeSession,
-                dailyLimit = settings.extensionDailyLimit,
-                sessionLimit = settings.extensionSessionLimit,
-                freeDailyLimit = settings.extensionFreeDailyLimit,
-            )
-            if (!decision.allowed) return decision
-            if (!prefs.edit()
-                    .putString(globalPrefix + "day", decision.nextState.dayToken)
-                    .putInt(globalPrefix + "count", decision.nextState.dailyUsedCount)
-                    .putInt(globalPrefix + "free_count", decision.nextState.freeUsedCount)
-                    .putString(sessionPrefix + "id", decision.nextState.sessionId)
-                    .putInt(sessionPrefix + "count", decision.nextState.sessionUsedCount)
-                    .commit()) {
-                throw IllegalStateException("rewarded_extension_quota_persist_failed")
-            }
-            recordExtensionStatistic(packageName, decision.nextState.dayToken, identity, decision.nextState.dailyUsedCount)
-            return decision
-        }
-    }
+    private fun extensionGrantIdentity(packageName: String, sessionId: String, day: String): String =
+        "$day|$sessionId|${getRule(packageName).version}|${groupForPackage(packageName)?.version ?: 0L}|${getGlobalSettings().protectionModeGeneration}"
 
-    /** Checks whether a rewarded extension can be granted without consuming its quota. */
-    fun previewRewardedExtension(
-        packageName: String,
-        dayToken: String,
-        sessionId: String,
-    ): ExtensionQuotaDecision {
-        val settings = getGlobalSettings()
-        if (!settings.extensionEnabled) {
-            return ExtensionQuotaDecision(false, false, ExtensionQuotaState(), 0, 0, 0)
-        }
-        val group = groupForPackage(packageName)
-        val identity = group?.let { "group:${it.id}" } ?: "package:$packageName"
-        val safeSession = sessionId.take(160)
-        if (safeSession.isBlank()) throw IllegalArgumentException("missing_extension_session")
-        val globalPrefix = "runtime.extension.global.daily."
-        val sessionPrefix = "runtime.extension.$identity.session."
-        synchronized(STORAGE_LIFECYCLE_LOCK) {
-            return ExtensionQuotaPolicy.claimRewarded(
-                state = ExtensionQuotaState(
-                    dayToken = prefs.getString(globalPrefix + "day", "").orEmpty(),
-                    dailyUsedCount = prefs.getInt(globalPrefix + "count", 0),
-                    freeUsedCount = prefs.getInt(globalPrefix + "free_count", 0),
-                    sessionId = prefs.getString(sessionPrefix + "id", "").orEmpty(),
-                    sessionUsedCount = prefs.getInt(sessionPrefix + "count", 0),
-                ),
-                dayToken = dayToken.take(32),
-                sessionId = safeSession,
-                dailyLimit = settings.extensionDailyLimit,
-                sessionLimit = settings.extensionSessionLimit,
-                freeDailyLimit = settings.extensionFreeDailyLimit,
-            )
-        }
+    fun grantedExtensionMillis(packageName: String, sessionId: String): Long = synchronized(STORAGE_LIFECYCLE_LOCK) {
+        if (prefs in FAILED_EXTENSION_STORES) return@synchronized 0L
+        val prefix = "runtime.extension.grant.$packageName."
+        if (prefs.getString(prefix + "identity", "") !=
+            extensionGrantIdentity(packageName, sessionId, java.time.LocalDate.now().toString())) 0L
+        else prefs.getLong(prefix + "millis", 0L).coerceIn(0L, 86_400_000L)
     }
 
     private fun recordExtensionStatistic(
@@ -505,34 +480,19 @@ class RuleRepository(context: Context) {
             (settings.extensionDailyLimit - used).coerceAtLeast(0)
         }
 
-    /** The first successful parent temporary unlock each local day does not request an ad. */
-    fun isParentUnlockAdRequired(dayToken: String): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
+    /** Upgrade-only legacy counter; new quota is manager-private and transactional. */
+    fun legacyParentUnlockCount(dayToken: String): Int = synchronized(STORAGE_LIFECYCLE_LOCK) {
         val day = dayToken.take(32)
-        if (day.isBlank()) return@synchronized false
+        if (day.isBlank()) return@synchronized 0
         val prefix = "runtime.parent_auth.daily."
         val used = if (prefs.getString(prefix + "day", "") == day) {
             prefs.getInt(prefix + "count", 0).coerceAtLeast(0)
         } else {
             0
         }
-        used >= 1
+        used
     }
 
-    /** Counts only a successfully persisted temporary override; cancelled ad flows remain retryable. */
-    fun recordSuccessfulParentUnlock(dayToken: String): Boolean = synchronized(STORAGE_LIFECYCLE_LOCK) {
-        val day = dayToken.take(32)
-        if (day.isBlank()) return@synchronized false
-        val prefix = "runtime.parent_auth.daily."
-        val used = if (prefs.getString(prefix + "day", "") == day) {
-            prefs.getInt(prefix + "count", 0).coerceAtLeast(0)
-        } else {
-            0
-        }
-        prefs.edit()
-            .putString(prefix + "day", day)
-            .putInt(prefix + "count", (used + 1).coerceAtMost(Int.MAX_VALUE))
-            .commit()
-    }
 
     fun exportPortableBackup(
         sourceVersionName: String,
@@ -1548,6 +1508,7 @@ class RuleRepository(context: Context) {
     }
 
     companion object {
+        private val FAILED_EXTENSION_STORES = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<SharedPreferences, Boolean>())
         private val GROUP_COOLDOWN_LOCK = Any()
         private val GROUP_SESSION_LOCK = Any()
         private val STORAGE_LIFECYCLE_LOCK = Any()

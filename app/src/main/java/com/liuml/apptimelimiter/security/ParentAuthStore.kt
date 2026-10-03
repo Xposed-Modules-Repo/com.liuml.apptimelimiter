@@ -41,7 +41,7 @@ data class ParentAuthCompletion(
 /** Process-private authority shared by RuleProvider and Time Stop's secure PIN activity. */
 object ParentAuthStore {
     const val CHALLENGE_LIFETIME_MILLIS = 30_000L
-    private const val VERIFIED_AD_HANDOFF_LIFETIME_MILLIS = 2 * 60_000L
+    private const val ACTIVATION_LIFETIME_MILLIS = 2 * 60_000L
     private const val MAX_RECORDS = 64
     private const val PREFS_NAME = "parent_auth_runtime"
     private const val KEY_OVERRIDES = "temporary_overrides_v1"
@@ -63,19 +63,65 @@ object ParentAuthStore {
     private fun receipt(token: String): String = java.security.MessageDigest.getInstance("SHA-256")
         .digest(token.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 
+    const val DEFAULT_DAILY_LIMIT = 3
+    private const val KEY_DAILY_LIMIT = "daily_unlock_limit"
+    private const val KEY_NO_AD_MIGRATION = "no_ad_quota_migrated_v1"
+    private var testDailyLimit = DEFAULT_DAILY_LIMIT
+
     @Synchronized
-    fun isAdRequired(nowMillis: Long, nowElapsedMillis: Long? = null): Boolean {
+    fun dailyLimit(): Int = persistentPrefs?.getInt(KEY_DAILY_LIMIT, DEFAULT_DAILY_LIMIT)
+        ?.coerceIn(0, 50) ?: testDailyLimit
+
+    @Synchronized
+    fun setDailyLimit(value: Int): Boolean {
+        if (value !in 0..50 || !storageHealthy) return false
+        val prefs = persistentPrefs
+        if (prefs == null) return false
+        return runCatching { database!!.transaction {
+            check(prefs.edit().putInt(KEY_DAILY_LIMIT, value).commit())
+            true
+        } }.getOrDefault(false)
+    }
+
+    @Synchronized
+    internal fun setDailyLimitForTests(value: Int): Boolean {
+        if (value !in 0..50) return false
+        testDailyLimit = value
+        return true
+    }
+
+    @Synchronized
+    fun quotaExhausted(nowMillis: Long, nowElapsedMillis: Long, excluding: String? = null): Boolean {
+        if (!storageHealthy) return true
         val day = dayAt(nowMillis)
-        if ((quotaByDay[day] ?: if (dailyDay == day) dailyCount else 0) >= 1) return true
-        return overrides.values.any {
-            it.pendingQuotaDay == day && it.pendingDurationMillis > 0L &&
-                (nowElapsedMillis ?: SystemClock.elapsedRealtime()) in
-                    it.grantedAtElapsedMillis until it.expiresAtElapsedMillis
+        val used = quotaByDay[day] ?: if (dailyDay == day) dailyCount else 0
+        val reserved = overrides.entries.count { (key, value) ->
+            key != excluding && value.pendingQuotaDay == day && value.pendingDurationMillis > 0L &&
+                nowElapsedMillis in value.grantedAtElapsedMillis until value.expiresAtElapsedMillis
+        }
+        return used.toLong() + reserved >= dailyLimit()
+    }
+
+    @Synchronized
+    fun usedToday(nowMillis: Long): Int = quotaByDay[dayAt(nowMillis)]
+        ?: if (dailyDay == dayAt(nowMillis)) dailyCount else 0
+
+    /** One transaction preserves active grants, cancels legacy pending work and seeds the quota. */
+    @Synchronized
+    internal fun migrateNoAds(nowMillis: Long, historicalCount: Int) {
+        if (persistentPrefs?.getBoolean(KEY_NO_AD_MIGRATION, false) == true) return
+        atomicOperation({ true }) {
+            val day = dayAt(nowMillis)
+            quotaByDay[day] = maxOf(usedToday(nowMillis), historicalCount.coerceAtLeast(0))
+            if (day >= dailyDay) { dailyDay = day; dailyCount = quotaByDay.getValue(day) }
+            overrides.entries.removeAll { it.value.pendingDurationMillis > 0L }
+            challenges.clear()
+            check(persistOverrides())
+            check(persistentPrefs!!.edit().putBoolean(KEY_NO_AD_MIGRATION, true).commit())
         }
     }
 
     private fun countActivatedQuota(day: String) {
-        // A reservation crossing midnight belongs to its original day, never overwrites a newer day.
         if (day.isBlank()) return
         quotaByDay[day] = ((quotaByDay[day] ?: if (dailyDay == day) dailyCount else 0).toLong() + 1L)
             .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
@@ -84,14 +130,6 @@ object ParentAuthStore {
         dailyCount = if (dailyDay == day)
             (dailyCount.toLong() + 1L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() else 1
         dailyDay = day
-    }
-
-    @Synchronized
-    fun needsAdForCompletion(token: String, nowMillis: Long, nowElapsedMillis: Long): Boolean {
-        val challenge = challenges[token] ?: return false
-        return receipt(token) !in completedReceipts && challenge.uiConsumed &&
-            challenge.status == ParentAuthStatus.WAITING && challenge.expiresAtMillis > nowMillis &&
-            isAdRequired(nowMillis, nowElapsedMillis)
     }
 
     private fun dayAt(nowMillis: Long): String = java.time.Instant.ofEpochMilli(nowMillis)
@@ -109,6 +147,14 @@ object ParentAuthStore {
         dailyCount = persistentPrefs!!.getInt("quota_count", 0).coerceAtLeast(0)
         completedReceipts.addAll(persistentPrefs!!.getStringSet("completed_receipts", emptySet()).orEmpty())
         restoreOverrides()
+        if (!persistentPrefs!!.getBoolean(KEY_NO_AD_MIGRATION, false)) {
+            val history = runCatching {
+                com.liuml.apptimelimiter.statistics.UsageStatsRepository(context)
+                    .allParentUnlocksForDay(java.time.LocalDate.now())
+            }.getOrDefault(0)
+            try { migrateNoAds(System.currentTimeMillis(), history) }
+            catch (_: Exception) { storageHealthy = false }
+        }
     }
 
     @Synchronized internal fun initializeForTests(db: ManagerControlDatabase, boot: Int) {
@@ -227,12 +273,11 @@ object ParentAuthStore {
         durationMillis: Long,
         nowMillis: Long,
         nowElapsedMillis: Long,
-        enforceDailyAd: Boolean = false,
         deferActivation: Boolean = false,
         isIdentityCurrent: (TemporaryOverrideIdentity) -> Boolean = { true },
     ): ParentAuthCompletion? {
         if (database?.hasTransaction() == false) return atomicOperation({ it != null }) {
-            complete(token, granted, durationMillis, nowMillis, nowElapsedMillis, enforceDailyAd, deferActivation, isIdentityCurrent)
+            complete(token, granted, durationMillis, nowMillis, nowElapsedMillis, deferActivation, isIdentityCurrent)
         }
         if (!storageHealthy) return null
         prune(nowMillis)
@@ -248,8 +293,7 @@ object ParentAuthStore {
         if (!granted && existing.uiConsumed && existing.status == ParentAuthStatus.DENIED)
             return ParentAuthCompletion(existing, null)
         if (!existing.uiConsumed || !existing.status.allowsCompletion(granted)) return null
-        if (granted && enforceDailyAd && isAdRequired(nowMillis, nowElapsedMillis) &&
-            existing.status != ParentAuthStatus.AD_REWARDED) return null
+        if (granted && quotaExhausted(nowMillis, nowElapsedMillis)) return null
         if (granted && !isIdentityCurrent(existing.identity)) {
             challenges[token] = existing.copy(status = ParentAuthStatus.INVALID)
             return null
@@ -264,14 +308,14 @@ object ParentAuthStore {
             val previousReceipts = completedReceipts.toSet()
             completedReceipts.add(receipt(token))
             while (completedReceipts.size > MAX_RECORDS) completedReceipts.remove(completedReceipts.first())
-            if (enforceDailyAd && !deferActivation && existing.status != ParentAuthStatus.AD_REWARDED) countActivatedQuota(dayAt(nowMillis))
+            if (!deferActivation) countActivatedQuota(dayAt(nowMillis))
             val created = TemporaryParentOverride(
                 identity = existing.identity,
                 grantedAtElapsedMillis = nowElapsedMillis,
                 expiresAtElapsedMillis = safeAdd(nowElapsedMillis,
-                    if (deferActivation) VERIFIED_AD_HANDOFF_LIFETIME_MILLIS else durationMillis.coerceAtLeast(1L)),
+                    if (deferActivation) ACTIVATION_LIFETIME_MILLIS else durationMillis.coerceAtLeast(1L)),
                 pendingDurationMillis = if (deferActivation) durationMillis.coerceIn(1L, 3_600_000L) else 0L,
-                pendingQuotaDay = if (enforceDailyAd && deferActivation && existing.status != ParentAuthStatus.AD_REWARDED) dayAt(nowMillis) else "",
+                pendingQuotaDay = if (deferActivation) dayAt(nowMillis) else "",
             )
             overrides[overrideKey(existing.identity)] = created
             while (overrides.size > MAX_RECORDS) overrides.remove(overrides.keys.first())
@@ -291,34 +335,6 @@ object ParentAuthStore {
         }
         event(completed, RuntimeDiagnosticStage.PIN_COMPLETED)
         return ParentAuthCompletion(completed, parentOverride)
-    }
-
-    /** Records a successful PIN verification while the manager-owned restriction page shows an ad. */
-    @Synchronized
-    fun markVerifiedWaitingForAd(token: String, nowMillis: Long): ParentAuthChallenge? {
-        if (database?.hasTransaction() == false) return atomicOperation({ it != null }) { markVerifiedWaitingForAd(token, nowMillis) }
-        prune(nowMillis)
-        val existing = challenges[token] ?: return null
-        if (existing.uiConsumed && existing.status == ParentAuthStatus.VERIFIED_WAITING_AD) return existing
-        if (!existing.uiConsumed || existing.status != ParentAuthStatus.WAITING) return null
-        return existing.copy(
-            status = ParentAuthStatus.VERIFIED_WAITING_AD,
-            expiresAtMillis = safeAdd(nowMillis, VERIFIED_AD_HANDOFF_LIFETIME_MILLIS),
-            expiresAtElapsedMillis = if (database != null) safeAdd(SystemClock.elapsedRealtime(), VERIFIED_AD_HANDOFF_LIFETIME_MILLIS) else 0L,
-        ).also { challenges[token] = it; event(it, RuntimeDiagnosticStage.PIN_WAITING_AD) }
-    }
-
-    /** An ad-gated challenge may only grant after the manager process records a reward. */
-    @Synchronized
-    fun markAdRewarded(token: String, nowMillis: Long): ParentAuthChallenge? {
-        if (database?.hasTransaction() == false) return atomicOperation({ it != null }) { markAdRewarded(token, nowMillis) }
-        prune(nowMillis)
-        val existing = challenges[token] ?: return null
-        if (existing.uiConsumed && existing.status == ParentAuthStatus.AD_REWARDED) return existing
-        if (!existing.uiConsumed || existing.status != ParentAuthStatus.VERIFIED_WAITING_AD) return null
-        return existing.copy(status = ParentAuthStatus.AD_REWARDED).also {
-            challenges[token] = it; event(it, RuntimeDiagnosticStage.PIN_REWARDED)
-        }
     }
 
     @Synchronized
@@ -386,9 +402,10 @@ object ParentAuthStore {
         screenInteractive: Boolean,
         nowElapsedMillis: Long,
         foregroundVerified: Boolean,
+        nowMillis: Long = System.currentTimeMillis(),
     ): TemporaryParentOverride? {
         if (database?.hasTransaction() == false) return atomicOperation({ it != null }) {
-            activateOverride(identity, screenInteractive, nowElapsedMillis, foregroundVerified)
+            activateOverride(identity, screenInteractive, nowElapsedMillis, foregroundVerified, nowMillis)
         }
         if (!storageHealthy || !foregroundVerified || !screenInteractive) return null
         val granted = overrides[overrideKey(identity)] ?: return null
@@ -397,7 +414,11 @@ object ParentAuthStore {
             if (granted.identity.processSessionId != identity.processSessionId) return null
             val previousDay = dailyDay
             val previousCount = dailyCount
-            countActivatedQuota(granted.pendingQuotaDay)
+            if (quotaExhausted(nowMillis, nowElapsedMillis, overrideKey(identity))) return null
+            countActivatedQuota(dayAt(nowMillis))
+            val challenge = challenges.values.lastOrNull { it.identity == granted.identity && it.status == ParentAuthStatus.GRANTED }
+            database?.enqueuePinStatistic(identity.packageName,
+                receipt(challenge?.token ?: "${overrideKey(identity)}|${granted.grantedAtElapsedMillis}"), dayAt(nowMillis))
             val activated = granted.copy(grantedAtElapsedMillis = nowElapsedMillis,
                 expiresAtElapsedMillis = safeAdd(nowElapsedMillis, granted.pendingDurationMillis),
                 pendingDurationMillis = 0L, pendingQuotaDay = "")
@@ -465,6 +486,7 @@ object ParentAuthStore {
         database = null
         storageHealthy = true
         bootCount = -1
+        testDailyLimit = DEFAULT_DAILY_LIMIT
     }
 
     private fun prune(nowMillis: Long) {
@@ -488,7 +510,7 @@ object ParentAuthStore {
 
     private fun ParentAuthStatus.allowsCompletion(granted: Boolean): Boolean = when {
         !granted -> this == ParentAuthStatus.WAITING || this == ParentAuthStatus.VERIFIED_WAITING_AD
-        else -> this == ParentAuthStatus.WAITING || this == ParentAuthStatus.AD_REWARDED
+        else -> this == ParentAuthStatus.WAITING
     }
 
     private fun overrideKey(identity: TemporaryOverrideIdentity): String =

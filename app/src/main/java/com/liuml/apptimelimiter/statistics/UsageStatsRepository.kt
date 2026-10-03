@@ -305,6 +305,15 @@ class UsageStatsRepository(context: Context) {
         )
     }
 
+    /** Unfiltered upgrade-only count, including system and uninstalled packages. */
+    fun allParentUnlocksForDay(date: LocalDate): Int = synchronized(LOCK) {
+        check(recoverPendingWrite()) { "Statistics storage is unavailable" }
+        prefs.all.entries.asSequence()
+            .filter { it.key.startsWith("$date.") && it.key.endsWith(".parent_unlocks") }
+            .map { (it.value as? Int ?: 0).coerceAtLeast(0).toLong() }
+            .fold(0L) { sum, value -> (sum + value).coerceAtMost(Int.MAX_VALUE.toLong()) }.toInt()
+    }
+
     fun summaryToday(packageName: String): AppUsageSummary {
         return summaryForDay(packageName, LocalDate.now())
     }
