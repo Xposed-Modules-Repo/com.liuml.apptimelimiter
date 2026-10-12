@@ -13,6 +13,7 @@ data class PerLaunchRestDecision(
  * process that survived in the background from carrying an old partial session indefinitely.
  */
 object PerLaunchRestPolicy {
+    @Suppress("UNUSED_PARAMETER") // Retained argument no longer makes stale UI an authority.
     fun evaluate(
         hasPerLaunchQuota: Boolean,
         configuredCooldownMillis: Long,
@@ -28,11 +29,14 @@ object PerLaunchRestPolicy {
         } else {
             0L
         }
+        // A retained restriction page is not evidence of a current restriction. The caller
+        // re-evaluates daily quotas and schedules after resetting only the continuous cycle.
+        val requiredRest = SessionRestPolicy.intervalMillis(
+            configuredCooldownMillis > 0L, configuredCooldownMillis,
+        )
         val shouldReset = hasPerLaunchQuota &&
-            configuredCooldownMillis > 0L &&
             validBackgroundTimestamp &&
-            gapMillis >= configuredCooldownMillis &&
-            !blockingStateActive &&
+            gapMillis >= requiredRest &&
             activeCooldownRemainingMillis <= 0L
         return PerLaunchRestDecision(
             shouldStartNewCycle = shouldReset,

@@ -93,6 +93,11 @@ class LimitBlockActivity : Activity() {
     private var parentAuthPoll: Runnable? = null
     private var runtimeIdentity: Bundle? = null
     private var runtimeRenewedAt = 0L
+    private var targetExitTransport: Bundle? = null
+    private var taskExitInFlight = false
+    private var taskExitGeneration = 0L
+    private var taskExitFailedReason = ""
+    private var taskExitPendingReason = ""
     private val deviceUsageStatsRepository by lazy {
         DeviceUsageStatsRepository(applicationContext)
     }
@@ -110,6 +115,8 @@ class LimitBlockActivity : Activity() {
         super.onCreate(savedInstanceState)
         extensionRequestId = savedInstanceState?.getString("free_extension_request_id") ?: extensionRequestId
         runtimeIdentity = savedInstanceState?.getBundle("control_runtime_identity")
+        targetExitTransport = savedInstanceState?.getBundle("target_exit_transport")
+        taskExitPendingReason = savedInstanceState?.getString("target_exit_pending_reason").orEmpty()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             onBackInvokedDispatcher.registerOnBackInvokedCallback(
                 android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
@@ -160,6 +167,8 @@ class LimitBlockActivity : Activity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBundle("target_exit_transport", targetExitTransport)
+        outState.putString("target_exit_pending_reason", taskExitPendingReason.takeIf { taskExitInFlight })
         super.onSaveInstanceState(outState)
         outState.putString("free_extension_request_id", extensionRequestId)
         outState.putBundle("control_runtime_identity", runtimeIdentity)
@@ -239,6 +248,11 @@ class LimitBlockActivity : Activity() {
             "attempt=${launchAttemptId.take(12)}, hasFocus=${hasWindowFocus()}",
         )
         handler.post { confirmNonRootForegroundIfReady() }
+        if (taskExitPendingReason.isNotBlank() && !taskExitInFlight) {
+            val reason = taskExitPendingReason
+            taskExitPendingReason = ""
+            handler.post { exitBoundTarget(reason) }
+        }
         handler.removeCallbacks(refresh)
         handler.post(refresh)
     }
@@ -502,6 +516,11 @@ class LimitBlockActivity : Activity() {
 
     private fun applyTrustedIntent(source: android.content.Intent) {
         targetPackage = source.getStringExtra(EXTRA_TARGET_PACKAGE).orEmpty()
+        targetExitTransport = com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.transport(source.extras)
+        taskExitGeneration++
+        taskExitInFlight = false
+        taskExitFailedReason = ""
+        taskExitPendingReason = ""
         launchAttemptId = source.getStringExtra(EXTRA_LAUNCH_ATTEMPT_ID).orEmpty()
         lastRestrictionState = ""
         initialRuleVersion = source.getLongExtra(EXTRA_RULE_VERSION, Long.MIN_VALUE)
@@ -908,7 +927,7 @@ class LimitBlockActivity : Activity() {
     }
 
     private fun startParentUnlock() {
-        if (parentAuthInFlight) return
+        if (parentAuthInFlight || taskExitInFlight) return
         diagnostic(
             "INFO",
             targetPackage,
@@ -1110,7 +1129,7 @@ class LimitBlockActivity : Activity() {
             parentAuthPoll?.let(handler::removeCallbacks)
             parentAuthPoll = null
         }
-        parentUnlockView.isEnabled = !busy
+        parentUnlockView.isEnabled = !busy && !taskExitInFlight
         parentUnlockView.alpha = if (busy) 0.6f else 1f
         parentUnlockView.text = when {
             busy && english -> "Opening verification…"
@@ -1205,7 +1224,7 @@ class LimitBlockActivity : Activity() {
             !state.contains("COOLDOWN") && !state.contains("SCHEDULE")) View.VISIBLE else View.GONE
         val quota = runCatching { RuleRepository(this).previewExtension(targetPackage, controlSessionId) }.getOrNull()
         val needsCooldown = RuleRepository(this).extensionRequiresCooldown(targetPackage)
-        extensionView.isEnabled = quota?.allowed == true && !needsCooldown
+        extensionView.isEnabled = quota?.allowed == true && !needsCooldown && !taskExitInFlight
         extensionView.text = when {
             needsCooldown -> if (english) "This rule requires a cooling-off period; extensions are unavailable" else "当前规则要求到限后冷却，不可延时"
             quota == null -> if (english) "Extension status unavailable; reopen this page to retry" else "暂时无法读取延时次数，请重新进入管控页"
@@ -1218,6 +1237,7 @@ class LimitBlockActivity : Activity() {
     }
 
     private fun requestFreeExtension() {
+        if (taskExitInFlight || parentAuthInFlight) return
         extensionView.isEnabled = false
         val response = runCatching {
             contentResolver.call(RuleContract.CONTENT_URI, "request_free_extension", targetPackage, Bundle().apply {
@@ -1291,10 +1311,7 @@ class LimitBlockActivity : Activity() {
             "USER_EXIT_REQUESTED",
             "source=break_page, nonRoot=$nonRoot",
         )
-        launchHome()
-        // Do not leave the restriction task behind. A lingering page can be restored by the
-        // launcher or recents and makes one user exit look like two separate exits.
-        finishWithoutAnimation("user_exit")
+        exitBoundTarget("user_exit")
     }
 
     private fun claimRestrictionUi(
@@ -1358,25 +1375,61 @@ class LimitBlockActivity : Activity() {
             "BREAK_PAGE_FAIL_CLOSED",
             "reason=$reason, nonRoot=$nonRoot",
         )
-        launchHome()
-        finishWithoutAnimation(reason)
+        exitBoundTarget(reason)
     }
 
-    private fun launchHome() {
-        val home = Intent(Intent.ACTION_MAIN).apply {
-            addCategory(Intent.CATEGORY_HOME)
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+    private fun exitBoundTarget(reason: String) {
+        if (taskExitInFlight || parentAuthInFlight || isFinishing || isDestroyed) return
+        if (reason != "user_exit" && taskExitFailedReason == reason) return
+        val mode = targetExitTransport?.getString(com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.MODE)
+            ?.let { runCatching { com.liuml.apptimelimiter.core.TargetWindowMode.valueOf(it) }.getOrNull() }
+            ?: com.liuml.apptimelimiter.core.TargetWindowMode.UNKNOWN
+        // Always use the original-task capability. A task can become windowed after the
+        // page opens; its old FULLSCREEN snapshot must never authorize global Home.
+        val bridge = targetExitTransport?.getBinder(com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.EXTRA)
+        diagnostic("INFO", targetPackage, "TARGET_TASK_EXIT_REQUESTED",
+            "mode=$mode, task=${targetExitTransport?.getInt(com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.TASK_ID, -1)}, reason=$reason")
+        if (bridge == null) {
+            taskExitFailedReason = reason
+            showTaskExitFailure()
+            return
         }
-        runCatching { startActivity(home) }
-            .onFailure {
-                diagnostic(
-                    "WARN",
-                    targetPackage,
-                    "BREAK_PAGE_EXIT_HOME_FAILED",
-                    it.toString(),
-                )
-                moveTaskToBack(true)
+        taskExitInFlight = true
+        taskExitPendingReason = reason
+        exitView.isEnabled = false
+        parentUnlockView.isEnabled = false
+        extensionView.isEnabled = false
+        val generation = ++taskExitGeneration
+        val receiver = object : android.os.ResultReceiver(handler) {
+            override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
+                if (generation != taskExitGeneration || isFinishing || isDestroyed) return
+                taskExitInFlight = false
+                taskExitPendingReason = ""
+                taskExitGeneration++
+                exitView.isEnabled = true
+                parentUnlockView.isEnabled = !parentAuthInFlight
+                diagnostic(if (resultCode == 1) "INFO" else "WARN", targetPackage,
+                    "TARGET_TASK_EXIT_RESULT", "task=${targetExitTransport?.getInt(com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.TASK_ID, -1)} result=$resultCode")
+                if (resultCode == 1) finishWithoutAnimation(reason) else {
+                    taskExitFailedReason = reason
+                    showTaskExitFailure()
+                }
             }
+        }
+        if (!com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.request(bridge, receiver)) {
+            receiver.send(0, null)
+        }
+        handler.postDelayed({
+            if (generation == taskExitGeneration && taskExitInFlight) receiver.send(0, null)
+        }, 5_000L)
+    }
+
+    private fun showTaskExitFailure() {
+        if (::actionFeedbackView.isInitialized) {
+            actionFeedbackView.text = if (english) "Unable to close the target window. Close it manually or retry. Other apps will stay open."
+                else "无法自动关闭目标窗口，请手动关闭小窗或重试，不会退出其他应用。"
+            actionFeedbackView.visibility = View.VISIBLE
+        }
     }
 
     private fun parseMode(raw: String?): ScheduleMode =

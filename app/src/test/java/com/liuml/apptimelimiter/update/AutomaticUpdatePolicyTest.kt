@@ -1,57 +1,32 @@
 package com.liuml.apptimelimiter.update
 
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
+import org.junit.Assert.*
 import org.junit.Test
+import java.time.LocalDate
+import java.time.ZoneId
 
 class AutomaticUpdatePolicyTest {
-    @Test
-    fun `automatic check is enabled immediately then rate limited`() {
-        val now = 1_000_000_000L
-        assertTrue(AutomaticUpdatePolicy.shouldCheck(true, now, 0L))
-        assertFalse(AutomaticUpdatePolicy.shouldCheck(false, now, 0L))
-        assertFalse(
-            AutomaticUpdatePolicy.shouldCheck(
-                true,
-                now,
-                now - AutomaticUpdatePolicy.CHECK_INTERVAL_MILLIS + 1L,
-            ),
-        )
-        assertTrue(
-            AutomaticUpdatePolicy.shouldCheck(
-                true,
-                now,
-                now - AutomaticUpdatePolicy.CHECK_INTERVAL_MILLIS,
-            ),
-        )
+    @Test fun everyEntryChecksUnlessDisabled() {
+        assertTrue(AutomaticUpdatePolicy.shouldCheck(true, 1000, 999))
+        assertTrue(AutomaticUpdatePolicy.shouldCheck(true, 1000, 2000))
+        assertFalse(AutomaticUpdatePolicy.shouldCheck(false, 1000, 0))
+        assertFalse(AutomaticUpdatePolicy.shouldCheck(true, 0, 0))
     }
-
-    @Test
-    fun `new release prompts immediately and same release reminds daily`() {
-        val now = 2_000_000_000L
-        assertTrue(AutomaticUpdatePolicy.shouldPrompt("22-0.9.7", now, null, 0L))
-        assertTrue(AutomaticUpdatePolicy.shouldPrompt("22-0.9.7", now, "21-0.9.6", now))
-        assertFalse(
-            AutomaticUpdatePolicy.shouldPrompt(
-                "22-0.9.7",
-                now,
-                "22-0.9.7",
-                now - AutomaticUpdatePolicy.REMINDER_INTERVAL_MILLIS + 1L,
-            ),
-        )
-        assertTrue(
-            AutomaticUpdatePolicy.shouldPrompt(
-                "22-0.9.7",
-                now,
-                "22-0.9.7",
-                now - AutomaticUpdatePolicy.REMINDER_INTERVAL_MILLIS,
-            ),
-        )
+    @Test fun sameReleasePromptsOncePerLocalDayIncludingClockRollback() {
+        val midnight = LocalDate.of(2026, 10, 9).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        assertFalse(AutomaticUpdatePolicy.shouldPrompt("v2", midnight + 3600000, "v2", midnight + 1000))
+        assertTrue(AutomaticUpdatePolicy.shouldPrompt("v2", midnight + 1000, "v2", midnight - 1000))
+        assertFalse(AutomaticUpdatePolicy.shouldPrompt("v2", midnight - 1000, "v2", midnight + 1000))
+        assertTrue(AutomaticUpdatePolicy.shouldPrompt("v3", midnight, "v2", midnight))
+        assertTrue(AutomaticUpdatePolicy.shouldPrompt("v2", midnight, null, 0))
     }
-
-    @Test
-    fun `clock rollback allows a safe recheck and reprompt`() {
-        assertTrue(AutomaticUpdatePolicy.shouldCheck(true, 1_000L, 2_000L))
-        assertTrue(AutomaticUpdatePolicy.shouldPrompt("v1.0.0", 1_000L, "v1.0.0", 2_000L))
+    @Test fun rotationCannotReclaimAnEntryButNextOpeningCan() {
+        val id = MainEntryUpdatePolicy.nextEntry()
+        assertTrue(MainEntryUpdatePolicy.isKnown(id))
+        assertTrue(MainEntryUpdatePolicy.claim(id))
+        assertFalse(MainEntryUpdatePolicy.claim(id))
+        assertTrue(MainEntryUpdatePolicy.claim(MainEntryUpdatePolicy.nextEntry()))
+        assertFalse(MainEntryUpdatePolicy.claim(id))
+        assertFalse(MainEntryUpdatePolicy.isKnown(Long.MAX_VALUE))
     }
 }

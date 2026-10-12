@@ -325,6 +325,10 @@ internal class RuntimeLimiter(
     private var sessionPlanPromptRunnable: Runnable? = null
     private var blockingState: BlockingState? = null
     private var blockingOverlayFallback = false
+    private var windowRestrictionPanel: com.liuml.apptimelimiter.ui.WindowRestrictionPanel? = null
+    private var windowRestrictionActivity = WeakReference<Activity>(null)
+    private var windowRestrictionBusy = false
+    private var windowRestrictionRefresh: Runnable? = null
     private val incidentOccurredAtMillis = mutableMapOf<String, LocalCooldownStore.Time>()
     private var perLaunchCycleGeneration = 0L
     private var temporaryParentOverrideActive = false
@@ -517,6 +521,9 @@ internal class RuntimeLimiter(
             overrideAwaitingResume = parentOverrideAwaitingTargetResume,
             overrideActive = temporaryParentOverrideActive,
         )
+        if (temporaryParentOverrideActive && blockingState != null) {
+            removeBlockingOverlay(activity, "window_parent_override_active")
+        }
         if (!parentControlActive) {
             if (
                 enforceBlockingConditions(
@@ -641,6 +648,7 @@ internal class RuntimeLimiter(
 
     fun onActivityPaused(activity: Activity) {
         if (!resumedActivities.markPaused(activity)) return
+        if (windowRestrictionActivity.get() === activity) detachBlockingOverlay()
         if (!resumedActivities.isEmpty) {
             if (activeActivity.get() === activity) {
                 resumedActivities.anyOrNull()?.let { activeActivity = WeakReference(it) }
@@ -1616,11 +1624,12 @@ internal class RuntimeLimiter(
         val appLabel = runCatching {
             activity.packageManager.getApplicationLabel(activity.applicationInfo).toString()
         }.getOrDefault(packageName)
-        val message = hookText(
-            activity,
-            rule,
-            "今天已使用 $appLabel ${formatDuration(activity, rule, milestone * UsageMilestonePolicy.INTERVAL_MILLIS)}",
-            "$appLabel has been used for ${formatDuration(activity, rule, milestone * UsageMilestonePolicy.INTERVAL_MILLIS)} today",
+        val message = com.liuml.apptimelimiter.core.UsageReminderTextPolicy.message(
+            com.liuml.apptimelimiter.core.UsageReminderDisplay(
+                appLabel, used, thresholdStatus(activity, rule).snapshot.copy(
+                    planRemainingMillis = sessionPlanRemainingMillis().takeIf { it != NOT_RUNNING },
+                ),
+            ), isEnglish(activity, rule),
         )
         val banner = runCatching {
             TopWarningBanner.attach(
@@ -2794,7 +2803,116 @@ internal class RuntimeLimiter(
         rule: HookRule = checkNotNull(lastLoadedRule),
     ): Boolean {
         val previous = blockingState
+        if (com.liuml.apptimelimiter.core.WindowRestrictionPolicy.useEmbeddedPanel(
+                com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.activityMode(activity))) {
+            return showWindowRestriction(activity, state, rule)
+        }
+        detachBlockingOverlay()
         return showExternalBreakPage(activity, state, rule, previous)
+    }
+
+    private fun showWindowRestriction(activity: Activity, state: BlockingState, rule: HookRule): Boolean {
+        val newPanel = windowRestrictionPanel == null || windowRestrictionActivity.get() !== activity
+        if (newPanel) {
+            detachBlockingOverlay()
+            val panel = com.liuml.apptimelimiter.ui.WindowRestrictionPanel(activity,
+                com.liuml.apptimelimiter.ui.TargetUiPalette.resolve(activity, rule.themeMode, rule.themeColor),
+                isEnglish(activity, rule),
+                onExit = { exitWindowRestriction(activity) },
+                onPin = {
+                    val latest = readRule(activity, true)
+                    val current = blockingState
+                    if (current != null && !windowRestrictionBusy && windowRestrictionActivity.get() === activity &&
+                        latest.version == current.ruleVersion && latest.groupVersion == current.groupVersion &&
+                        guardXposedUiMode(activity, latest, "window_pin")) {
+                        beginParentAuthentication(activity, latest, current.reason.name, current.token)
+                    }
+                },
+                onExtend = { extendWindowRestriction(activity) })
+            if (!runCatching { com.liuml.apptimelimiter.ui.WindowRestrictionPanel.attach(activity, panel) }.getOrDefault(false)) return false
+            windowRestrictionPanel = panel
+            windowRestrictionActivity = WeakReference(activity)
+            // Pause tracked media only in this target; never send global media keys.
+            runCatching { mediaPauseController.pauseCommonMedia() }
+            diagnostic(activity, event = "WINDOW_RESTRICTION_SHOWN", message = "task=${activity.taskId}; no new task")
+        }
+        blockingState = state
+        val message = when (state.reason) {
+            LimitBlockReason.SCHEDULE -> hookText(activity, rule,
+                "当前不在可用时段。${formatNextTransition(activity, rule, evaluateSchedule(rule))}",
+                "Outside available hours. ${formatNextTransition(activity, rule, evaluateSchedule(rule))}")
+            LimitBlockReason.COOLDOWN -> hookText(activity, rule,
+                "冷却中，剩余 ${formatCooldownRemaining(activity, rule, cooldownRemainingMillis(activity, rule))}",
+                "Cooldown remaining: ${formatCooldownRemaining(activity, rule, cooldownRemainingMillis(activity, rule))}")
+            LimitBlockReason.QUOTA -> com.liuml.apptimelimiter.core.RestrictionReasonText.details(thresholdStatus(activity, rule).snapshot, isEnglish(activity, rule))
+        }
+        windowRestrictionPanel?.update(hookText(activity, rule, "使用已暂停", "Usage paused"), message,
+            rule.childLockEnabled, canExtendWindowRestriction(activity, rule), windowRestrictionBusy || parentAuthPending || extensionActionInFlight)
+        if (windowRestrictionRefresh == null) {
+            val refresh = Runnable {
+                windowRestrictionRefresh = null
+                if (windowRestrictionActivity.get() !== activity || !resumedActivities.contains(activity) ||
+                    activity.isFinishing || activity.isDestroyed || parentAuthPending || windowRestrictionBusy) return@Runnable
+                val latest = readRule(activity, true)
+                refreshTemporaryParentOverride(activity, latest)
+                if (temporaryParentOverrideActive || latest.protectionMode != ProtectionMode.XPOSED) {
+                    removeBlockingOverlay(activity, "window_override_or_mode_changed")
+                    processResumedActivity(activity, true, activity, false)
+                } else if (!enforceBlockingConditions(activity, latest, false, true)) {
+                    processResumedActivity(activity, true, activity, false)
+                }
+            }
+            windowRestrictionRefresh = refresh
+            mainHandler.postDelayed(refresh, 1_000L)
+        }
+        return true
+    }
+
+    private fun canExtendWindowRestriction(activity: Activity, rule: HookRule): Boolean =
+        com.liuml.apptimelimiter.core.WindowRestrictionPolicy.canExtend(rule.extensionEnabled,
+            rule.hasSchedule() && !evaluateSchedule(rule).allowed, cooldownRemainingMillis(activity, rule), rule.extensionRemainingCount)
+
+    private fun extendWindowRestriction(activity: Activity) {
+        val current = blockingState ?: return
+        if (windowRestrictionBusy || extensionActionInFlight || parentAuthPending || windowRestrictionActivity.get() !== activity) return
+        val latest = readRule(activity, true)
+        if (latest.version != current.ruleVersion || latest.groupVersion != current.groupVersion ||
+            !guardXposedUiMode(activity, latest, "window_extension") || !canExtendWindowRestriction(activity, latest)) {
+            windowRestrictionPanel?.showStatus(hookText(activity, latest, "当前限制不能延时", "This restriction cannot be extended"))
+            return
+        }
+        extensionActionInFlight = true
+        val result = grantExtension(activity, latest)
+        if (result != ExtensionActionResult.RECOVERING_PROVIDER) extensionActionInFlight = false
+        if (result == ExtensionActionResult.GRANTED) extensionsUsedThisProcess++
+        else windowRestrictionPanel?.showStatus(hookText(activity, latest, "延时未完成，请稍后重试", "Extension was not granted. Try again."))
+    }
+
+    private fun exitWindowRestriction(activity: Activity) {
+        val state = blockingState ?: return
+        if (windowRestrictionBusy || parentAuthPending || extensionActionInFlight) return
+        val latest = readRule(activity, true)
+        if (!guardXposedUiMode(activity, latest, "window_exit")) return
+        windowRestrictionBusy = true
+        windowRestrictionPanel?.update(hookText(activity, latest, "正在关闭窗口", "Closing window"), "", false, false, true)
+        val bridge = com.liuml.apptimelimiter.ipc.TargetTaskExitBridge(activity, Process.myUid()) {
+            blockingState?.token == state.token && windowRestrictionActivity.get() === activity &&
+                lastLoadedRule?.version == latest.version && lastLoadedRule?.groupVersion == latest.groupVersion &&
+                lastLoadedRule?.protectionModeGeneration == latest.protectionModeGeneration && !parentAuthPending && !temporaryParentOverrideActive
+        }
+        val panel = windowRestrictionPanel
+        val completed = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun finish(code: Int) {
+            if (!completed.compareAndSet(false, true) || windowRestrictionPanel !== panel) return
+            windowRestrictionBusy = false
+            if (code == com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.CLOSED) detachBlockingOverlay()
+            else {
+                showWindowRestriction(activity, state, readRule(activity, true))
+                panel?.showStatus(hookText(activity, latest, "无法自动关闭，请使用小窗关闭按钮", "Use the floating-window close control"))
+            }
+        }
+        if (!com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.request(bridge, mainHandler, ::finish)) finish(0)
+        mainHandler.postDelayed({ finish(0) }, 2_000L)
     }
 
     private fun showExternalBreakPage(
@@ -2835,7 +2953,22 @@ internal class RuntimeLimiter(
             }
         }
         val launched = runCatching {
+            val exitBridge = com.liuml.apptimelimiter.ipc.TargetTaskExitBridge(
+                activity,
+                activity.packageManager.getApplicationInfo(BuildConfig.APPLICATION_ID, 0).uid,
+            ) {
+                blockingState?.token == state.token &&
+                    lastLoadedRule?.version == rule.version &&
+                    lastLoadedRule?.groupVersion == rule.groupVersion &&
+                    lastLoadedRule?.protectionModeGeneration == rule.protectionModeGeneration &&
+                    !temporaryParentOverrideActive && !parentAuthPending
+            }
             val intent = Intent().apply {
+                putExtras(Bundle().apply {
+                    putBinder(com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.EXTRA, exitBridge)
+                    putString(com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.MODE, exitBridge.windowMode.name)
+                    putInt(com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.TASK_ID, exitBridge.boundTaskId)
+                })
                 setClassName(BuildConfig.APPLICATION_ID, LimitBlockActivity::class.java.name)
                 putExtra(LimitBlockActivity.EXTRA_TARGET_PACKAGE, packageName)
                 putExtra(
@@ -2900,10 +3033,18 @@ internal class RuntimeLimiter(
         ?.getString(RuleContract.KEY_BREAK_SESSION_TOKEN)
         ?.takeIf(String::isNotBlank)
 
-    private fun detachBlockingOverlay() = Unit
+    private fun detachBlockingOverlay() {
+        windowRestrictionRefresh?.let(mainHandler::removeCallbacks)
+        windowRestrictionRefresh = null
+        windowRestrictionPanel?.detach()
+        windowRestrictionPanel = null
+        windowRestrictionActivity.clear()
+        windowRestrictionBusy = false
+    }
 
     private fun removeBlockingOverlay(activity: Activity, reason: String) {
         if (blockingState == null) return
+        detachBlockingOverlay()
         blockingState = null
         blockingOverlayFallback = false
         diagnostic(activity, event = "EXTERNAL_BREAK_PAGE_REMOVED", message = reason)
@@ -2979,6 +3120,8 @@ internal class RuntimeLimiter(
     }
 
     private fun completeRestCycleIfNeeded(activity: Activity, rule: HookRule): Boolean {
+        // Only the Provider can restart a shared group cycle.
+        if (rule.groupEnabled) return false
         val state = blockingState ?: return false
         val nowMillis = System.currentTimeMillis()
         if (
@@ -3019,7 +3162,10 @@ internal class RuntimeLimiter(
         rule: HookRule,
     ) {
         val backgroundedAt = processBackgroundedAtElapsedMillis
-        processBackgroundedAtElapsedMillis = NOT_RUNNING
+        if (rule.groupEnabled) {
+            processBackgroundedAtElapsedMillis = NOT_RUNNING
+            return
+        }
         val decision = PerLaunchRestPolicy.evaluate(
             hasPerLaunchQuota = rule.perLaunchEnabled || rule.groupPerLaunchEnabled,
             configuredCooldownMillis = rule.configuredCooldownMillis(),
@@ -3028,8 +3174,12 @@ internal class RuntimeLimiter(
             blockingStateActive = blockingState != null,
             activeCooldownRemainingMillis = cooldownRemainingMillis(activity, rule),
         )
+        processBackgroundedAtElapsedMillis = NOT_RUNNING
         if (!decision.shouldStartNewCycle) return
 
+        stopTimingCallbacks()
+        dismissWarning(resetForCurrentLimit = true)
+        dismissScheduleWarning()
         perLaunchCommittedMs = 0L
         clearSharedGroupSessionState()
         perLaunchCycleGeneration++
@@ -3041,10 +3191,19 @@ internal class RuntimeLimiter(
                 incidentId.startsWith("group-launch|")
         }
         cancelSessionPlan(dismissDialog = true, resetPrompt = true)
+        // Keep daily/schedule evidence; remove only the expired continuous-use evidence.
+        blockingState = blockingState?.let { state ->
+            state.copy(
+                reachedKinds = state.reachedKinds.filterNotTo(linkedSetOf()) {
+                    it == QuotaKind.APP_PER_LAUNCH || it == QuotaKind.GROUP_PER_LAUNCH
+                },
+                cooldownEndsAtMillis = 0L,
+            )
+        }
         diagnostic(
             activity,
             event = "PER_LAUNCH_REST_RESET",
-            message = "离开应用达到冷静时长，开始新的单次轮次；gap=${decision.backgroundGapMillis / 1000.0}s, required=${rule.configuredCooldownMillis() / 1000.0}s, cycle=$perLaunchCycleGeneration, group=${rule.groupEnabled}",
+            message = "离开应用达到休息时长，开始新的单次轮次；gap=${decision.backgroundGapMillis / 1000.0}s, required=${com.liuml.apptimelimiter.core.SessionRestPolicy.intervalMillis(rule.configuredCooldownMillis() > 0L, rule.configuredCooldownMillis()) / 1000.0}s, cycle=$perLaunchCycleGeneration, group=${rule.groupEnabled}",
         )
     }
 
@@ -3208,33 +3367,16 @@ internal class RuntimeLimiter(
 
     private fun closeActivityUi(activity: Activity, eventPrefix: String? = null) {
         fun event(defaultName: String): String = eventPrefix?.let { "${it}_$defaultName" } ?: defaultName
-        runCatching { activity.finishAndRemoveTask() }
-            .onFailure {
-                diagnostic(
-                    activity,
-                    level = "ERROR",
-                    event = event("FINISH_TASK_FAILED"),
-                    message = it.toString(),
-                )
-            }
-        runCatching { activity.finishAffinity() }
-            .onFailure {
-                diagnostic(
-                    activity,
-                    level = "ERROR",
-                    event = event("FINISH_AFFINITY_FAILED"),
-                    message = it.toString(),
-                )
-            }
-        runCatching { activity.moveTaskToBack(true) }
-            .onFailure {
-                diagnostic(
-                    activity,
-                    level = "ERROR",
-                    event = event("MOVE_TASK_FAILED"),
-                    message = it.toString(),
-                )
-            }
+        // A target Activity can live in another app's task. Never remove that foreign task
+        // or move it to the background; on an ownership failure finish only this Activity.
+        val bridge = com.liuml.apptimelimiter.ipc.TargetTaskExitBridge(activity, Process.myUid()) { true }
+        val callback: (Int) -> Unit = { resultCode ->
+            diagnostic(activity, if (resultCode == 1) "INFO" else "WARN", event("TARGET_TASK_EXIT_RESULT"),
+                "task=${bridge.boundTaskId} result=$resultCode")
+            if (resultCode != 1) runCatching { activity.finish() }
+                .onFailure { diagnostic(activity, "ERROR", event("FINISH_ACTIVITY_FAILED"), it.javaClass.simpleName) }
+        }
+        if (!com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.request(bridge, mainHandler, callback)) callback(0)
     }
 
     private fun scheduleExitRecovery() {
@@ -3276,6 +3418,27 @@ internal class RuntimeLimiter(
     }
 
     private fun leaveTargetByUser(activity: Activity, source: String) {
+        if (!com.liuml.apptimelimiter.core.TargetTaskExitPolicy.mayGoHome(
+                com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.activityMode(activity))) {
+            val originalRule = lastLoadedRule ?: return
+            val originalSession = processSessionId
+            val bridge = com.liuml.apptimelimiter.ipc.TargetTaskExitBridge(activity, Process.myUid()) {
+                lastLoadedRule?.enabled == true && processSessionId == originalSession &&
+                    lastLoadedRule?.version == originalRule.version &&
+                    lastLoadedRule?.groupVersion == originalRule.groupVersion &&
+                    lastLoadedRule?.protectionModeGeneration == originalRule.protectionModeGeneration &&
+                    !temporaryParentOverrideActive
+            }
+            val callback: (Int) -> Unit = { resultCode ->
+                diagnostic(activity, if (resultCode == 1) "INFO" else "WARN",
+                    "TARGET_TASK_EXIT_RESULT", "source=$source task=${bridge.boundTaskId} result=$resultCode")
+                if (resultCode != 1) Toast.makeText(activity,
+                    hookText(activity, lastLoadedRule ?: originalRule, "无法关闭此小窗，请手动关闭", "Unable to close this window. Close it manually."),
+                    Toast.LENGTH_LONG).show()
+            }
+            if (!com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.request(bridge, mainHandler, callback)) callback(0)
+            return
+        }
         dismissWarning(resetForCurrentLimit = false)
         dismissScheduleWarning()
         dismissSessionPlanWarning()
@@ -3711,6 +3874,15 @@ internal class RuntimeLimiter(
             sharedGroupSessionUsedMs,
         ).coerceAtLeast(0L)
         val restarted = result.getBoolean(RuleContract.KEY_GROUP_SESSION_RESTARTED, false)
+        if (action == SharedGroupSessionAction.ENTER && !staleGroupResponse(result) &&
+            previousSessionId.isNotBlank() && previousSessionId != sharedGroupSessionId
+        ) {
+            stopTimingCallbacks()
+            dismissWarning(resetForCurrentLimit = true)
+            perLaunchCommittedMs = 0L
+            grantedExtensionMs = 0L
+            cancelSessionPlan(dismissDialog = true, resetPrompt = true)
+        }
         val transferred = result.getBoolean(
             RuleContract.KEY_GROUP_SESSION_OWNER_TRANSFERRED,
             false,
@@ -3732,6 +3904,9 @@ internal class RuntimeLimiter(
         }
         return !stale
     }
+
+    private fun staleGroupResponse(result: Bundle): Boolean =
+        result.getBoolean(RuleContract.KEY_GROUP_SESSION_STALE_REQUEST, false)
 
     private fun shouldReportUsageDuration(rule: HookRule): Boolean =
         UsageReportingPolicy.shouldReportDuration(
@@ -4464,6 +4639,8 @@ internal class RuntimeLimiter(
 
     private fun grantExtension(activity: Activity, rule: HookRule): ExtensionActionResult {
         val requestGeneration = ++extensionActionGeneration
+        val embeddedRequest = windowRestrictionPanel
+        val embeddedIncident = blockingState?.token
         // A click is an in-flight state transition. Invalidate the old deadline first so it
         // cannot win while the provider is atomically claiming the daily allowance.
         mainHandler.removeCallbacks(deadline)
@@ -4484,6 +4661,12 @@ internal class RuntimeLimiter(
                         ) return@requestInteractiveProviderAccessRecovery
                         if (recovered) {
                             val retryRule = readRule(activity, reloadFallback = true)
+                            if (embeddedRequest != null && (windowRestrictionPanel !== embeddedRequest ||
+                                blockingState?.token != embeddedIncident || retryRule.version != rule.version ||
+                                retryRule.groupVersion != rule.groupVersion ||
+                                retryRule.protectionModeGeneration != rule.protectionModeGeneration ||
+                                !guardXposedUiMode(activity, retryRule, "window_extension_retry") ||
+                                !canExtendWindowRestriction(activity, retryRule))) return@requestInteractiveProviderAccessRecovery
                             val retryClaim = consumeExtensionQuota(activity, retryRule)
                             if (retryClaim.accepted) {
                                 applyGrantedExtension(activity, retryRule, requestGeneration)
@@ -4543,6 +4726,11 @@ internal class RuntimeLimiter(
         if (requestGeneration != extensionActionGeneration || exitScheduled) return
         val latestRule = readRule(activity, reloadFallback = true)
         dismissWarning(resetForCurrentLimit = false)
+        if (windowRestrictionPanel != null) {
+            removeBlockingOverlay(activity, "window_extension_granted")
+            processResumedActivity(activity, true, activity, false)
+            return
+        }
         scheduleDeadline(activity, latestRule)
         scheduleSessionPlan(activity, latestRule)
     }

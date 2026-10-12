@@ -13,8 +13,8 @@ android {
         applicationId = "com.liuml.apptimelimiter"
         minSdk = 27
         targetSdk = 35
-        versionCode = 63
-        versionName = "0.11.24"
+        versionCode = 64
+        versionName = "0.11.25"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -30,8 +30,8 @@ android {
         }
         create("modern") {
             dimension = "distribution"
-            versionCode = 63
-            versionName = "0.11.24"
+            versionCode = 64
+            versionName = "0.11.25"
             buildConfigField("boolean", "MODERN_XPOSED_ENABLED", "true")
             buildConfigField("boolean", "LEGACY_MIGRATION_EXPORT_ENABLED", "false")
         }

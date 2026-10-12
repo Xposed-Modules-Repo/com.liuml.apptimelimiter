@@ -15,6 +15,7 @@ import android.widget.Toast
 import com.liuml.apptimelimiter.LimitBlockActivity
 import com.liuml.apptimelimiter.ParentUnlockActivity
 import com.liuml.apptimelimiter.core.GroupUsagePolicy
+import com.liuml.apptimelimiter.core.SessionRestPolicy
 import com.liuml.apptimelimiter.core.QuotaIncidentPolicy
 import com.liuml.apptimelimiter.core.QuotaKind
 import com.liuml.apptimelimiter.core.ScheduleBlockPolicy
@@ -66,6 +67,9 @@ class ForegroundControlCoordinator(
     private val statusRepository = NonRootProtectionStatusRepository.get(appContext)
     private val shizuku = ShizukuExecutionRepository.get(appContext)
     private val rootExecutor = RootExecutor(appContext)
+    // Read once per real foreground observation; no privileged polling or content access.
+    private var taskBindingKey = ""
+    private var taskBindingSnapshot: TargetTaskSnapshot? = null
     private val usageMilestoneNotifier = UsageMilestoneNotifier(appContext)
     private val overlay = NonRootSessionPlanOverlay(service) { level, packageName, event, message ->
         log(packageName, event, message, level)
@@ -198,6 +202,8 @@ class ForegroundControlCoordinator(
         source: ForegroundSignalSource,
         observedAtMillis: Long = System.currentTimeMillis(),
     ) {
+        // Window movement/resizing is event-driven; never poll privileged task geometry.
+        if (overlay.isWindowRestrictionShowing && packageName == foregroundPackage) taskBindingKey = ""
         val kind = classifyForegroundPackage(packageName)
         if (
             source == ForegroundSignalSource.ACCESSIBILITY_CONTENT_COMPAT &&
@@ -414,23 +420,38 @@ class ForegroundControlCoordinator(
             packageName,
             nowElapsed,
             protectionModeGeneration = settings.protectionModeGeneration,
-            preserveExistingSession = BuildConfig.MODERN_XPOSED_ENABLED &&
+            restIntervalMillis = restIntervalMillis(rule, group),
+            preserveExistingSession = (BuildConfig.MODERN_XPOSED_ENABLED &&
                 previousState != null &&
-                packageName in activeParentOverridePackages,
+                packageName in activeParentOverridePackages) || group?.perLaunchEnabled == true,
         )
         if (previousState?.sessionId != resumed.sessionId) {
             planPromptAttempts.remove(packageName)
         }
         sessions[packageName] = resumed
         if (group?.perLaunchEnabled == true) {
-            syncNonRootGroupSession(
+            val previousGroup = groupPerLaunchSessions[group.id]
+                ?: repository.getGroupPerLaunchSession(group.id)
+            val currentGroup = syncNonRootGroupSession(
                 packageName,
                 resumed,
                 group,
                 SharedGroupSessionAction.ENTER,
             )
+            if (previousState != null && currentGroup != null &&
+                previousGroup.sessionId != currentGroup.sessionId &&
+                packageName !in activeParentOverridePackages
+            ) {
+                val fresh = NonRootSessionPolicy.foreground(
+                    null, packageName, nowElapsed,
+                    protectionModeGeneration = settings.protectionModeGeneration,
+                )
+                sessions[packageName] = fresh
+                planPromptAttempts.remove(packageName)
+                syncNonRootGroupSession(packageName, fresh, group, SharedGroupSessionAction.ENTER)
+            }
         }
-        persistSession(resumed, "foreground")
+        persistSession(sessions[packageName] ?: resumed, "foreground")
         splitActiveSessionAtDayBoundary(packageName, nowElapsed)
         if (restrictionReentry) {
             log(packageName, "NON_ROOT_RESTRICTION_REENTRY", "revalidating restriction")
@@ -784,7 +805,10 @@ class ForegroundControlCoordinator(
         }
         val state = sessions[packageName] ?: runtimeStore.loadSession(packageName) ?: return
         if (state.foregroundStartedAtElapsedMillis <= 0L) return
-        val paused = NonRootSessionPolicy.background(state, nowElapsed)
+        val paused = NonRootSessionPolicy.background(
+            state, nowElapsed,
+            restIntervalMillis(repository.getRule(packageName), repository.groupForPackage(packageName)),
+        )
         val segmentDayToken = state.foregroundDayToken.ifBlank {
             LocalDate.now().toString()
         }
@@ -822,6 +846,16 @@ class ForegroundControlCoordinator(
             NonRootUiExecutionState.IDLE,
             packageName,
             "selected_xposed_mode",
+        )
+    }
+
+    private fun restIntervalMillis(rule: AppRule, group: AppGroup?): Long {
+        val enabledGroup = group?.takeIf { it.enabled }
+        val enabled = enabledGroup?.cooldownEnabled ?: rule.cooldownEnabled
+        val seconds = enabledGroup?.cooldownSeconds ?: rule.cooldownSeconds
+        return SessionRestPolicy.intervalMillis(
+            enabled,
+            seconds.coerceIn(RuleRepository.MIN_COOLDOWN_SECONDS, RuleRepository.MAX_COOLDOWN_SECONDS) * 1_000L,
         )
     }
 
@@ -1121,6 +1155,15 @@ class ForegroundControlCoordinator(
             planRemainingMillis = NonRootSessionPolicy.planRemainingMillis(session, nowElapsed),
             grouped = group != null,
         )
+        val taskKey = "$packageName:${session.sessionId}:$detectedAtMillis:${settings.accessibilityForceStopEnhancement}"
+        if (taskBindingKey != taskKey) {
+            taskBindingKey = taskKey
+            taskBindingSnapshot = when (settings.accessibilityForceStopEnhancement) {
+                com.liuml.apptimelimiter.data.ForceStopEnhancement.ROOT -> rootExecutor.inspectTask(packageName)
+                com.liuml.apptimelimiter.data.ForceStopEnhancement.SHIZUKU -> shizuku.inspectTask(packageName)
+                else -> null
+            }
+        }
         return EvaluationResult(
             packageName = packageName,
             foregroundDetectedAtMillis = detectedAtMillis,
@@ -1136,6 +1179,7 @@ class ForegroundControlCoordinator(
             cooldownEndsAtMillis = effectiveCooldownEnd,
             groupPerLaunchSessionId = groupSession?.sessionId.orEmpty(),
             appReminderUsedMillis = appReminderUsed,
+            targetTask = taskBindingSnapshot,
         )
     }
 
@@ -1196,7 +1240,7 @@ class ForegroundControlCoordinator(
             return
         }
         if (parentOverride.pendingExpired) {
-            fallbackToHome(result.packageName, result.settings, "parent_activation_timeout")
+            fallbackTargetExit(result.packageName, result.settings, "parent_activation_timeout")
             return
         }
         if (parentOverride.granted) {
@@ -1392,7 +1436,7 @@ class ForegroundControlCoordinator(
                 persistSession(skipped, "plan_exit")
                 planPromptAttempts.remove(packageName)
                 log(packageName, "USER_EXIT_REQUESTED", "source=non_root_plan_overlay")
-                fallbackToHome(
+                fallbackTargetExit(
                     packageName = packageName,
                     settings = result.settings,
                     stage = "user_exit_plan_overlay",
@@ -1420,7 +1464,7 @@ class ForegroundControlCoordinator(
                 )
             } else {
                 log(packageName, "SESSION_PLAN_PROMPT_FAILED", "attempts=$attempts")
-                fallbackToHome(
+                fallbackTargetExit(
                     packageName = packageName,
                     settings = result.settings,
                     stage = "session_plan_prompt_failed",
@@ -1482,7 +1526,7 @@ class ForegroundControlCoordinator(
                     "reason=unexpected_detach, attempts=$attempts",
                     "ERROR",
                 )
-                fallbackToHome(
+                fallbackTargetExit(
                     packageName = packageName,
                     settings = repository.getGlobalSettings(),
                     stage = "session_plan_detached",
@@ -1561,7 +1605,7 @@ class ForegroundControlCoordinator(
                         },
                         onExit = {
                             log(packageName, "USER_EXIT_REQUESTED", "source=non_root_plan_warning")
-                            fallbackToHome(
+                            fallbackTargetExit(
                                 packageName = packageName,
                                 settings = result.settings,
                                 stage = "user_exit_plan_warning",
@@ -1619,7 +1663,14 @@ class ForegroundControlCoordinator(
             )?.getBoolean(RuleContract.KEY_OK, false) == true
         }.getOrDefault(false)
         if (!updateClaim("reserve")) return
-        if (!usageMilestoneNotifier.show(result.packageName, result.appReminderUsedMillis, isEnglish(result.settings))) {
+        val label = runCatching {
+            appContext.packageManager.getApplicationLabel(appContext.packageManager.getApplicationInfo(result.packageName, 0)).toString()
+        }.getOrDefault(result.packageName)
+        val message = com.liuml.apptimelimiter.core.UsageReminderTextPolicy.message(
+            com.liuml.apptimelimiter.core.UsageReminderDisplay(label, result.appReminderUsedMillis, result.decision.restrictionSnapshot),
+            isEnglish(result.settings),
+        )
+        if (!usageMilestoneNotifier.show(result.packageName, result.appReminderUsedMillis, isEnglish(result.settings), message)) {
             updateClaim("cancel")
             log(result.packageName, "USAGE_MILESTONE_NOTIFICATION_FAILED", "milestone=$milestone", "WARN")
             return
@@ -1823,7 +1874,7 @@ class ForegroundControlCoordinator(
             }
             if (reason == NonRootBlockReason.SESSION_PLAN) {
                 if (foregroundPackage == packageName) {
-                    fallbackToHome(
+                    fallbackTargetExit(
                         packageName = packageName,
                         settings = result.settings,
                         stage = "session_plan_expired",
@@ -1855,8 +1906,8 @@ class ForegroundControlCoordinator(
                                     "target still reported foreground after force-stop",
                                     "WARN",
                                 )
-                                recordShizukuFallback("HOME_REQUESTED")
-                                fallbackToHome(
+                                recordShizukuFallback("MANUAL_EXIT_REQUIRED")
+                                fallbackTargetExit(
                                     packageName = packageName,
                                     settings = result.settings,
                                     stage = "shizuku_foreground_confirmation",
@@ -1885,8 +1936,8 @@ class ForegroundControlCoordinator(
                             recordShizukuFallback(if (shown) "BREAK_PAGE_REQUESTED" else "BREAK_PAGE_FAILED")
                         }
                     ) {
-                        recordShizukuFallback("HOME_REQUESTED")
-                        fallbackToHome(
+                        recordShizukuFallback("MANUAL_EXIT_REQUIRED")
+                        fallbackTargetExit(
                             packageName = packageName,
                             settings = result.settings,
                             stage = "start_exception_or_token_failure",
@@ -1925,7 +1976,7 @@ class ForegroundControlCoordinator(
         }.getOrNull()
         if (runtime?.getString(RuleContract.KEY_MESSAGE) == "parent_allowance_exists") return@execute
         if (runtime?.getBoolean(RuleContract.KEY_OK, false) != true) {
-            fallbackToHome(packageName, result.settings, "runtime_authority_failed")
+            fallbackTargetExit(packageName, result.settings, "runtime_authority_failed")
             return@execute
         }
         if (
@@ -2319,6 +2370,10 @@ class ForegroundControlCoordinator(
         incidentId: String,
     ): Boolean {
         if (!mayExecuteDisruptiveAction(result.packageName, "show_break_page")) return false
+        if (result.targetTask?.windowMode == com.liuml.apptimelimiter.core.TargetWindowMode.WINDOWED &&
+            result.targetTask.bounds != null) {
+            return showWindowedRestriction(result, cooldownEndsAtMillis, sessionResetAtMillis, incidentId)
+        }
         pendingBreakPageAttempt?.takeIf {
             it.packageName == result.packageName
         }?.let {
@@ -2397,6 +2452,36 @@ class ForegroundControlCoordinator(
             putExtra(LimitBlockActivity.EXTRA_NON_ROOT, true)
             putExtra(LimitBlockActivity.EXTRA_CONTROL_SESSION_ID, result.session.sessionId)
             putExtra(LimitBlockActivity.EXTRA_INCIDENT_ID, incidentId)
+            result.targetTask?.let { task ->
+                val bridge = com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.managerBridge(executor,
+                    stillCurrent = {
+                        !destroyed && sessions[result.packageName]?.sessionId == result.session.sessionId &&
+                            LimitBlockActivity.isRestrictionPageForegroundFor(result.packageName)
+                    },
+                    close = {
+                        val currentSettings = repository.getGlobalSettings()
+                        val currentRule = repository.getRule(result.packageName)
+                        val currentGroup = repository.groupForPackage(result.packageName)?.takeIf {
+                            it.enabled && result.packageName in it.packageNames
+                        }
+                        if (!LimitBlockActivity.isRestrictionPageForegroundFor(result.packageName) ||
+                            currentSettings.protectionMode != result.settings.protectionMode ||
+                            currentSettings.protectionModeGeneration != result.settings.protectionModeGeneration ||
+                            currentRule.version != result.rule.version ||
+                            (currentGroup?.version ?: 0L) != (result.group?.version ?: 0L) ||
+                            currentSettings.accessibilityForceStopEnhancement != result.settings.accessibilityForceStopEnhancement) false
+                        else when (currentSettings.accessibilityForceStopEnhancement) {
+                            com.liuml.apptimelimiter.data.ForceStopEnhancement.ROOT -> rootExecutor.removeTask(result.packageName, task.taskId)
+                            com.liuml.apptimelimiter.data.ForceStopEnhancement.SHIZUKU -> shizuku.removeTask(result.packageName, task.taskId)
+                            else -> false
+                        }
+                    })
+                putExtras(Bundle().apply {
+                    putBinder(com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.EXTRA, bridge)
+                    putString(com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.MODE, task.windowMode.name)
+                    putInt(com.liuml.apptimelimiter.ipc.TargetTaskExitBridge.TASK_ID, task.taskId)
+                })
+            }
         }
         val attempt = BreakPageAttempt(
             attemptId = attemptId,
@@ -2486,7 +2571,7 @@ class ForegroundControlCoordinator(
                         detail = "attempt=${attemptId.take(12)} timeout=${BREAK_PAGE_CONFIRM_TIMEOUT_MILLIS}ms",
                         settings = repository.getGlobalSettings(),
                     )
-                    fallbackToHome(
+                    fallbackTargetExit(
                         packageName = result.packageName,
                         settings = repository.getGlobalSettings(),
                         stage = "foreground_confirmation_timeout",
@@ -2520,6 +2605,131 @@ class ForegroundControlCoordinator(
         }
     }
 
+    private fun showWindowedRestriction(result: EvaluationResult, cooldownEnd: Long, resetAt: Long, incident: String): Boolean {
+        val task = result.targetTask ?: return false
+        val bounds = task.bounds ?: return false
+        val pkg = result.packageName
+        val english = isEnglish(result.settings)
+        val identity = Bundle().apply {
+            putString(RuleContract.KEY_PROCESS_SESSION_ID, result.session.sessionId)
+            putLong(RuleContract.KEY_VERSION, result.rule.version)
+            putLong(RuleContract.KEY_GROUP_VERSION, result.group?.version ?: 0L)
+            putLong(RuleContract.KEY_PROTECTION_MODE_GENERATION, result.settings.protectionModeGeneration)
+            putString(RuleContract.KEY_INCIDENT_ID, incident.ifBlank { "nonroot:$pkg:${result.session.sessionId}" })
+        }
+        val claim = runCatching { appContext.contentResolver.call(RuleContract.CONTENT_URI,
+            RuleContract.METHOD_CLAIM_RESTRICTION_UI, pkg, identity) }.getOrNull()
+        if (claim?.getBoolean(RuleContract.KEY_OK, false) != true) return false
+        identity.putString(RuleContract.KEY_INCIDENT_ID, claim.getString(RuleContract.KEY_INCIDENT_ID))
+        fun current(): Boolean = !destroyed && interactive && foregroundPackage == pkg &&
+            sessions[pkg]?.sessionId == result.session.sessionId && repository.getGlobalSettings().let {
+                it.protectionMode == result.settings.protectionMode &&
+                it.protectionModeGeneration == result.settings.protectionModeGeneration &&
+                it.accessibilityForceStopEnhancement == result.settings.accessibilityForceStopEnhancement
+            } && repository.getRule(pkg).version == result.rule.version &&
+            (repository.groupForPackage(pkg)?.version ?: 0L) == (result.group?.version ?: 0L)
+        var busy = false
+        lateinit var panel: com.liuml.apptimelimiter.ui.WindowRestrictionPanel
+        // Defined as a lambda because click callbacks may finish after another window replaced this panel.
+        val refreshControls: () -> Unit = {
+            panel.update(if (english) "Usage paused" else "使用已暂停",
+                when (result.decision.blockingReason) {
+                    NonRootBlockReason.SCHEDULE -> if (english) "Outside available hours" else "当前不在可用时段"
+                    NonRootBlockReason.COOLDOWN -> if (english) "Cooldown is active; allowances and schedules will be rechecked after it ends." else "冷却尚未结束；结束后仍需重新检查额度和可用时段。"
+                    else -> result.decision.reachedKinds.joinToString("\n") { kind ->
+                        com.liuml.apptimelimiter.core.RestrictionReason.values().firstOrNull { it.quotaKind == kind }
+                            ?.let { com.liuml.apptimelimiter.core.RestrictionReasonText.label(it, english) }.orEmpty()
+                    }
+                },
+                result.settings.childLockEnabled,
+                result.settings.extensionEnabled && result.decision.blockingReason == NonRootBlockReason.QUOTA && cooldownEnd <= System.currentTimeMillis() &&
+                    !repository.extensionRequiresCooldown(pkg), busy)
+        }
+        panel = com.liuml.apptimelimiter.ui.WindowRestrictionPanel(service,
+            com.liuml.apptimelimiter.ui.TargetUiPalette.resolve(service, result.settings.themeMode, result.settings.themeColor), english,
+            onExit = {
+                if (!busy && current()) {
+                    busy = true; refreshControls()
+                    executor.execute {
+                        val closed = current() && when (result.settings.accessibilityForceStopEnhancement) {
+                            com.liuml.apptimelimiter.data.ForceStopEnhancement.ROOT -> rootExecutor.removeTask(pkg, task.taskId)
+                            com.liuml.apptimelimiter.data.ForceStopEnhancement.SHIZUKU -> shizuku.removeTask(pkg, task.taskId)
+                            else -> false
+                        }
+                        handler.post {
+                            if (!current()) return@post
+                            busy = false
+                            if (closed) { overlay.dismiss("window_closed"); recoverForegroundFromUsageStats() }
+                            else { refreshControls(); panel.showStatus(if (english) "Use the floating-window close control" else "请使用小窗关闭按钮") }
+                        }
+                    }
+                }
+            },
+            onPin = {
+                if (!busy && current()) {
+                    busy = true; refreshControls()
+                    val response = runCatching { appContext.contentResolver.call(RuleContract.CONTENT_URI,
+                        RuleContract.METHOD_CREATE_PARENT_AUTH_CHALLENGE, pkg, Bundle(identity).apply {
+                            putString(RuleContract.KEY_PARENT_AUTH_REASON, result.decision.blockingReason?.name ?: "QUOTA")
+                        }) }.getOrNull()
+                    val token = response?.takeIf { it.getBoolean(RuleContract.KEY_OK, false) }?.getString(RuleContract.KEY_PARENT_AUTH_TOKEN).orEmpty()
+                    val launched = token.isNotBlank() && runCatching {
+                        service.startActivity(Intent(appContext, ParentUnlockActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                            .putExtra(ParentUnlockActivity.EXTRA_TOKEN, token))
+                    }.isSuccess
+                    if (launched) {
+                        parentAuthTargetPackage = pkg; parentAuthTargetSessionId = result.session.sessionId
+                        overlay.dismiss("window_pin_handoff")
+                        pollNonRootParentAuth(pkg, result.session.sessionId, token, AtomicBoolean(false)) {
+                            if (foregroundPackage == pkg) scheduleEvaluation(pkg, 0L)
+                        }
+                    } else { busy = false; refreshControls(); panel.showStatus(if (english) "Could not open PIN verification" else "无法打开 PIN 验证") }
+                }
+            },
+            onExtend = {
+                if (!busy && current()) {
+                    busy = true; refreshControls()
+                    val response = runCatching { appContext.contentResolver.call(RuleContract.CONTENT_URI,
+                        "request_free_extension", pkg, Bundle(identity).apply { putString("extension_request_id", UUID.randomUUID().toString()) }) }.getOrNull()
+                    busy = false
+                    if (response?.getBoolean(RuleContract.KEY_OK, false) == true) {
+                        overlay.dismiss("window_extension_granted")
+                        clearActiveRestriction(pkg, "window_extension_granted")
+                        val resumed = NonRootSessionPolicy.foreground(sessions[pkg], pkg, SystemClock.elapsedRealtime(),
+                            protectionModeGeneration = result.settings.protectionModeGeneration, preserveExistingSession = true)
+                        sessions[pkg] = resumed; persistSession(resumed, "window_extension_resume")
+                        scheduleEvaluation(pkg, 0L)
+                    } else { refreshControls(); panel.showStatus(if (english) "Extension not granted; no time added" else "延时未成功，未增加使用时间") }
+                }
+            })
+        refreshControls()
+        val shown = overlay.showWindowRestriction(pkg, bounds, panel)
+        if (shown) {
+            log(pkg, "NON_ROOT_WINDOW_RESTRICTION_SHOWN", "task=${task.taskId}; no new task")
+            val now = System.currentTimeMillis()
+            val nextDay = LocalDate.now().plusDays(1).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+            val next = listOf(cooldownEnd, resetAt, nextDay,
+                result.scheduleNextTransitionMillis?.takeIf { it > 0L }?.let { safeAdd(now, it) } ?: 0L)
+                .filter { it > now }.minOrNull() ?: nextDay
+            handler.postDelayed({
+                if (!current() || !overlay.isWindowRestrictionShowing) return@postDelayed
+                if (resetAt > 0L && System.currentTimeMillis() >= resetAt &&
+                    (QuotaKind.APP_PER_LAUNCH in result.decision.reachedKinds || QuotaKind.GROUP_PER_LAUNCH in result.decision.reachedKinds)) {
+                    // Reset the app cycle only. A group's shared balance is reread from Provider.
+                    val resumed = NonRootSessionPolicy.foreground(null, pkg, SystemClock.elapsedRealtime(),
+                        protectionModeGeneration = result.settings.protectionModeGeneration)
+                    sessions[pkg] = resumed
+                    persistSession(resumed, "window_rest_completed")
+                    result.group?.let { groupPerLaunchSessions.remove(it.id) }
+                    overlay.dismiss("window_rest_recheck")
+                }
+                scheduleEvaluation(pkg, 0L)
+            }, (next - now).coerceAtLeast(1L))
+        }
+        return shown
+    }
+
     private fun recordBreakPageCompatibilityFailure(
         packageName: String,
         stage: BreakPageCompatibilityStage,
@@ -2547,46 +2757,41 @@ class ForegroundControlCoordinator(
         ).show()
     }
 
-    private fun fallbackToHome(
+    private fun fallbackTargetExit(
         packageName: String,
         settings: GlobalSettings,
         stage: String,
         retry: Boolean = true,
         showToast: Boolean = true,
-        toastEnglish: String = "The restriction page was blocked. Returned Home.",
-        toastChinese: String = "限制页被系统拦截，已返回桌面",
+        toastEnglish: String = "Unable to open the restriction page. Close the target window manually and check background pop-up permission.",
+        toastChinese: String = "无法打开限制页，请手动关闭目标窗口，并检查后台弹出权限。",
     ) {
-        if (!mayExecuteDisruptiveAction(packageName, "home_fallback:$stage")) return
+        if (!mayExecuteDisruptiveAction(packageName, "target_exit_fallback:$stage")) return
         val shouldShowToast = showToast && !suppressNextGenericBreakPageToast
         suppressNextGenericBreakPageToast = false
         if (uiState == NonRootUiExecutionState.BREAK_PAGE_PENDING) {
             transitionUiState(
                 NonRootUiExecutionState.IDLE,
                 packageName,
-                "home_fallback:$stage",
+                "target_exit_fallback:$stage",
             )
         }
-        val accepted = runCatching {
-            service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
-        }.getOrElse {
-            log(
-                packageName,
-                "NON_ROOT_HOME_FALLBACK_EXCEPTION",
-                "stage=$stage, error=${describeThrowable(it)}",
-                "ERROR",
-            )
-            false
-        }
+        // Package-only accessibility signals cannot identify a floating task. Global Home
+        // would also minimize an unrelated game underneath. Keep the restriction state;
+        // never substitute a global navigation action for a failed target-only action.
+        val accepted = false
+        val blockingOverlayShown = overlay.showManualExitBlock(packageName, isEnglish(settings))
         log(
             packageName,
-            "NON_ROOT_HOME_FALLBACK_REQUESTED",
-            "stage=$stage, accepted=$accepted, current=${foregroundPackage.orEmpty()}",
+            "NON_ROOT_GLOBAL_NAVIGATION_SUPPRESSED",
+            "stage=$stage, accepted=$accepted, blockingOverlay=$blockingOverlayShown, current=${foregroundPackage.orEmpty()}",
             if (accepted) "WARN" else "ERROR",
         )
         if (shouldShowToast) {
             Toast.makeText(
                 service,
-                if (isEnglish(settings)) toastEnglish else toastChinese,
+                if (isEnglish(settings)) "Unable to close the target window safely. Close it manually and check background pop-up permission."
+                else "无法安全关闭目标窗口，请手动关闭，并检查后台弹出权限。不会退出其他应用。",
                 Toast.LENGTH_LONG,
             ).show()
         }
@@ -2618,14 +2823,14 @@ class ForegroundControlCoordinator(
                         val stillTarget = foregroundPackage == packageName
                         log(
                             packageName,
-                            "NON_ROOT_HOME_FALLBACK_RESULT",
+                            "NON_ROOT_EXIT_RECONCILIATION_RESULT",
                             "stage=$stage, current=${foregroundPackage.orEmpty()}, " +
                                 "usage=${recentForeground?.packageName.orEmpty()}, " +
                                 "reconciled=$reconciled, stillTarget=$stillTarget",
                             if (stillTarget) "ERROR" else "INFO",
                         )
                         if (stillTarget && retry) {
-                            fallbackToHome(
+                            fallbackTargetExit(
                                 packageName = packageName,
                                 settings = settings,
                                 stage = "${stage}_retry",
@@ -2638,7 +2843,7 @@ class ForegroundControlCoordinator(
                     }
                 }
             },
-            HOME_FALLBACK_CONFIRM_MILLIS,
+            TARGET_EXIT_CONFIRM_MILLIS,
         )
     }
 
@@ -2822,14 +3027,7 @@ class ForegroundControlCoordinator(
                 segmentId = segmentId,
                 segmentMillis = segmentMillis.coerceAtLeast(0L),
                 nowElapsedMillis = SystemClock.elapsedRealtime(),
-                resetGapMillis = if (group.cooldownEnabled) {
-                    group.cooldownSeconds.coerceIn(
-                        RuleRepository.MIN_COOLDOWN_SECONDS,
-                        RuleRepository.MAX_COOLDOWN_SECONDS,
-                    ) * 1_000L
-                } else {
-                    SharedGroupSessionPolicy.DEFAULT_RESET_GAP_MILLIS
-                },
+                resetGapMillis = restIntervalMillis(repository.getRule(packageName), group),
                 )
             }.onSuccess { update ->
                 groupPerLaunchSessions[group.id] = update.record
@@ -2907,6 +3105,7 @@ class ForegroundControlCoordinator(
         packageName: String,
         stage: String,
     ): Boolean {
+        overlay.dismissWindowRestriction(packageName, stage)
         val cleared = runtimeStore.clearActiveRestriction(packageName)
         if (!cleared) {
             log(
@@ -3017,6 +3216,7 @@ class ForegroundControlCoordinator(
         val cooldownEndsAtMillis: Long,
         val groupPerLaunchSessionId: String,
         val appReminderUsedMillis: Long,
+        val targetTask: TargetTaskSnapshot?,
     )
 
     private data class BreakPageAttempt(
@@ -3031,7 +3231,7 @@ class ForegroundControlCoordinator(
         const val PARENT_AUTH_POLL_MILLIS = 250L
         const val THRESHOLD_SLOP_MILLIS = 80L
         const val BREAK_PAGE_CONFIRM_TIMEOUT_MILLIS = 2_500L
-        const val HOME_FALLBACK_CONFIRM_MILLIS = 700L
+        const val TARGET_EXIT_CONFIRM_MILLIS = 700L
         const val SHIZUKU_FOREGROUND_CONFIRM_MILLIS = 700L
         const val SHIZUKU_EXECUTION_TIMEOUT_MILLIS = 3_000L
         const val FIRST_PLAN_REATTACH_MILLIS = 300L

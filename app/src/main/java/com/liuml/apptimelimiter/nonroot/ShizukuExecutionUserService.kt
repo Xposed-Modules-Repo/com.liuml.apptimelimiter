@@ -7,9 +7,8 @@ import androidx.annotation.Keep
 import rikka.shizuku.SystemServiceHelper
 
 class ShizukuExecutionUserService() : IShizukuExecutionService.Stub() {
-    @Suppress("UNUSED_PARAMETER")
     @Keep
-    constructor(context: Context) : this()
+    constructor(context: Context) : this() { PrivilegedTaskAccess.initialize(context) }
 
     // Shizuku starts UserService with app_process, where non-SDK API restrictions are disabled.
     // Keep this suppression local; ordinary app-process code must not call this API.
@@ -39,6 +38,14 @@ class ShizukuExecutionUserService() : IShizukuExecutionService.Stub() {
     override fun destroy() {
         System.exit(0)
     }
+
+    private fun managerCaller(): Boolean = PrivilegedTaskAccess.isManagerCaller(android.os.Binder.getCallingUid())
+
+    override fun inspectTask(packageName: String?, userId: Int): String? =
+        if (managerCaller()) PrivilegedTaskAccess.inspect(packageName.orEmpty(), userId) else null
+
+    override fun removeTask(packageName: String?, userId: Int, taskId: Int, deadlineElapsed: Long): Boolean =
+        managerCaller() && PrivilegedTaskAccess.remove(packageName.orEmpty(), userId, taskId, deadlineElapsed)
 
     companion object {
         const val RESULT_OK = 0

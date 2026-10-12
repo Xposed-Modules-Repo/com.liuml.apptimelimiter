@@ -1,6 +1,7 @@
 package com.liuml.apptimelimiter.nonroot
 
 import com.liuml.apptimelimiter.core.SessionPlanPolicy
+import com.liuml.apptimelimiter.core.SessionRestPolicy
 import java.time.LocalDate
 import java.util.UUID
 
@@ -25,7 +26,7 @@ data class DayBoundaryUsageSplit(
 )
 
 object NonRootSessionPolicy {
-    const val SESSION_GRACE_MILLIS = 30_000L
+    const val SESSION_GRACE_MILLIS = SessionRestPolicy.DEFAULT_REST_MILLIS
 
     fun newSession(
         packageName: String,
@@ -39,9 +40,15 @@ object NonRootSessionPolicy {
     fun shouldResume(
         state: NonRootSessionState?,
         nowElapsedMillis: Long,
+        restIntervalMillis: Long? = null,
     ): Boolean = state != null &&
-        state.graceEndsAtElapsedMillis > 0L &&
-        nowElapsedMillis <= state.graceEndsAtElapsedMillis
+        state.backgroundedAtElapsedMillis > 0L &&
+        nowElapsedMillis >= state.backgroundedAtElapsedMillis &&
+        if (restIntervalMillis != null) {
+            !SessionRestPolicy.completed(state.backgroundedAtElapsedMillis, nowElapsedMillis, restIntervalMillis)
+        } else {
+            state.graceEndsAtElapsedMillis > nowElapsedMillis
+        }
 
     fun foreground(
         state: NonRootSessionState?,
@@ -50,6 +57,7 @@ object NonRootSessionPolicy {
         dayToken: String = LocalDate.now().toString(),
         protectionModeGeneration: Long = state?.protectionModeGeneration ?: 0L,
         preserveExistingSession: Boolean = false,
+        restIntervalMillis: Long? = null,
     ): NonRootSessionState {
         val base = state
             ?.takeIf {
@@ -57,7 +65,7 @@ object NonRootSessionPolicy {
                     it.protectionModeGeneration == protectionModeGeneration &&
                     (
                         it.foregroundStartedAtElapsedMillis > 0L ||
-                            shouldResume(it, nowElapsedMillis) ||
+                            shouldResume(it, nowElapsedMillis, restIntervalMillis) ||
                             preserveExistingSession
                         )
             }
@@ -80,7 +88,9 @@ object NonRootSessionPolicy {
     fun background(
         state: NonRootSessionState,
         nowElapsedMillis: Long,
+        restIntervalMillis: Long = SESSION_GRACE_MILLIS,
     ): NonRootSessionState {
+        if (state.foregroundStartedAtElapsedMillis <= 0L) return state
         val segment = activeSegmentMillis(state, nowElapsedMillis)
         return state.copy(
             accumulatedForegroundMillis = safeAdd(
@@ -90,7 +100,7 @@ object NonRootSessionPolicy {
             foregroundStartedAtElapsedMillis = 0L,
             foregroundDayToken = "",
             backgroundedAtElapsedMillis = nowElapsedMillis,
-            graceEndsAtElapsedMillis = safeAdd(nowElapsedMillis, SESSION_GRACE_MILLIS),
+            graceEndsAtElapsedMillis = safeAdd(nowElapsedMillis, restIntervalMillis.coerceAtLeast(1L)),
             planRemainingMillis = (state.planRemainingMillis - segment).coerceAtLeast(0L),
         )
     }

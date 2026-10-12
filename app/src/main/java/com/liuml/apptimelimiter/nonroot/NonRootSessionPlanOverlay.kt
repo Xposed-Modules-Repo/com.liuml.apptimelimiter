@@ -37,9 +37,57 @@ class NonRootSessionPlanOverlay(
     private var ignoreOwnWindowEventsUntilElapsedMillis = 0L
 
     val isShowing: Boolean get() = attachedView != null
+    val isWindowRestrictionShowing: Boolean get() = attachedKind == "WINDOW_RESTRICTION"
+    fun dismissWindowRestriction(packageName: String, reason: String) {
+        if (isWindowRestrictionShowing && attachedPackageName == packageName) dismiss(reason)
+    }
+
+    fun showWindowRestriction(packageName: String, bounds: com.liuml.apptimelimiter.core.TargetWindowBounds,
+        panel: com.liuml.apptimelimiter.ui.WindowRestrictionPanel): Boolean {
+        val size = android.graphics.Point()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealSize(size)
+        if (!bounds.fits(size.x, size.y)) return false
+        return attach(packageName, "WINDOW_RESTRICTION", panel, WindowManager.LayoutParams(
+            bounds.right - bounds.left, bounds.bottom - bounds.top,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT,
+        ).apply { gravity = Gravity.TOP or Gravity.LEFT; x = bounds.left; y = bounds.top }, onShown = {})
+    }
     val shouldIgnoreOwnWindowEvents: Boolean
         get() = isShowing ||
             SystemClock.elapsedRealtime() <= ignoreOwnWindowEventsUntilElapsedMillis
+
+    /** Fails closed without minimizing any unrelated task under a floating app. */
+    fun showManualExitBlock(packageName: String, english: Boolean): Boolean {
+        if (attachedPackageName == packageName && attachedKind == "MANUAL_EXIT_BLOCK") return true
+        dismiss()
+        val settings = RuleRepository(service).getGlobalSettings()
+        val ui = OverlayUi(service, english, TargetUiPalette.resolve(service, settings.themeMode, settings.themeColor))
+        val root = LinearLayout(service).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            isClickable = true
+            setPadding(ui.dp(24), ui.dp(24), ui.dp(24), ui.dp(24))
+            setBackgroundColor(ui.colors.background)
+        }
+        root.addView(TextView(service).apply {
+            text = ui.text("请手动关闭受限应用窗口", "Close the restricted app window manually")
+            setTextColor(ui.colors.textPrimary); textSize = 22f; typeface = Typeface.DEFAULT_BOLD
+        })
+        root.addView(TextView(service).apply {
+            text = ui.text("无法确认并关闭目标任务。请通过小窗关闭按钮或最近任务关闭 $packageName；时停不会将其他应用退回桌面。若限制页被拦截，请检查后台弹出权限。",
+                "The target task could not be closed safely. Close $packageName using the floating-window control or Recents. Other apps will stay open. Check background pop-up permission if the restriction page was blocked.")
+            setTextColor(ui.colors.textSecondary); textSize = 15f
+            setPadding(0, ui.dp(16), 0, 0)
+        })
+        return attach(packageName, "MANUAL_EXIT_BLOCK", root, WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN, PixelFormat.TRANSLUCENT,
+        ), onShown = {})
+    }
 
     fun showUsageTip(packageName: String, message: String, english: Boolean): Boolean {
         if (isShowing || message.isBlank()) return false

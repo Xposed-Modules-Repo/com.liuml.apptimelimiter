@@ -46,7 +46,7 @@ class ShizukuExecutionRepository private constructor(
             .processNameSuffix("time_stop")
             .daemon(false)
             .tag(USER_SERVICE_TAG)
-            .version(BuildConfig.VERSION_CODE)
+            .version(BuildConfig.VERSION_CODE * 100 + 2)
     }
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "time-stop-shizuku").apply { isDaemon = true }
@@ -63,6 +63,18 @@ class ShizukuExecutionRepository private constructor(
     private var pendingRepair: PendingRepair? = null
 
     val state: StateFlow<ShizukuExecutionState> = _state.asStateFlow()
+
+    fun inspectTask(packageName: String): TargetTaskSnapshot? {
+        if (Looper.myLooper() == Looper.getMainLooper() || validateTarget(packageName) != null) return null
+        return runCatching { TargetTaskSnapshot.parse(remote?.inspectTask(packageName, Process.myUid() / PER_USER_RANGE)) }.getOrNull()
+    }
+
+    fun removeTask(packageName: String, taskId: Int): Boolean {
+        if (Looper.myLooper() == Looper.getMainLooper() || taskId < 0 || validateTarget(packageName) != null) return false
+        if (RuleRepository(appContext).getGlobalSettings().accessibilityForceStopEnhancement != com.liuml.apptimelimiter.data.ForceStopEnhancement.SHIZUKU) return false
+        return runCatching { remote?.removeTask(packageName, Process.myUid() / PER_USER_RANGE, taskId,
+            android.os.SystemClock.elapsedRealtime() + 2_500L) == true }.getOrDefault(false)
+    }
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
         refresh()

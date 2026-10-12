@@ -32,16 +32,24 @@ sealed interface UpdateCheckResult {
 }
 
 object UpdateChecker {
+    private val requests = SingleFlightCallbacks<UpdateCheckResult>()
+    fun isChecking(): Boolean = requests.isRunning()
     fun check(context: Context, callback: (UpdateCheckResult) -> Unit) {
+        if (!requests.join(callback)) return
         val english = isEnglish(context)
         thread(name = "github-update-check", isDaemon = true) {
+            android.util.Log.i("TimeStopUpdate", "request_started")
             val result = runCatching { requestLatestRelease(english) }
                 .getOrElse {
                     UpdateCheckResult.Error(
                         it.message ?: if (english) "Unable to connect to GitHub" else "无法连接 GitHub",
                     )
                 }
-            Handler(Looper.getMainLooper()).post { callback(result) }
+            Handler(Looper.getMainLooper()).post {
+                android.util.Log.i("TimeStopUpdate", "request_completed=${result.javaClass.simpleName}")
+                val callbacks = requests.drain()
+                callbacks.forEach { runCatching { it(result) } }
+            }
         }
     }
 

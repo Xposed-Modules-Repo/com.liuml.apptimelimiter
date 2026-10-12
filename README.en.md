@@ -1,5 +1,13 @@
 # Time Stop (Android)
 
+Beta discussion is available on [Telegram](https://t.me/timestop3) and QQ group 1009712674. Open a group link and follow its joining instructions; include a log file when reporting an issue. Half-hour reminders show actual daily usage and remaining session/daily allowances, explicitly labeling shared group allowances. Top banners wrap naturally and show each balance on its own line without ellipsizing. In tiny windows or with large fonts, scroll within the bounded reminder to read all details. Basic-mode notifications show a usage summary when collapsed and full balances when expanded. With automatic checks enabled, each deliberate opening checks stable GitHub releases, with one prompt per release per local day. Hook maintenance cards identify the app, package, and issue. Root force-stop affects only that app; reopen it to verify its Hook.
+
+In-window restriction: LSPosed places a scrollable blocking view inside a floating/split target window, without launching another Time Stop task. Exit, PIN and allowed extensions retain their existing checks; PIN entry stays in Time Stop's secure Activity. Standard mode uses a bounded accessibility overlay only when Root/Shizuku can verify both task and window bounds; missing geometry retains the safe fallback without reading window content or adding permissions. The panel stops module timing and attempts to pause tracked media; Android UsageStats may still record a visible Activity and custom players may continue.
+
+Floating-window exit: the standalone restriction page binds Exit to the original restricted task. LSPosed asks the target process to remove its own task. Standard mode can remove a verified target task through already-authorized Root/Shizuku. Missing permissions, ambiguous ownership or failure keeps the restriction and requests manual closure; no global Home fallback interrupts another app underneath. Reopen target apps to load the new Hook after updating.
+
+Both protection modes restart continuous-use allowance after a genuine background/screen-off rest: the configured cooldown duration, or 30 seconds when disabled. Group members must all leave before resting. Activity changes, rotation, PIN and plan dialogs do not count as rest. Daily quotas, schedules and active PIN deadlines remain unchanged.
+
 The interface uses iOS-inspired neutral grouped backgrounds, rounded cards, consistent line icons and switches. Home, apps, groups, statistics, weekly reports, rules, settings, PIN and restriction pages share the visual system, with three accent colors and dark mode. Settings use a category directory followed by detail pages; returning to the directory preserves drafts. Bottom actions respect system bars and the keyboard. Both protection modes expose reminders and extensions. General settings require Save and return; PIN limits and system authorization actions take effect after their separate confirmation. Ordinary extensions support 1–15 minutes, with daily/session availability shown on the restriction page. The statistics date precedes the chart, and clearing records requires confirmation.
 
 LSPosed settings offer a per-app “Force stop (Root required)” action. Time Stop requests Root and stops only configured, permitted targets; reopen the target manually to verify its Hook. This does not enable automatic Root enhancement or fix a disabled module or missing LSPosed scope.
@@ -8,7 +16,7 @@ Restriction details can be expanded to show the main reason and other active lim
 
 Precision app-time control for Android power users who want policy, telemetry, and enforcement in the same loop.
 
-Current release: `0.11.24 (63)` Modern. Legacy migration builds are retained only for existing users completing the two-stage upgrade.
+Current release: `0.11.25 (64)` Modern. Legacy migration builds are retained only for existing users completing the two-stage upgrade.
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -41,7 +49,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Encrypted WebDAV sync | Manually upload or download portable rules, groups, and portable settings through a user-configured HTTPS WebDAV endpoint. Payloads are encrypted with AES-GCM; PIN material, statistics, diagnostics, and runtime state stay local. |
 | Protection status in Settings | Settings shows the selected mode, actual execution path, confirmed issues, and repair actions. Unknown LSPosed evidence is shown as waiting for verification rather than inactive; unavailable Shizuku is shown as a basic-protection fallback. |
 | Daily cumulative mode | Uses the stronger source for each app: Android system usage when available, or Hook-local foreground accounting, then resets at local midnight. |
-| Per-launch mode | Starts a fresh foreground timer for the target process. If the process survives in the background, staying away for at least the configured cooldown counts as an effective rest and starts a new cycle. |
+| Per-launch mode | Both modes start a fresh continuous-use cycle after leaving or turning the screen off for the configured cooldown duration, or 30 seconds when cooldown is disabled. Daily quotas and schedules still apply. |
 | Session planning | Optionally asks for a 5, 10, 15, 30, or custom 1–60 minute plan when the target process first opens. Quick choices and a one-minute-step slider share one compact page, while the fixed footer keeps exit and skip actions visible. A choice beyond the earliest remaining quota shows an immediate warning and disables submission; the final submission is revalidated. |
 | Weekly schedules | Supports allow-only and block-during windows across multiple weekdays, including overnight ranges. Schedule blocks cannot be bypassed with the delay action. |
 | Foreground-only accounting | Counts only the `onResume` to `onPause` phase. Background residency does not burn the quota. |

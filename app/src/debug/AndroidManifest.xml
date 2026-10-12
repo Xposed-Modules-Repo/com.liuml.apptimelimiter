@@ -1,0 +1,10 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity android:name=".TaskExitTestActivity" android:exported="false"
+            android:process=":task_exit_test" android:taskAffinity="com.liuml.apptimelimiter.task_exit_test"
+            android:resizeableActivity="true" android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+        <activity android:name=".TaskExitUnderlyingTestActivity" android:exported="false"
+            android:taskAffinity="com.liuml.apptimelimiter.underlying_test"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+    </application>
+</manifest>

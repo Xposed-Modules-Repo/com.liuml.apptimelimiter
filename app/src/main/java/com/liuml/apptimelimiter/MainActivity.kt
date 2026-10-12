@@ -339,6 +339,10 @@ class MainActivity : FragmentActivity() {
     private val xposedStatusRepository = XposedStatusRepository.instance
     private lateinit var nonRootStatusRepository: NonRootProtectionStatusRepository
     private var openStatisticsFromIntent by mutableStateOf(false)
+    private var mainEntryRevision by mutableStateOf(0L)
+    private var hasResumed = false
+    private var stoppedForEntry = false
+    private var outboundNavigation = false
 
     override fun attachBaseContext(newBase: Context) {
         val migration = MigrationCoordinator.get(newBase)
@@ -353,6 +357,9 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        mainEntryRevision = savedInstanceState?.getLong("main_entry_revision") ?: 0L
+        hasResumed = savedInstanceState != null && com.liuml.apptimelimiter.update.MainEntryUpdatePolicy.isKnown(mainEntryRevision)
+        outboundNavigation = savedInstanceState?.getBoolean("main_outbound_navigation") ?: false
         openStatisticsFromIntent = shouldOpenStatistics(intent)
         val migrationCoordinator = MigrationCoordinator.get(this)
         if (!migrationCoordinator.canInitializeRepositories()) {
@@ -483,6 +490,7 @@ class MainActivity : FragmentActivity() {
                         },
                         themeColor = themeColor,
                         openStatisticsFromIntent = openStatisticsFromIntent,
+                        mainEntryRevision = mainEntryRevision,
                     )
                 }
             }
@@ -491,6 +499,12 @@ class MainActivity : FragmentActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (!hasResumed || (stoppedForEntry && !outboundNavigation)) {
+            mainEntryRevision = com.liuml.apptimelimiter.update.MainEntryUpdatePolicy.nextEntry()
+        }
+        hasResumed = true
+        stoppedForEntry = false
+        outboundNavigation = false
         if (BuildConfig.MODERN_XPOSED_ENABLED) {
             xposedStatusRepository.initialize(this)
             xposedStatusRepository.refresh()
@@ -498,10 +512,29 @@ class MainActivity : FragmentActivity() {
         if (::nonRootStatusRepository.isInitialized) nonRootStatusRepository.refresh()
     }
 
+    override fun onStop() {
+        super.onStop()
+        if (!isChangingConfigurations) stoppedForEntry = true
+    }
+
+    override fun startActivityForResult(intent: Intent, requestCode: Int, options: Bundle?) {
+        outboundNavigation = true
+        super.startActivityForResult(intent, requestCode, options)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putLong("main_entry_revision", mainEntryRevision)
+        outState.putBoolean("main_outbound_navigation", outboundNavigation)
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         openStatisticsFromIntent = shouldOpenStatistics(intent)
+        if (hasResumed && !stoppedForEntry && intent.action == Intent.ACTION_MAIN && intent.hasCategory(Intent.CATEGORY_LAUNCHER)) {
+            mainEntryRevision = com.liuml.apptimelimiter.update.MainEntryUpdatePolicy.nextEntry()
+        }
     }
 
     private fun shouldOpenStatistics(intent: Intent?): Boolean =
@@ -541,6 +574,7 @@ private fun TimeLimiterScreen(
     onThemeChanged: (AppThemeMode, AppThemeColor) -> Unit,
     themeColor: AppThemeColor,
     openStatisticsFromIntent: Boolean,
+    mainEntryRevision: Long,
 ) {
     val context = LocalContext.current
     val screenScope = rememberCoroutineScope()
@@ -775,7 +809,8 @@ private fun TimeLimiterScreen(
         }
     }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(mainEntryRevision) {
+        if (mainEntryRevision <= 0L) return@LaunchedEffect
         val uiPreferences = context.getSharedPreferences("ui", Context.MODE_PRIVATE)
         val nowMillis = System.currentTimeMillis()
         val settings = repository.getGlobalSettings()
@@ -787,16 +822,21 @@ private fun TimeLimiterScreen(
                     AUTOMATIC_UPDATE_LAST_CHECK_AT_KEY,
                     0L,
                 ),
-            )
+            ) && (com.liuml.apptimelimiter.update.MainEntryUpdatePolicy.claim(mainEntryRevision) || UpdateChecker.isChecking())
         ) {
-            UpdateChecker.check(context) { result ->
+            android.util.Log.i("TimeStopUpdate", "main_entry=$mainEntryRevision")
+            val result = kotlinx.coroutines.suspendCancellableCoroutine<UpdateCheckResult> { continuation ->
+                UpdateChecker.check(context) { value ->
+                    if (continuation.isActive) continuation.resumeWith(Result.success(value))
+                }
+            }
                 if (result !is UpdateCheckResult.Error) {
                     uiPreferences.edit()
                         .putLong(AUTOMATIC_UPDATE_LAST_CHECK_AT_KEY, System.currentTimeMillis())
                         .apply()
                 }
                 if (result is UpdateCheckResult.Available) {
-                    if (checkingUpdate || updateResult != null) return@check
+                    if (checkingUpdate || updateResult != null) return@LaunchedEffect
                     val promptNow = System.currentTimeMillis()
                     if (
                         AutomaticUpdatePolicy.shouldPrompt(
@@ -815,7 +855,6 @@ private fun TimeLimiterScreen(
                         pendingAutomaticUpdate = result
                     }
                 }
-            }
         }
     }
 
@@ -1854,7 +1893,7 @@ private fun TimeLimiterScreen(
                 showSettings = false
                 showAbout = true
             },
-            onJoinBeta = { openQqGroup(context) },
+            onJoinBeta = { showBetaInvite = true },
             onFeedback = {
                 showSettings = false
                 showFeedbackOptions = true
@@ -2634,13 +2673,14 @@ private fun TimeLimiterScreen(
         )
     } else if (showBetaInvite && !showNonRootRepairPrompt && !showSetupGuide) {
         BetaInviteDialog(
+            onJoinTelegram = { openTelegramGroup(context) },
+            onJoinQq = { openQqGroup(context) },
             onClose = { joinGroup ->
                 context.getSharedPreferences("ui", Context.MODE_PRIVATE)
                     .edit()
                     .putInt(BETA_INVITE_LAST_VERSION_KEY, BuildConfig.VERSION_CODE)
                     .commit()
                 showBetaInvite = false
-                if (joinGroup) openQqGroup(context)
             },
         )
     } else if (showNonRootRepairPrompt) {
@@ -4956,7 +4996,7 @@ private fun GroupEditorDialog(
                 item {
                     ThresholdEditor(
                         title = "到限后冷却",
-                        description = "任一成员达到分组额度后，整个分组共同进入冷却",
+                        description = "组内到限后共享冷却；全部成员离开或息屏满此时长恢复每轮额度，关闭时需休息30秒。",
                         enabled = cooldownEnabled,
                         toggleAvailable = cooldownAvailable,
                         minutes = cooldownMinutes,
@@ -5437,6 +5477,8 @@ private fun FeatureIntroDialog(onClose: (doNotShowAgain: Boolean) -> Unit) {
 
 @Composable
 private fun BetaInviteDialog(
+    onJoinTelegram: () -> Unit,
+    onJoinQq: () -> Unit,
     onClose: (joinGroup: Boolean) -> Unit,
 ) {
     val context = LocalContext.current
@@ -5447,13 +5489,16 @@ private fun BetaInviteDialog(
             Text(
                 localizedText(
                     context,
-                    "推荐加入时停内测群",
+                    "时停内测交流群",
                     "Join the Time Stop beta group",
                 ),
             )
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Column(
+                modifier = Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
                 Surface(
                     color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f),
                     shape = RoundedCornerShape(20.dp),
@@ -5466,8 +5511,8 @@ private fun BetaInviteDialog(
                         Text(
                             localizedText(
                                 context,
-                                "提前体验新功能",
-                                "Try new features early",
+                                "交流使用体验，参与版本测试",
+                                "Discuss your experience and help test releases",
                             ),
                             color = MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.Bold,
@@ -5476,26 +5521,32 @@ private fun BetaInviteDialog(
                         Text(
                             localizedText(
                                 context,
-                                "加入 QQ 群可获取测试版本、反馈兼容性问题，并参与新功能讨论。",
-                                "Join the QQ group for test builds, compatibility feedback, and feature discussions.",
+                                "选择 Telegram 或 QQ 内测群，交流使用问题、反馈建议并参与新版本测试。反馈异常时，请通过“反馈问题”分享日志文件，方便定位问题。",
+                                "Choose a Telegram or QQ beta group to discuss issues, share suggestions, and test new releases. For troubleshooting, share a log file via Report a problem.",
                             ),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Text(
                             localizedText(
                                 context,
-                                "QQ群：$QQ_GROUP_NUMBER",
-                                "QQ group: $QQ_GROUP_NUMBER",
+                                "Telegram：t.me/timestop3\nQQ：$QQ_GROUP_NUMBER\n点击下方入口打开群链接，再按页面提示加入。",
+                                "Telegram: t.me/timestop3\nQQ: $QQ_GROUP_NUMBER\nOpen a group link below, then follow the page instructions to join.",
                             ),
                             fontWeight = FontWeight.Medium,
                         )
+                        TextButton(onClick = { onClose(true); onJoinTelegram() }) {
+                            Text(localizedText(context, "打开 Telegram 内测群", "Open Telegram beta group"))
+                        }
+                        TextButton(onClick = { onClose(true); onJoinQq() }) {
+                            Text(localizedText(context, "打开 QQ 内测群", "Open QQ beta group"))
+                        }
                     }
                 }
                 Text(
                     localizedText(
                         context,
-                        "本版本仅提示一次，下次更新后会再次展示。",
-                        "Shown once for this version and again after the next update.",
+                        "每个版本首次打开时推荐一次，也可随时从设置打开。",
+                        "Recommended once per version; also available anytime in Settings.",
                     ),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -5503,12 +5554,12 @@ private fun BetaInviteDialog(
             }
         },
         confirmButton = {
-            Button(onClick = { onClose(true) }) {
+            Button(onClick = { onClose(false) }) {
                 Text(
                     localizedText(
                         context,
-                        "加入内测群",
-                        "Join beta group",
+                        "关闭",
+                        "Close",
                     ),
                 )
             }
@@ -6737,8 +6788,8 @@ private fun SettingsDialog(
                                 Text(
                                     localizedText(
                                         context,
-                                        "已管控应用每累计 30 分钟提示一次；普通模式需允许通知。",
-                                        "Remind once every 30 minutes for managed apps. Normal mode needs notification permission.",
+                                        "每个管控应用当日累计使用每满 30 分钟提醒一次，显示实际已用时间及可计算的剩余时间。分组额度由成员共享；普通模式需允许通知。",
+                                        "Remind at each 30-minute milestone of daily usage for each managed app, showing actual usage and available remaining time. Group allowances are shared by members. Normal mode requires notification permission.",
                                     ),
                                     style = MaterialTheme.typography.bodySmall,
                                 )
@@ -7166,7 +7217,7 @@ private fun SettingsDialog(
                         Column(Modifier.weight(1f)) {
                             Text("自动检查更新", fontWeight = FontWeight.Medium)
                             Text(
-                                "打开时停时按需检查，新版发布后主动提醒",
+                                localizedText(context, "每次打开时停检查；同一新版每日最多提醒一次", "Check whenever you open Time Stop; remind once a day per release"),
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
@@ -7178,9 +7229,9 @@ private fun SettingsDialog(
                 }
                 item {
                     SettingsEntry(
-                        title = "加入内测",
-                        description = "加入 QQ 群交流使用体验；问题反馈请使用下方日志文件入口",
-                        action = "加群 ›",
+                        title = localizedText(context, "内测交流群", "Beta community"),
+                        description = localizedText(context, "选择 Telegram 或 QQ 群，交流使用问题与建议；异常反馈请附日志文件", "Choose Telegram or QQ to discuss issues and suggestions; include a log file when reporting a problem"),
+                        action = localizedText(context, "选择群聊 ›", "Choose group ›"),
                         onClick = onJoinBeta,
                     )
                 }
@@ -7792,6 +7843,21 @@ private fun openWechatDonation(context: Context): Boolean {
     }
 }
 
+private fun openTelegramGroup(context: Context) {
+    val link = "https://t.me/timestop3"
+    val opened = runCatching {
+        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }.isSuccess
+    if (!opened) {
+        context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
+            ClipData.newPlainText("Time Stop Telegram", link),
+        )
+        Toast.makeText(context, localizedText(context,
+            "没有可打开此链接的应用，内测群链接已复制：$link",
+            "No app can open this link. Beta group link copied: $link"), Toast.LENGTH_LONG).show()
+    }
+}
+
 private fun openQqGroup(context: Context) {
     val groupUri = Uri.parse(
         "mqqapi://card/show_pslcard" +
@@ -8080,7 +8146,7 @@ private fun RuleDialog(
                 item {
                     ThresholdEditor(
                         title = "到限后冷却",
-                        description = "达到每日或单次额度后，在设定时间内限制再次使用",
+                        description = "到限后限制再次使用；离开应用或息屏满此时长恢复每轮额度，关闭时需休息30秒。每日额度和时段限制不变。",
                         enabled = cooldownEnabled,
                         toggleAvailable = cooldownAvailable,
                         minutes = cooldownMinutes,

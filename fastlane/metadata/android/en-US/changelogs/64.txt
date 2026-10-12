@@ -1,0 +1,5 @@
+Added in-window restrictions for floating/split windows and verified task-specific exit.
+Unified session resets after background/screen-off rest in both modes.
+Fixed truncated half-hour reminder balances; expanded notifications show full details.
+Checks updates on deliberate opening, with one prompt per release per day.
+Improved per-app Hook maintenance cards.

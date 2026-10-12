@@ -17,6 +17,7 @@ import android.view.WindowInsets
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import com.liuml.apptimelimiter.data.AppThemeColor
 import com.liuml.apptimelimiter.data.AppThemeMode
@@ -44,8 +45,15 @@ internal class TopWarningBanner private constructor(
         get() = root.isAttachedToWindow
 
     fun update(title: String, message: String, remainingMillis: Long) {
-        titleView.text = title
-        messageView.text = message
+        if (kind == WarningBannerKind.USAGE_MILESTONE) {
+            val lines = message.lines().filter { it.isNotBlank() }
+            titleView.text = lines.firstOrNull() ?: title
+            messageView.text = lines.drop(1).joinToString("\n")
+            messageView.visibility = if (lines.size > 1) View.VISIBLE else View.GONE
+        } else {
+            titleView.text = title
+            messageView.text = message
+        }
         progressView.progress = remainingMillis.coerceIn(0L, maxProgressMillis).toInt()
         root.contentDescription = "$title，$message"
     }
@@ -81,6 +89,7 @@ internal class TopWarningBanner private constructor(
             val density = activity.resources.displayMetrics.density
             fun dp(value: Int): Int = (value * density + 0.5f).toInt()
             val availableWidthDp = (windowWidth(activity) / density).toInt()
+            val passiveReminder = kind == WarningBannerKind.USAGE_MILESTONE && !fullScreen
             val actionCount = listOf(
                 exitLabel to onExit,
                 actionLabel to onAction,
@@ -96,7 +105,7 @@ internal class TopWarningBanner private constructor(
             val root = FrameLayout(activity).apply {
                 setPadding(
                     dp(if (fullScreen) FULL_SCREEN_PADDING_DP else 16),
-                    dp(if (fullScreen) FULL_SCREEN_PADDING_DP else 12),
+                    dp(if (fullScreen) FULL_SCREEN_PADDING_DP else if (passiveReminder) 10 else 12),
                     dp(if (fullScreen) FULL_SCREEN_PADDING_DP else 12),
                     dp(if (fullScreen) FULL_SCREEN_PADDING_DP else 8),
                 )
@@ -106,7 +115,7 @@ internal class TopWarningBanner private constructor(
                     strokeWidth = if (fullScreen) 0 else dp(1),
                     strokeColor = if (fullScreen) Color.TRANSPARENT else colors.outline,
                 )
-                elevation = if (fullScreen) 0f else dp(12).toFloat()
+                elevation = if (fullScreen) 0f else dp(if (passiveReminder) 4 else 12).toFloat()
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
                 isClickable = fullScreen
                 isFocusable = fullScreen
@@ -138,15 +147,17 @@ internal class TopWarningBanner private constructor(
                 setTextColor(if (fullScreen) colors.textPrimary else colors.onPrimaryContainer)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, if (fullScreen) 28f else 15f)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-                maxLines = 2
-                ellipsize = TextUtils.TruncateAt.END
+                maxLines = if (passiveReminder) Int.MAX_VALUE else 2
+                if (passiveReminder) includeFontPadding = false
+                ellipsize = if (passiveReminder) null else TextUtils.TruncateAt.END
                 gravity = if (fullScreen) Gravity.CENTER else Gravity.NO_GRAVITY
             }
             val messageView = TextView(activity).apply {
                 setTextColor(colors.textSecondary)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, if (fullScreen) 16f else 12.5f)
-                maxLines = if (fullScreen) 3 else 2
-                ellipsize = TextUtils.TruncateAt.END
+                maxLines = if (passiveReminder) Int.MAX_VALUE else if (fullScreen) 3 else 2
+                if (passiveReminder) includeFontPadding = false
+                ellipsize = if (passiveReminder) null else TextUtils.TruncateAt.END
                 gravity = if (fullScreen) Gravity.CENTER else Gravity.NO_GRAVITY
                 setPadding(0, dp(if (fullScreen) 8 else 2), 0, 0)
             }
@@ -186,8 +197,29 @@ internal class TopWarningBanner private constructor(
                     ).apply { topMargin = dp(18) },
                 )
             }
+            // Normal windows show every line. Tiny windows bound the occupied area,
+            // but preserve the complete text through local scrolling instead of truncation.
+            val textContent: View = if (passiveReminder) {
+                object : ScrollView(activity) {
+                    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                        val windowHeight = decor.height.takeIf { it > 0 }
+                            ?: activity.resources.displayMetrics.heightPixels
+                        val limit = minOf(dp(220), (windowHeight * 0.4f).toInt()).coerceAtLeast(1)
+                        val available = if (View.MeasureSpec.getMode(heightMeasureSpec) == View.MeasureSpec.UNSPECIFIED)
+                            limit else minOf(limit, View.MeasureSpec.getSize(heightMeasureSpec))
+                        super.onMeasure(widthMeasureSpec, View.MeasureSpec.makeMeasureSpec(available, View.MeasureSpec.AT_MOST))
+                    }
+                }.apply {
+                    isFocusable = false
+                    isFocusableInTouchMode = false
+                    isVerticalScrollBarEnabled = true
+                    addView(textColumn, FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ))
+                }
+            } else textColumn
             contentRow.addView(
-                textColumn,
+                textContent,
                 if (fullScreen || stackCompactActions) {
                     LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
@@ -289,6 +321,7 @@ internal class TopWarningBanner private constructor(
                 progressBackgroundTintList = ColorStateList.valueOf(colors.outline)
                 isClickable = false
                 isFocusable = false
+                if (passiveReminder) visibility = View.GONE
             }
             contentColumn.addView(
                 contentRow,

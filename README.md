@@ -1,5 +1,13 @@
 # Time Stop
 
+Half-hour reminders show daily usage and remaining personal/group allowances on separate wrapping lines, with bounded scrolling for dense banners and full balances in expanded notifications. With automatic updates enabled, deliberate openings check stable releases, with one prompt per release per local day. Hook maintenance cards identify the app, package and issue; reopen a stopped app to verify its Hook.
+
+In-window restriction: LSPosed places a scrollable blocking panel inside floating/split target windows. Basic protection uses a bounded overlay only when authorized Root/Shizuku can verify the task and bounds. Existing PIN and extension checks still apply. Module timing pauses and tracked media is paused where possible; Android UsageStats and custom players may behave differently.
+
+Floating-window exit is bound to the original restricted task. LSPosed asks the target process to remove its own task; Basic protection can use authorized Root/Shizuku after verifying ownership. Unconfirmed or failed closure retains the restriction and asks for manual closure, avoiding a global Home action that could interrupt the app underneath. Reopen managed apps after updating to load the new Hook.
+
+Both protection modes restart continuous-use allowance after a genuine background/screen-off rest: the configured cooldown duration, or 30 seconds when disabled. Group members share a cycle. Daily quotas, schedules and active PIN deadlines remain unchanged.
+
 The interface uses neutral grouped backgrounds, rounded cards and consistent line icons, with three accent colors and dark mode. Settings use a category directory and detail pages, preserving drafts on return. Bottom actions respect system bars and the keyboard. Both protection modes expose reminders and free extensions of 1–15 minutes; restriction pages show daily/session availability.
 
 LSPosed settings offer per-app Root force-stop actions for outdated or failed Hooks. Only configured, permitted targets are stopped; reopen them manually to verify the Hook. Missing scope or a disabled module still requires LSPosed configuration.
@@ -10,14 +18,14 @@ Restriction pages explain personal and group quotas, session limits, schedules a
 
 ![Android 8.1+](https://img.shields.io/badge/Android-8.1%2B-3DDC84?logo=android&logoColor=white)
 ![LSPosed API 93+](https://img.shields.io/badge/LSPosed-API%2093%2B-5C6BC0)
-![Version 0.11.24](https://img.shields.io/badge/version-0.11.24-2E7D5B)
+![Version 0.11.25](https://img.shields.io/badge/version-0.11.25-2E7D5B)
 ![License GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
 Stock screen-time tools are usually built for reports, daily caps, and focus modes. **Time Stop** is built for people who want sharper controls: per-app quotas, per-launch timers, weekly allow/block windows, shared group budgets, cooldowns after forced exits, Hook verification, and diagnostics that show what is actually happening inside the target process.
 
 [Latest release](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed module page](https://modules.lsposed.org/module/com.liuml.apptimelimiter/) · [Obtainium](#obtainium) · [中文说明](#中文说明)
 
-Current release: `0.11.24 (63)` Modern. The legacy migration builds are retained only for existing users completing the two-stage upgrade.
+Current release: `0.11.25 (64)` Modern. The legacy migration builds are retained only for existing users completing the two-stage upgrade.
 
 ## Why Not Just Use Stock Screen Time?
 
@@ -46,7 +54,7 @@ Time Stop is not a soft "please stop scrolling" timer. It is a small policy engi
 | Optional force-stop enhancement | Basic protection selects one limit action: restriction page, Root force-stop, or Shizuku force-stop. Root and Shizuku only execute validated force-stops for configured third-party targets; missing permission, a stopped service, binder failure, or a protected package falls back to the restriction page. |
 | Free extension | All ordinary extensions are free within the daily and per-session limits; no ads are loaded or displayed. |
 | Daily cumulative mode | Uses the stronger source for each app: Android system usage when available, or Hook-local foreground accounting, then resets at local midnight. |
-| Per-launch mode | Starts a fresh foreground timer for the target process. If the process survives in the background, staying away for at least the configured cooldown counts as an effective rest and starts a new cycle. |
+| Per-launch mode | Both modes start a fresh continuous-use cycle after leaving or turning the screen off for the configured cooldown duration, or 30 seconds when cooldown is disabled. Daily quotas and schedules still apply. |
 | Session planning | Optionally asks for a 5, 10, 15, 30, or custom 1–60 minute plan when the target process first opens. Quick choices and a one-minute-step slider share one compact page, while the fixed footer keeps exit and skip actions visible. Values beyond the earliest remaining timed quota are rejected. |
 | Weekly schedules | Supports allow-only and block-during windows across multiple weekdays, including overnight ranges. Schedule blocks cannot be bypassed with the delay action. |
 | Foreground-only accounting | Counts only the `onResume` to `onPause` phase. Background residency does not burn the quota. |
@@ -105,7 +113,7 @@ Key source files:
 - `app/src/main/java/com/liuml/apptimelimiter/ipc/RuleProvider.kt`: controlled IPC for rule reads, diagnostics, statistics, and Hook verification.
 - `app/src/main/java/com/liuml/apptimelimiter/statistics/`: Android usage-event calculation and module statistics.
 - `app/src/main/java/com/liuml/apptimelimiter/xposed/AppTimeLimitHook.kt`: lifecycle hooks, timers, group sync, cooldowns, warnings, and exit execution.
-- `app/src/main/java/com/liuml/apptimelimiter/nonroot/`: accessibility coordination, 30-second sessions, plan overlay, restriction fallback, and restricted Shizuku execution.
+- `app/src/main/java/com/liuml/apptimelimiter/nonroot/`: accessibility coordination, shared rest-interval sessions, plan overlay, restriction fallback, and restricted Shizuku execution.
 - `app/src/main/java/com/liuml/apptimelimiter/core/`: pure policy helpers covered by unit tests.
 - `app/src/main/java/com/liuml/apptimelimiter/security/`: private PIN verification, biometric recovery, one-time challenges, and session-bound parent overrides. PIN material is never mirrored to Hook-readable preferences.
 - `xposed-stubs/`: compile-time Xposed API signatures; they are not packaged into the APK.
@@ -237,13 +245,21 @@ This tool should be used only by the device owner or on explicitly authorized ma
 
 # 时停
 
+新版支持小窗、分屏内管控与经核验的指定任务退出，避免全局返回桌面打断底下的应用。LSPosed 面板位于目标原窗口；普通保护仅在已授权 Root/Shizuku 能确认任务与边界时使用局部浮层。PIN 和延时仍需通过原有校验；不能确认退出结果时保留限制并提示手动关闭。
+
+两种模式在真实离开或息屏休息后重置单次额度：开启冷却时按配置时长，关闭时按 30 秒；分组须全部成员离开。切页、旋转、PIN 和计划流程不算休息，每日额度、时段和有效 PIN 截止时间不变。
+
+半小时提醒按项换行展示今日用时及个人/分组剩余额度，密集顶部提醒可滚动，通知展开显示完整信息。开启自动更新后主动打开应用检查正式版本，同一新版每日最多提示一次。Hook 维护卡片显示图标、名称、包名、问题及逐应用操作结果。
+
+内测交流支持 [Telegram](https://t.me/timestop3) 与 QQ 群 1009712674；反馈异常请附日志文件。
+
 > 把时间留给真正重要的事。
 
 系统自带的屏幕时间管理通常更侧重**查看使用统计、设置每日限额或开启专注模式**。**时停**则专注于更精细、可组合的单应用规则：不仅能限制一天总共使用多久，还能限制每次连续打开多久，还能规定每周哪些时段允许或禁止使用，并支持应用分组共享额度、退出后冷却和管控锁。用户可全局选择 LSPosed、普通保护或普通保护 + Shizuku，所有管控应用统一使用所选链路。
 
 [下载最新版本](https://github.com/Xposed-Modules-Repo/com.liuml.apptimelimiter/releases/latest) · [LSPosed 模块页面](https://modules.lsposed.org/module/com.liuml.apptimelimiter/)
 
-当前版本：`0.11.24 (63)` Modern 构建。传统迁移版仅用于存量用户完成两阶段升级。
+当前版本：`0.11.25 (64)` Modern 构建。传统迁移版仅用于存量用户完成两阶段升级。
 
 ## 它和系统屏幕时间有什么不同？
 

@@ -649,14 +649,13 @@ class RuleProvider : ContentProvider() {
                 ) return denied("invalid_group_session_fields")
                 val segmentMillis = request.getLong(RuleContract.KEY_DURATION_MS, 0L)
                     .coerceIn(0L, MAX_GROUP_SESSION_SEGMENT_MILLIS)
-                val resetGapMillis = if (group.cooldownEnabled) {
+                val resetGapMillis = com.liuml.apptimelimiter.core.SessionRestPolicy.intervalMillis(
+                    group.cooldownEnabled,
                     group.cooldownSeconds.coerceIn(
                         RuleRepository.MIN_COOLDOWN_SECONDS,
                         RuleRepository.MAX_COOLDOWN_SECONDS,
-                    ) * 1_000L
-                } else {
-                    SharedGroupSessionPolicy.DEFAULT_RESET_GAP_MILLIS
-                }
+                    ) * 1_000L,
+                )
                 val bootCount = Settings.Global.getInt(
                     appContext.contentResolver,
                     Settings.Global.BOOT_COUNT,

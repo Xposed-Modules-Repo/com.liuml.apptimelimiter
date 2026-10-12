@@ -25,6 +25,42 @@ class RootExecutor(context: Context) : RestrictionExecutor {
     /** User-initiated authorization needs time for the root manager's confirmation dialog. */
     fun requestAuthorization(): Boolean = runCommand("id", 30_000L) == 0
 
+    fun inspectTask(packageName: String): TargetTaskSnapshot? =
+        TargetTaskSnapshot.parse(taskCommand(packageName, null))
+
+    fun removeTask(packageName: String, taskId: Int): Boolean =
+        taskId >= 0 && taskCommand(packageName, taskId) == "closed"
+
+    private fun taskCommand(packageName: String, taskId: Int?): String? {
+        if (Looper.myLooper() == Looper.getMainLooper()) return null
+        if (!PackageNamePolicy.isValid(packageName)) return null
+        // Reuse the same system-app, configured-package and current-user protection as force stop.
+        val request = RestrictionRequest(packageName = packageName, userId = android.os.Process.myUid() / 100000,
+            reason = "task_exit", incidentId = "task-exit", ruleVersion = 0, groupVersion = 0,
+            modeGeneration = 0, foregroundPackage = packageName, foregroundGeneration = 0,
+            sessionId = "", allowDelay = false, allowPin = false, allowAd = false)
+        if (!runCatching { isValidRequest(request, false) }.getOrDefault(false)) return null
+        val settings = RuleRepository(appContext).getGlobalSettings()
+        if (settings.protectionMode != com.liuml.apptimelimiter.data.ProtectionMode.ACCESSIBILITY ||
+            settings.accessibilityForceStopEnhancement != com.liuml.apptimelimiter.data.ForceStopEnhancement.ROOT) return null
+        var process: Process? = null
+        val output = runCatching { java.io.File.createTempFile("task-exit-", ".tmp", appContext.cacheDir) }.getOrNull() ?: return null
+        return try {
+            val apk = appContext.applicationInfo.sourceDir.replace("'", "'\\''")
+            val command = "CLASSPATH='$apk' app_process /system/bin com.liuml.apptimelimiter.nonroot.PrivilegedTaskAccess " +
+                "${if (taskId == null) "inspect" else "remove"} $packageName ${request.userId}" +
+                (taskId?.let { " $it" } ?: "") + " ${SystemClock.elapsedRealtime() + 2_500L}"
+            val child = ProcessBuilder("su", "-c", command).redirectError(java.io.File("/dev/null"))
+                .redirectOutput(output).start()
+            process = child
+            if (!child.waitFor(COMMAND_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS) || child.exitValue() != 0 || output.length() > 1024L) null
+            else output.readLines().singleOrNull { it.startsWith("TASK:") }?.removePrefix("TASK:")
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt(); null
+        } catch (_: Exception) { null }
+        finally { runCatching { process?.destroyForcibly() }; output.delete() }
+    }
+
     /** Manager settings action: the selected app may already be in the background. */
     fun forceStopForHookReload(packageName: String): RestrictionExecutionResult {
         if (RuleRepository(appContext).getGlobalSettings().protectionMode !=

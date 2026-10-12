@@ -34,7 +34,7 @@ data class SharedGroupSessionUpdate(
  */
 object SharedGroupSessionPolicy {
     const val MAX_HANDLED_SEGMENTS = 64
-    const val DEFAULT_RESET_GAP_MILLIS = 30_000L
+    const val DEFAULT_RESET_GAP_MILLIS = SessionRestPolicy.DEFAULT_REST_MILLIS
 
     fun update(
         existing: SharedGroupSessionRecord,

@@ -24,15 +24,10 @@ internal class UsageMilestoneNotifier(context: Context) {
                 PackageManager.PERMISSION_GRANTED
 
     @SuppressLint("MissingPermission") // canPost checks POST_NOTIFICATIONS immediately above notify.
-    fun show(packageName: String, usedMillis: Long, english: Boolean): Boolean {
+    fun show(packageName: String, usedMillis: Long, english: Boolean, message: String): Boolean {
         if (!canPost()) return false
         val manager = NotificationManagerCompat.from(appContext)
         createChannel()
-        val label = runCatching {
-            appContext.packageManager.getApplicationLabel(
-                appContext.packageManager.getApplicationInfo(packageName, 0),
-            ).toString()
-        }.getOrDefault(packageName)
         val intent = Intent(appContext, MainActivity::class.java)
             .setData(android.net.Uri.parse("apptimelimiter://settings?section=stats"))
             .putExtra(MainActivity.EXTRA_OPEN_STATISTICS, true)
@@ -50,10 +45,8 @@ internal class UsageMilestoneNotifier(context: Context) {
                 NotificationCompat.Builder(appContext, CHANNEL_ID)
                     .setSmallIcon(R.mipmap.ic_launcher)
                     .setContentTitle(if (english) "Usage reminder" else "使用时长提醒")
-                    .setContentText(
-                        if (english) "$label has been used for ${formatDuration(usedMillis, true)} today"
-                        else "今天已使用 $label ${formatDuration(usedMillis, false)}",
-                    )
+                    .setContentText(message.lineSequence().firstOrNull().orEmpty())
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(message))
                     .setContentIntent(pendingIntent)
                     .setAutoCancel(true)
                     .setOnlyAlertOnce(true)

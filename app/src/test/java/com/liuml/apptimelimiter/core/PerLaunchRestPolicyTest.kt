@@ -51,7 +51,7 @@ class PerLaunchRestPolicyTest {
     }
 
     @Test
-    fun `active limit state cannot be bypassed by background rest`() {
+    fun `stale page does not veto rest but live cooldown does`() {
         val blocked = PerLaunchRestPolicy.evaluate(
             hasPerLaunchQuota = true,
             configuredCooldownMillis = 20 * 60_000L,
@@ -69,12 +69,12 @@ class PerLaunchRestPolicyTest {
             activeCooldownRemainingMillis = 1L,
         )
 
-        assertFalse(blocked.shouldStartNewCycle)
+        assertTrue(blocked.shouldStartNewCycle)
         assertFalse(coolingDown.shouldStartNewCycle)
     }
 
     @Test
-    fun `missing quota or cooldown keeps current cycle`() {
+    fun `missing quota keeps cycle and disabled cooldown uses thirty seconds`() {
         val noQuota = PerLaunchRestPolicy.evaluate(
             hasPerLaunchQuota = false,
             configuredCooldownMillis = 20 * 60_000L,
@@ -93,7 +93,7 @@ class PerLaunchRestPolicyTest {
         )
 
         assertFalse(noQuota.shouldStartNewCycle)
-        assertFalse(noCooldown.shouldStartNewCycle)
+        assertTrue(noCooldown.shouldStartNewCycle)
     }
 
     @Test
